@@ -18,3 +18,15 @@ __all__ = [
     "Backtester",
     "BacktestResult",
 ]
+
+
+def __getattr__(name):
+    # Live + paper trading depend on ccxt, which is optional. Lazy-import so
+    # the rest of the package works without it.
+    if name == "CCXTFeed":
+        from gnn_arbitrage.live import CCXTFeed
+        return CCXTFeed
+    if name in ("PaperBroker", "PaperTrade", "RiskCaps"):
+        from gnn_arbitrage import paper as _paper
+        return getattr(_paper, name)
+    raise AttributeError(name)
