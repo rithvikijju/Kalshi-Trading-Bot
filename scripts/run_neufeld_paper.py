@@ -33,6 +33,16 @@ def main():
     p.add_argument("--max-iters", type=int, default=None)
     p.add_argument("--max-notional", type=float, default=5_000.0)
     p.add_argument("--log", default="neufeld_paper.jsonl")
+    p.add_argument("--require-feasibility", action="store_true",
+                   help="only log rows whose min_payoff_unit >= 0 on the dense grid")
+    p.add_argument("--feasibility-grid", type=int, default=4096,
+                   help="size of the fresh grid used to evaluate feasibility (default 4096)")
+    p.add_argument("--slippage-bps", type=float, default=5.0,
+                   help="per-leg haircut: longs pay ask*(1+s/2), shorts receive bid*(1-s/2)")
+    p.add_argument("--lsip-target", action="store_true",
+                   help="solve the LP for V(K, π) on each row; adds ~1s per snapshot")
+    p.add_argument("--lsip-grid", type=int, default=512,
+                   help="LSIP target grid size when --lsip-target is on")
     args = p.parse_args()
 
     ckpt = torch.load(args.model, map_location="cpu", weights_only=True)
@@ -46,6 +56,11 @@ def main():
         poll_seconds=args.poll,
         max_abs_notional=args.max_notional,
         log_path=args.log,
+        require_feasibility=args.require_feasibility,
+        s_grid_size=args.feasibility_grid,
+        slippage_bps_per_leg=args.slippage_bps,
+        compute_lsip_target=args.lsip_target,
+        lsip_grid_size=args.lsip_grid,
     )
     run(model, cfg, max_iters=args.max_iters)
 
