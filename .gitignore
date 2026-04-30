@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# Paper trading runtime logs
+paper_trades.jsonl
+*.jsonl

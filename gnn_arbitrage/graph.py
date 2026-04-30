@@ -25,22 +25,36 @@ def build_rate_graph(snap: FXSnapshot, ref: int = 0) -> tuple[np.ndarray, np.nda
     e = len(pairs)
     edge_index = np.array(pairs, dtype=np.int64).T  # [2, E]
 
-    rates = np.array([snap.executable_rate(i, j) for i, j in pairs], dtype=np.float32)
-    log_rates = np.log(rates).astype(np.float32)
-    log_rates_centered = log_rates - log_rates.mean()
-    spread = np.array(
-        [np.log(snap.rates_ask[i, j] / snap.rates_bid[i, j]) for i, j in pairs],
-        dtype=np.float32,
-    )
+    # Live-feed snapshots may have rate=0 for unlisted pairs. Replace the log
+    # of 0/non-positive rates with a large negative penalty so the GNN treats
+    # them as unusable, but does not blow up on -inf.
+    UNLISTED_LOG = -50.0
 
-    # Cycle-aware features: for each directed edge (i, j), the best and mean
-    # triangle profit through it. A vanilla MP-GNN cannot recover the
-    # existential cycle quantifier on a complete digraph from local edge
-    # weights alone; supplying the triangle aggregates as edge features gives
-    # the network the right inductive bias and matches real-world arbitrage
-    # systems that precompute cycle products.
-    log_rate_mat = np.log(np.array([[snap.executable_rate(a, b) for b in range(n)] for a in range(n)],
-                                   dtype=np.float64))
+    def _safe_log(x: float) -> float:
+        return float(np.log(x)) if x > 0 else UNLISTED_LOG
+
+    rates_list = [snap.executable_rate(i, j) for i, j in pairs]
+    log_rates = np.array([_safe_log(r) for r in rates_list], dtype=np.float32)
+    listed_mask = np.array([r > 0 for r in rates_list], dtype=bool)
+    if listed_mask.any():
+        listed_mean = float(log_rates[listed_mask].mean())
+    else:
+        listed_mean = 0.0
+    log_rates_centered = log_rates - listed_mean
+    log_rates_centered[~listed_mask] = UNLISTED_LOG
+
+    spread = np.zeros(len(pairs), dtype=np.float32)
+    for idx, (i, j) in enumerate(pairs):
+        b = float(snap.rates_bid[i, j]); a = float(snap.rates_ask[i, j])
+        spread[idx] = float(np.log(a / b)) if (b > 0 and a > 0) else 0.0
+
+    # Cycle-aware features: best and mean log-profit of triangles through (i, j).
+    log_rate_mat = np.full((n, n), UNLISTED_LOG, dtype=np.float64)
+    for a in range(n):
+        for b in range(n):
+            r = snap.executable_rate(a, b)
+            if r > 0:
+                log_rate_mat[a, b] = float(np.log(r))
     np.fill_diagonal(log_rate_mat, 0.0)
     best_tri = np.zeros(len(pairs), dtype=np.float32)
     mean_tri = np.zeros(len(pairs), dtype=np.float32)
@@ -55,9 +69,9 @@ def build_rate_graph(snap: FXSnapshot, ref: int = 0) -> tuple[np.ndarray, np.nda
     edge_attr = np.stack([log_rates_centered, spread, best_tri, mean_tri], axis=1).astype(np.float32)
 
     # Reference-currency anchored node features.
-    log_in = np.array([np.log(snap.rates_bid[ref, j]) if j != ref else 0.0 for j in range(n)],
+    log_in = np.array([_safe_log(snap.rates_bid[ref, j]) if j != ref else 0.0 for j in range(n)],
                       dtype=np.float32)
-    log_out = np.array([np.log(snap.rates_bid[j, ref]) if j != ref else 0.0 for j in range(n)],
+    log_out = np.array([_safe_log(snap.rates_bid[j, ref]) if j != ref else 0.0 for j in range(n)],
                        dtype=np.float32)
     node_attr = np.stack([log_in, log_out], axis=1)
     return edge_index, edge_attr, node_attr

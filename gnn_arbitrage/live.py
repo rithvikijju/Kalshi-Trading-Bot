@@ -105,8 +105,14 @@ class CCXTFeed:
             tickers = self.ex.fetch_tickers(symbols)
 
         n = len(self.currencies)
-        bid = np.ones((n, n), dtype=np.float64)
-        ask = np.ones((n, n), dtype=np.float64)
+        # Default to 0 for off-diagonal entries: any cycle that traverses an
+        # unlisted pair multiplies by 0 and is correctly pruned. A naive
+        # `np.ones` default would make missing legs a free 1:1 conversion,
+        # which fabricates astronomical fake arbitrage.
+        bid = np.zeros((n, n), dtype=np.float64)
+        ask = np.zeros((n, n), dtype=np.float64)
+        np.fill_diagonal(bid, 1.0)
+        np.fill_diagonal(ask, 1.0)
 
         for (i, j), info in self.pair_map.items():
             t = tickers.get(info.symbol)
@@ -124,9 +130,6 @@ class CCXTFeed:
                 # i -> j by selling i at the bid of i/j: receive bid units of j.
                 bid[i, j] = tb
                 ask[i, j] = ta
-
-        np.fill_diagonal(bid, 1.0)
-        np.fill_diagonal(ask, 1.0)
         snap = FXSnapshot(t=self.t, currencies=self.currencies, rates_bid=bid, rates_ask=ask)
         self.t += 1
         return snap

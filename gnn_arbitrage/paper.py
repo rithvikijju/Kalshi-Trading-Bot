@@ -52,6 +52,11 @@ class RiskCaps:
     max_daily_loss_base: float = 500.0
     max_trades_per_day: int = 200
     max_notional_base: float = 1_000.0
+    # Cycle returns above this are almost certainly a data bug (missing pair,
+    # wrong side, decimals). Real triangular arbitrage on liquid spot crypto
+    # is sub-1% per cycle; reject anything beyond and surface the row for
+    # inspection so a corrupted feed can never compound.
+    sanity_max_net_return: float = 1.02  # 200 bps cap per cycle
 
 
 class PaperBroker:
@@ -147,6 +152,14 @@ class PaperBroker:
         gross, net, legs = self.cycle_gross_and_net(snap, cycle_idx)
         if net <= 1.0:
             return None  # don't book negative-edge fills
+        if net > self.risk.sanity_max_net_return:
+            cycle_ccys = tuple(snap.currencies[i] for i in cycle_idx)
+            print(f"[PaperBroker] REJECTED implausible net={net:.4f} on {cycle_ccys}; "
+                  f"likely a missing-pair or quote bug. Skipping.")
+            return None
+        # Cycles that touch an unlisted pair will surface as a leg with rate 0.
+        if any(leg["rate"] <= 0 for leg in legs):
+            return None
         pnl = notional * (net - 1.0)
         self.equity += pnl
         self._day_pnl += pnl

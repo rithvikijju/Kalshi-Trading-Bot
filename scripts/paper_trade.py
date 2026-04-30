@@ -48,7 +48,8 @@ from gnn_arbitrage.paper import PaperBroker, RiskCaps
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--venue", default="kraken", choices=["kraken", "binance", "coinbase", "bybit"])
+    p.add_argument("--venue", default="kraken",
+                   choices=["kraken", "binance", "binanceus", "coinbase", "bybit", "gemini", "okx", "kucoin"])
     p.add_argument("--currencies", nargs="+", default=["USDT", "BTC", "ETH", "SOL", "XRP"])
     p.add_argument("--mode", default="oracle", choices=["oracle", "gnn", "baseline"])
     p.add_argument("--poll", type=float, default=2.0, help="seconds between snapshots")
