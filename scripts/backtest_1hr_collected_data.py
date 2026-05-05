@@ -42,6 +42,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.btc_1hr_config import CFG, MINUTES_PER_YEAR
 import scripts.btc_1hr_paper as paper_strategy
+import scripts.btc_1hr_hardened as hardened_strategy
 import scripts.btc_1hr_neohardened as neo_strategy
 
 
@@ -62,6 +63,12 @@ PAPER_CFG = {
     "max_entry_price": 0.60,
 }
 NEOHARDENED_CFG = {
+    "min_edge_cents": 7.0,
+    "max_spread_cents": 3,
+    "min_entry_price": 0.20,
+    "max_entry_price": 0.80,
+}
+HARDENED_CFG = {
     "min_edge_cents": 7.0,
     "max_spread_cents": 3,
     "min_entry_price": 0.20,
@@ -513,6 +520,8 @@ def compute_neohardened_features(btc: pd.DataFrame) -> pd.DataFrame:
 def apply_strategy_cfg(strategy_name: str) -> None:
     if strategy_name == "paper":
         CFG.update(PAPER_CFG)
+    elif strategy_name == "hardened":
+        CFG.update(HARDENED_CFG)
     elif strategy_name == "neohardened":
         CFG.update(NEOHARDENED_CFG)
     elif strategy_name == "research":
@@ -524,11 +533,17 @@ def apply_strategy_cfg(strategy_name: str) -> None:
 def strategy_module(strategy_name: str):
     if strategy_name == "research":
         raise ValueError("research strategy is only implemented in the vectorized backtest engine")
-    return paper_strategy if strategy_name == "paper" else neo_strategy
+    if strategy_name == "paper":
+        return paper_strategy
+    if strategy_name == "hardened":
+        return hardened_strategy
+    return neo_strategy
 
 
 def feature_frame_for_strategy(strategy_name: str, btc: pd.DataFrame) -> pd.DataFrame:
-    return compute_paper_features(btc) if strategy_name == "paper" else compute_neohardened_features(btc)
+    if strategy_name in {"paper", "hardened"}:
+        return compute_paper_features(btc)
+    return compute_neohardened_features(btc)
 
 
 def btc_at_or_before(btc: pd.DataFrame, ts: pd.Timestamp) -> tuple[float | None, int | None]:
@@ -648,6 +663,19 @@ def should_skip_neohardened_for_cooldown(settled: list[dict], scan_ts: pd.Timest
     return (scan_ts - last3[-1]["settle_time"]).total_seconds() < 30 * 60
 
 
+def should_skip_hardened_for_cooldown(settled: list[dict], scan_ts: pd.Timestamp) -> bool:
+    recent = sorted(
+        (r for r in settled if r.get("strategy") == "hardened"),
+        key=lambda r: r["entry_time"],
+    )
+    if len(recent) < 3:
+        return False
+    last3 = recent[-3:]
+    if not all(r["pnl"] <= 0 for r in last3):
+        return False
+    return (scan_ts - last3[-1]["entry_time"]).total_seconds() < 30 * 60
+
+
 def select_signals_for_scan(
     strategy_name: str,
     event: EventFile,
@@ -681,7 +709,7 @@ def select_signals_for_scan(
                 btc_window,
                 emp_cache,
             )
-            if strategy_name == "paper":
+            if strategy_name in {"paper", "hardened"}:
                 signals = module.tradeable_signals(edges)
             else:
                 signals = module.tradeable_signals(edges, btc_window)
@@ -735,6 +763,8 @@ def run_strategy_backtest_module(
 
             ttl_min = (event.close_ts - scan_ts).total_seconds() / 60.0
             if ttl_min <= CFG["min_ttl_min"] or ttl_min >= CFG["max_ttl_hours"] * 60:
+                continue
+            if strategy_name == "hardened" and should_skip_hardened_for_cooldown(settled, scan_ts):
                 continue
             if strategy_name == "neohardened" and should_skip_neohardened_for_cooldown(settled, scan_ts):
                 continue
@@ -1304,7 +1334,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--strategies",
         nargs="+",
-        choices=("paper", "neohardened", "research"),
+        choices=("paper", "hardened", "neohardened", "research"),
         default=["paper", "neohardened", "research"],
     )
     parser.add_argument("--verify-only", action="store_true")
@@ -1334,6 +1364,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.engine == "module" and "research" in args.strategies:
         print("The research strategy is only available with --engine vectorized.")
+        return 1
+    if args.engine == "vectorized" and "hardened" in args.strategies:
+        print("The hardened strategy is only available with --engine module.")
         return 1
 
     first_ts = min(ev.first_ts for ev in events)

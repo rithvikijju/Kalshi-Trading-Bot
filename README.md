@@ -240,10 +240,12 @@ python scripts/btc_1hr_research_live.py
 
 The deployed live script is pinned to the successful research backtest:
 KXBTCD hourly BTC markets only, cumulative "$X or above" markets only,
-one selected signal per minute, one contract per signal, 7-day empirical
-training window frozen at event open, official Kalshi taker fee estimate,
-and real orderbook execution checks. Running it with no flags starts live
-prod execution. Use `--dry-run --once` for a one-cycle validation scan.
+one selected signal per minute, 7-day empirical training window frozen at
+event open, official Kalshi taker fee estimate, and real orderbook execution
+checks. The signal filter remains the one-contract research filter; the live
+order count is then bankroll-scaled up to 3 contracts. Running it with no
+flags starts live prod execution. Use `--dry-run --once` for a one-cycle
+validation scan.
 
 ### Data Verification
 
@@ -255,6 +257,90 @@ prod execution. Use `--dry-run --once` for a one-cycle validation scan.
 The missing candidates are mostly recurring unavailable hours in the Kalshi
 history export set, not malformed files. The verifier refused to backtest on
 structural errors; both March and April reports had `errors: []`.
+
+### Faithful DuckDB/Parquet Datamart
+
+Build the corrected research store:
+
+```
+python scripts/download_kalshi_bidask_history.py --from-csv-dir data --out-dir data/research_datamart/kalshi_bidask_events --workers 4
+python scripts/build_research_datamart.py --out-dir data/research_datamart --fill-internal-btc-gaps
+```
+
+Run the strict replay:
+
+```
+python scripts/backtest_research_duckdb.py --strategy research --db data/research_datamart/research.duckdb --output-dir backtest_outputs/research_duckdb
+python scripts/backtest_research_duckdb.py --strategy paper --db data/research_datamart/research.duckdb --output-dir backtest_outputs/paper_duckdb
+```
+
+Outputs:
+
+| Path | Role |
+|---|---|
+| `data/research_datamart/research_backtest.duckdb` | Compact queryable DuckDB copy, safe to commit without LFS |
+| `data/research_datamart/research.duckdb` | Full local DuckDB copy; ignored because it exceeds GitHub's 100 MB file limit |
+| `data/research_datamart/kalshi_quotes.parquet` | Observed historical Kalshi bid/ask candles; no forward fill |
+| `data/research_datamart/kalshi_bidask_events/` | Per-event bid/ask Parquet parts from Kalshi's event candlestick API |
+| `data/research_datamart/kalshi_csv_prices.parquet` | Raw CSV exports copied for reference only |
+| `data/research_datamart/btc_1m.parquet` | Coinbase candles with `available_at = bucket_start + 1 minute` |
+| `backtest_outputs/research_duckdb/` | Corrected research backtest report |
+| `backtest_outputs/paper_duckdb/` | Corrected original paper-signal backtest report |
+
+Datamart build on 2026-05-05:
+
+| Table | Rows | Distinct Events | Notes |
+|---|---:|---:|---|
+| `kalshi_markets` | 233,241 | n/a | SQLite markets plus bid/ask/CSV-inferred market metadata |
+| `kalshi_quotes` | 2,627,142 | 1,474 | Bid/ask candle data from SQLite plus event candlestick API |
+| `kalshi_csv_prices` | 2,193,773 | 1,470 | Raw downloaded midpoint-style CSV history; not used for fills |
+| `btc_1m` | 107,317 | n/a | Coinbase minute OHLCV from 2026-02-20 to 2026-05-05 |
+
+Corrected faithful replay:
+
+Sources: `backtest_outputs/research_duckdb/backtest_research_duckdb_summary.csv`
+and `backtest_outputs/paper_duckdb/backtest_paper_duckdb_summary.csv`.
+
+| Strategy | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Win Rate | Profit Factor | Max Active Premium ($) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| paper_duckdb | 1,931 | -83.85 | 1,041.85 | -8.05% | -85.63 | 49.61% | 0.84 | 6.58 |
+| research_duckdb | 128 | 7.04 | 87.96 | 8.00% | -5.07 | 74.22% | 1.32 | 0.77 |
+
+Event-prefix splits:
+
+| Strategy | Event Prefix | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Win Rate | Profit Factor |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| paper_duckdb | `KXBTCD-26MAR` | 874 | -50.29 | 465.29 | -10.81% | -51.68 | 47.48% | 0.79 |
+| paper_duckdb | `KXBTCD-26APR` | 913 | -24.64 | 496.64 | -4.96% | -27.77 | 51.70% | 0.90 |
+| paper_duckdb | `KXBTCD-26MAY` | 144 | -8.92 | 79.92 | -11.16% | -11.67 | 49.31% | 0.78 |
+| research_duckdb | `KXBTCD-26MAR` | 57 | 4.04 | 39.96 | 10.11% | -2.22 | 77.19% | 1.45 |
+| research_duckdb | `KXBTCD-26APR` | 64 | 1.55 | 43.45 | 3.57% | -4.44 | 70.31% | 1.13 |
+| research_duckdb | `KXBTCD-26MAY` | 7 | 1.45 | 4.55 | 31.87% | -0.66 | 85.71% | 3.20 |
+
+Looser replay allowing multiple active markets in the same hourly event:
+
+Source: `backtest_outputs/research_duckdb_allow_multi_event/backtest_research_duckdb_summary.csv`
+
+| Strategy | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Win Rate | Profit Factor | Max Active Premium ($) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| research_duckdb | 242 | 2.87 | 167.13 | 1.72% | -14.29 | 70.25% | 1.06 | 7.22 |
+
+Interpretation: this is the only execution-faithful historical replay in the
+repo right now. It removes the Coinbase candle timestamp lookahead, does not
+forward-fill stale Kalshi prices, uses observed bid/ask candles for entries,
+charges Kalshi taker fees, and defaults to one active position per event. It
+still uses historical minute candle closes rather than full orderbook-depth
+snapshots, and the BTC cache reported 15 internal minute gaps on the full
+build. Those gaps are not forward-filled by this replay.
+
+The paper row uses the original `scripts/btc_1hr_paper.py` signal thresholds
+and simple rolling BTC volatility model, but applies the official taker fee
+formula in both edge filtering and PnL. That fee correction makes it stricter
+than the old paper script's fixed `0.70c` fee assumption.
+
+The older reports below are retained for comparison only. They used CSV prices
+with an assumed spread, so they are useful diagnostics but not production-grade
+evidence of edge.
 
 ### March 2026, Official Fee + 2c Assumed Spread
 
@@ -287,9 +373,13 @@ Source:
 
 ### Production Selection
 
-Deploy `scripts/btc_1hr_research_live.py`. Across March and April it had
-the best PnL, best return on premium, best profit factor, and materially
-lower drawdown than the other two BTC 1-hour scripts.
+If running the research strategy, use `scripts/btc_1hr_research_live.py`
+rather than the older paper or hardened scripts. However, the March/April
+selection was based on the assumed-spread CSV replay above. After the corrected
+DuckDB replay, the edge is much smaller and should be treated as a modest
+historical bid/ask-candle edge, not proof of live production profitability.
+The next data upgrade is full orderbook-depth snapshots plus Coinbase spot
+snapshots at decision time.
 
 Live execution safeguards:
 
@@ -299,6 +389,7 @@ Live execution safeguards:
 | Correct market | Trades only cumulative `-T` markets inside that exact event; bucket markets and next-day events are rejected. |
 | Duplicate protection | Blocks existing DB `submitted`, `filled`, or `partial_filled` rows and all nonzero live Kalshi positions by ticker. |
 | Bankroll control | Reads Kalshi `balance` and `portfolio_value` every live cycle, blocks orders that exceed available cash, per-market exposure, or total active exposure. |
+| Scaled sizing | Keeps the backtested one-contract signal filter, then sizes the final live order up to 3 contracts when bankroll, exposure, and visible orderbook depth allow it. |
 | Order pricing | Uses real YES and NO orderbook bids. YES ask is `1 - best NO bid`; NO ask is `1 - best YES bid`. |
 | Order type | Uses Kalshi V2 FOK orders with `cancel_order_on_pause` and self-trade prevention. |
 | Unknown order state | Inserts a local `submitted` row before POSTing; timeout/unknown state blocks re-entry instead of retrying blindly. |

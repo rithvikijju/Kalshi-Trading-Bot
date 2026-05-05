@@ -18,3 +18,12 @@ backtest_outputs/
 data/*.db
 data/*.parquet
 data/kalshi_history.db
+
+# Full local datamart is too large for regular GitHub pushes.
+# Keep only the compact replay DB and its report in git.
+data/research_datamart/*
+!data/research_datamart/research_backtest.duckdb
+!data/research_datamart/datamart_report.json
+data/research_datamart_test/
+data/research_datamart_bidask_smoke/
+data/research_datamart_smoke_bidask/

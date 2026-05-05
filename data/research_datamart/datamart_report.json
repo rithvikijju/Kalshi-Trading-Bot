@@ -1,0 +1,23 @@
+{
+  "built_at": "2026-05-05T19:56:24.070725+00:00",
+  "source_sqlite": "C:\\Users\\ahmed\\Documents\\Computer_Science\\Projects\\Kalshi-Trading-Bot\\data\\kalshi_history.db",
+  "out_dir": "data\\research_datamart",
+  "btc_cache": "data\\research_datamart\\btc_1m_cache.parquet",
+  "bidask_dir": "data\\research_datamart\\kalshi_bidask_events",
+  "markets": 233241,
+  "quote_rows": 2627142,
+  "quote_events": 1474,
+  "sqlite_quote_rows": 214261,
+  "event_bidask_quote_rows": 2492538,
+  "csv_price_rows": 2193773,
+  "csv_events": 1470,
+  "btc_rows": 107317,
+  "btc_start_available_at": "2026-02-20 04:01:00+00:00",
+  "btc_end_available_at": "2026-05-05 17:02:00+00:00",
+  "btc_internal_gap_count": 15,
+  "notes": [
+    "kalshi_quotes contains observed bid/ask candles only; no forward fill.",
+    "btc_1m.available_at is Coinbase bucket_start + 1 minute.",
+    "kalshi_csv_prices is raw/reference data and is not execution-faithful."
+  ]
+}

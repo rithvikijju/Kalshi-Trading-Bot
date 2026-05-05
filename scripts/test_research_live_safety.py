@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -18,12 +19,14 @@ from scripts.btc_1hr_research_live import (
     TradeSignal,
     bankroll_allows_trade,
     build_research_event,
+    choose_contracts_for_signal,
     db_active_tickers,
     db_connect,
     market_is_research_cumulative,
     parse_event_close_from_ticker,
     quote_from_orderbook,
     record_trade,
+    resize_signal,
     signal_from_book,
     update_trade_response,
 )
@@ -114,6 +117,16 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         q2 = quote_from_orderbook("T", {"orderbook_fp": {"yes_dollars": [["0.6200", "10"]], "no_dollars": [["0.3500", "7"]]}})
         self.assertEqual((round(q2.yes_bid, 4), round(q2.yes_ask, 4), round(q2.no_bid, 4), round(q2.no_ask, 4)), (0.62, 0.65, 0.35, 0.38))
 
+    def test_signal_allows_spread_at_limit_with_float_noise(self) -> None:
+        close = datetime(2026, 5, 5, 6, 0, tzinfo=timezone.utc)
+        event = {"event_ticker": "KXBTCD-26MAY0502", "close_time": close, "ttl_hours": 0.5}
+        mkt = market("KXBTCD-26MAY0502", close)
+        quote = BookQuote("x", 0.48, 10, 0.500000000001, 10, None, 0, None, 0)
+        emp_cache = {30: {"n": 100000}}
+        with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.80, 30.0)):
+            sig = signal_from_book(event, mkt, quote, None, emp_cache, 100500.0, 1, 12.0, 2.0)
+        self.assertIsNotNone(sig)
+
     def test_submitted_and_partial_fills_block_reentry(self) -> None:
         close = datetime.now(timezone.utc) + timedelta(hours=1)
         sig = sample_signal(close)
@@ -140,6 +153,25 @@ class ResearchLiveSafetyTests(unittest.TestCase):
 
         maxed = PortfolioSnapshot(available_balance=100.0, portfolio_value=100.0, active_tickers=set(), market_exposure=50.0)
         self.assertFalse(bankroll_allows_trade(sig, maxed, 0.0, 0.0)[0])
+
+    def test_live_sizing_caps_at_three_and_recalculates_fee(self) -> None:
+        sig = sample_signal(datetime.now(timezone.utc) + timedelta(hours=1))
+        portfolio = PortfolioSnapshot(available_balance=20.0, portfolio_value=20.0, active_tickers=set(), market_exposure=0.0)
+        contracts = choose_contracts_for_signal(sig, portfolio, local_active_exposure=0.0, spent_this_cycle=0.0)
+        self.assertEqual(contracts, 3)
+
+        sized = resize_signal(sig, contracts)
+        self.assertEqual(sized.contracts, 3)
+        self.assertGreater(sized.entry_fee, sig.entry_fee)
+        self.assertLessEqual(sized.contracts * sized.entry_price + sized.entry_fee, 4.0)
+
+    def test_live_sizing_respects_cash_and_active_exposure(self) -> None:
+        sig = sample_signal(datetime.now(timezone.utc) + timedelta(hours=1))
+        low_cash = PortfolioSnapshot(available_balance=1.0, portfolio_value=20.0, active_tickers=set(), market_exposure=0.0)
+        self.assertEqual(choose_contracts_for_signal(sig, low_cash, 0.0, 0.0), 2)
+
+        maxed = PortfolioSnapshot(available_balance=20.0, portfolio_value=20.0, active_tickers=set(), market_exposure=10.0)
+        self.assertEqual(choose_contracts_for_signal(sig, maxed, 0.0, 0.0), 0)
 
 
 if __name__ == "__main__":

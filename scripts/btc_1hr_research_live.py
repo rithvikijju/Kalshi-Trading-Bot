@@ -31,7 +31,7 @@ import re
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
@@ -79,10 +79,12 @@ RESEARCH_MAX_NO_P = 0.35
 BRTI_DAMPENING = 0.80
 ORDERBOOK_BATCH_SIZE = 100
 ACTIVE_TRADE_STATUSES = ("paper_filled", "filled", "partial_filled", "submitted")
+FLOAT_EPSILON = 1e-9
 RESEARCH_SERIES = "KXBTCD"
 RESEARCH_TRAIN_DAYS = 7
 RESEARCH_BOOTSTRAP_BTC_DAYS = RESEARCH_TRAIN_DAYS + 2
-RESEARCH_CONTRACTS = 1
+RESEARCH_SIGNAL_CONTRACTS = 1
+RESEARCH_MAX_CONTRACTS_PER_TRADE = 3
 RESEARCH_MAX_TTL_MIN = 65.0
 RESEARCH_EVENT_CLOSE_TOLERANCE_SEC = 120
 RESEARCH_SCAN_INTERVAL_SEC = 60
@@ -696,9 +698,9 @@ def signal_from_book(
         return None
     if net_edge_cents < threshold:
         return None
-    if best["spread"] > max_spread_cents:
+    if best["spread"] > max_spread_cents + FLOAT_EPSILON:
         return None
-    if entry_price < RESEARCH_MIN_ENTRY or entry_price > RESEARCH_MAX_ENTRY:
+    if entry_price < RESEARCH_MIN_ENTRY - FLOAT_EPSILON or entry_price > RESEARCH_MAX_ENTRY + FLOAT_EPSILON:
         return None
     if best["available_qty"] < contracts:
         return None
@@ -1001,6 +1003,50 @@ def estimated_trade_cost(signal: TradeSignal) -> float:
     return signal.contracts * signal.entry_price + signal.entry_fee
 
 
+def choose_contracts_for_signal(
+    signal: TradeSignal,
+    portfolio: PortfolioSnapshot | None,
+    local_active_exposure: float,
+    spent_this_cycle: float,
+) -> int:
+    max_contracts = min(RESEARCH_MAX_CONTRACTS_PER_TRADE, int(math.floor(signal.available_qty)))
+    if max_contracts <= 0:
+        return 0
+    if portfolio is None:
+        return max_contracts
+
+    bankroll = max(portfolio.portfolio_value, portfolio.available_balance)
+    total_exposure = max(portfolio.market_exposure, local_active_exposure) + spent_this_cycle
+    budget = min(
+        portfolio.available_balance,
+        bankroll * RESEARCH_MAX_PER_MARKET_FRACTION,
+        bankroll * RESEARCH_MAX_TOTAL_EXPOSURE_FRACTION - total_exposure,
+    )
+    if budget <= 0:
+        return 0
+
+    chosen = 0
+    for contracts in range(1, max_contracts + 1):
+        fee = kalshi_fee_dollars(signal.entry_price, contracts=contracts, liquidity="taker")
+        cost = signal.entry_price * contracts + fee
+        if cost <= budget:
+            chosen = contracts
+        else:
+            break
+    return chosen
+
+
+def resize_signal(signal: TradeSignal, contracts: int) -> TradeSignal:
+    fee = kalshi_fee_dollars(signal.entry_price, contracts=contracts, liquidity="taker")
+    fee_cents_per_contract = (fee / contracts) * 100.0 if contracts > 0 else 0.0
+    return replace(
+        signal,
+        contracts=contracts,
+        entry_fee=fee,
+        net_edge_cents=signal.edge_gross_cents - fee_cents_per_contract,
+    )
+
+
 def db_active_exposure(conn: sqlite3.Connection, now: datetime) -> float:
     placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
     row = conn.execute(
@@ -1090,7 +1136,7 @@ def find_signals(
                 btc_1m,
                 emp_cache,
                 spot=spot,
-                contracts=RESEARCH_CONTRACTS,
+                contracts=RESEARCH_SIGNAL_CONTRACTS,
                 min_edge_cents=RESEARCH_MIN_EDGE_CENTS,
                 max_spread_cents=RESEARCH_MAX_SPREAD_CENTS,
             )
@@ -1214,6 +1260,11 @@ def run_once(args, data_client: KalshiApi, trade_client: KalshiApi | None, conn:
         if not fresh:
             log.info("skip %s: failed fresh orderbook reprice/filter", original.market_ticker)
             continue
+        sized_contracts = choose_contracts_for_signal(fresh, portfolio, local_active_exposure, spent_this_cycle)
+        if sized_contracts <= 0:
+            log.info("skip %s: bankroll/depth gate allowed 0 contracts", fresh.market_ticker)
+            continue
+        fresh = resize_signal(fresh, sized_contracts)
         estimated_cost = fresh.contracts * fresh.entry_price + fresh.entry_fee
         if portfolio is not None:
             ok, reason = bankroll_allows_trade(fresh, portfolio, local_active_exposure, spent_this_cycle)
@@ -1305,7 +1356,7 @@ def main() -> None:
         args.trade_env,
         RESEARCH_SERIES,
         RESEARCH_TRAIN_DAYS,
-        RESEARCH_CONTRACTS,
+        RESEARCH_MAX_CONTRACTS_PER_TRADE,
         args.interval_sec,
         LOG_FILE,
     )
