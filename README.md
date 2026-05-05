@@ -224,5 +224,97 @@ the NN reproduces the LSIP target sign with ~89% accuracy.
 pip install -r requirements.txt
 ```
 
+## BTC 1-Hour Kalshi Backtest Report
 
+Backtest script:
+
+```
+python scripts/backtest_1hr_collected_data.py
+```
+
+Live execution script:
+
+```
+python scripts/btc_1hr_research_live.py
+```
+
+The deployed live script is pinned to the successful research backtest:
+KXBTCD hourly BTC markets only, cumulative "$X or above" markets only,
+one selected signal per minute, one contract per signal, 7-day empirical
+training window frozen at event open, official Kalshi taker fee estimate,
+and real orderbook execution checks. Running it with no flags starts live
+prod execution. Use `--dry-run --once` for a one-cycle validation scan.
+
+### Data Verification
+
+| Month | Files | Time Coverage (UTC) | Rows/File | Markets/File | Errors | Missing Calendar Candidates |
+|---|---:|---|---:|---:|---:|---:|
+| March 2026 | 696 | 2026-03-01 04:01 -> 2026-04-01 03:00 | 60 | 75-188 | 0 | 48 |
+| April 2026 | 670 | 2026-04-01 03:01 -> 2026-05-01 03:00 | 60 | 188 | 0 | 50 |
+
+The missing candidates are mostly recurring unavailable hours in the Kalshi
+history export set, not malformed files. The verifier refused to backtest on
+structural errors; both March and April reports had `errors: []`.
+
+### March 2026, Official Fee + 2c Assumed Spread
+
+Source: `backtest_outputs/march_official_fee_2c/backtest_1hr_summary.csv`
+
+| Strategy | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Win Rate | Profit Factor | Avg Edge (c) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| paper | 2,108 | 164.47 | 1,089.53 | 15.10% | -8.74 | 59.49% | 1.38 | 12.12 |
+| neohardened | 3,488 | 336.55 | 2,196.45 | 15.32% | -7.11 | 72.62% | 1.60 | 19.22 |
+| research | 2,081 | 364.67 | 1,184.33 | 30.79% | -3.12 | 74.44% | 2.24 | 23.49 |
+
+### April 2026, Official Fee + 2c Assumed Spread
+
+Source: `backtest_outputs/april_official_fee_2c/backtest_1hr_summary.csv`
+
+| Strategy | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Win Rate | Profit Factor | Avg Edge (c) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| paper | 2,187 | 204.93 | 1,140.07 | 17.98% | -11.32 | 61.50% | 1.48 | 13.70 |
+| neohardened | 3,623 | 390.87 | 2,254.13 | 17.34% | -14.01 | 73.01% | 1.67 | 21.28 |
+| research | 2,203 | 413.93 | 1,247.07 | 33.19% | -5.97 | 75.40% | 2.33 | 25.78 |
+
+### April 2026, Research Rerun With Full BTC Cache
+
+Source:
+`backtest_outputs/april_official_fee_2c_fullbtc_research/backtest_1hr_summary.csv`
+
+| Strategy | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Win Rate | Profit Factor | Avg Edge (c) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| research | 2,276 | 418.71 | 1,296.29 | 32.30% | -6.91 | 75.35% | 2.31 | 25.61 |
+
+### Production Selection
+
+Deploy `scripts/btc_1hr_research_live.py`. Across March and April it had
+the best PnL, best return on premium, best profit factor, and materially
+lower drawdown than the other two BTC 1-hour scripts.
+
+Live execution safeguards:
+
+| Guard | Behavior |
+|---|---|
+| Correct event | Trades only the current KXBTCD hourly event whose API close time matches the event ticker's New York close hour. |
+| Correct market | Trades only cumulative `-T` markets inside that exact event; bucket markets and next-day events are rejected. |
+| Duplicate protection | Blocks existing DB `submitted`, `filled`, or `partial_filled` rows and all nonzero live Kalshi positions by ticker. |
+| Bankroll control | Reads Kalshi `balance` and `portfolio_value` every live cycle, blocks orders that exceed available cash, per-market exposure, or total active exposure. |
+| Order pricing | Uses real YES and NO orderbook bids. YES ask is `1 - best NO bid`; NO ask is `1 - best YES bid`. |
+| Order type | Uses Kalshi V2 FOK orders with `cancel_order_on_pause` and self-trade prevention. |
+| Unknown order state | Inserts a local `submitted` row before POSTing; timeout/unknown state blocks re-entry instead of retrying blindly. |
+
+
+
+
+## Historical Runs
+
+### Base Paper Bot (15 Hour Run)
+- **Total Trades:** 61 (Settled: 54)
+- **Net PnL:** +0.532 USD
+- **Win Rate:** 53.7%
+
+### Hardened Bot (15 Hour Run)
+- **Total Trades:** 64 (Settled: 56)
+- **Net PnL:** +1.498 USD
+- **Win Rate:** 50.0%
 

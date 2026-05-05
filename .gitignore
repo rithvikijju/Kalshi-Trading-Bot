@@ -9,3 +9,12 @@ venv/
 # Paper trading runtime logs
 paper_trades.jsonl
 *.jsonl
+*.pem
+*.env
+
+# Generated research/backtest artifacts
+logs/
+backtest_outputs/
+data/*.db
+data/*.parquet
+data/kalshi_history.db
