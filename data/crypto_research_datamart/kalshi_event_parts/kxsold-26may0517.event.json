@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXSOLD-26MAY0517",
+  "series_ticker": "KXSOLD",
+  "asset": "SOL",
+  "product_id": "SOL-USD",
+  "family": "above_below",
+  "frequency": "hourly",
+  "title": "SOL price on May 5, 2026 at 5pm EDT?",
+  "sub_title": "On May 5, 2026 at 5pm EDT",
+  "open_time": "2026-05-04T20:00:00+00:00",
+  "close_time": "2026-05-05T21:00:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

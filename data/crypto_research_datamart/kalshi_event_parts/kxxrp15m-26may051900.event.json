@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXXRP15M-26MAY051900",
+  "series_ticker": "KXXRP15M",
+  "asset": "XRP",
+  "product_id": "XRP-USD",
+  "family": "updown15",
+  "frequency": "fifteen_min",
+  "title": "XRP 15 min \u00b7 $1.4120 target",
+  "sub_title": "May 5 - 6:45PM EDT to 7:00PM EDT",
+  "open_time": "2026-05-05T22:45:00+00:00",
+  "close_time": "2026-05-05T23:00:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXSOL15M-26MAY052045",
+  "series_ticker": "KXSOL15M",
+  "asset": "SOL",
+  "product_id": "SOL-USD",
+  "family": "updown15",
+  "frequency": "fifteen_min",
+  "title": "SOL 15 min \u00b7 $86.1603 target",
+  "sub_title": "May 5 - 8:30PM EDT to 8:45PM EDT",
+  "open_time": "2026-05-06T00:30:00+00:00",
+  "close_time": "2026-05-06T00:45:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXDOGE-26MAY0516",
+  "series_ticker": "KXDOGE",
+  "asset": "DOGE",
+  "product_id": "DOGE-USD",
+  "family": "range",
+  "frequency": "hourly",
+  "title": "Dogecoin price range on May 5, 2026 at 4pm EDT?",
+  "sub_title": "On May 5, 2026 at 4pm EDT",
+  "open_time": "2026-05-05T19:00:00+00:00",
+  "close_time": "2026-05-05T20:00:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

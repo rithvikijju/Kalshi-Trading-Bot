@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXXRP-26MAY0511",
+  "series_ticker": "KXXRP",
+  "asset": "XRP",
+  "product_id": "XRP-USD",
+  "family": "range",
+  "frequency": "hourly",
+  "title": "\nRipple price range at May 5, 2026 at 11am EDT?\n",
+  "sub_title": "On May 5, 2026 at 11am EDT",
+  "open_time": "2026-05-05T14:00:00+00:00",
+  "close_time": "2026-05-05T15:00:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

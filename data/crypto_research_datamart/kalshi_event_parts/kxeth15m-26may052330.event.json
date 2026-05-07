@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXETH15M-26MAY052330",
+  "series_ticker": "KXETH15M",
+  "asset": "ETH",
+  "product_id": "ETH-USD",
+  "family": "updown15",
+  "frequency": "fifteen_min",
+  "title": "ETH 15 min \u00b7 $2,368.89 target",
+  "sub_title": "May 5 - 11:15PM EDT to 11:30PM EDT",
+  "open_time": "2026-05-06T03:15:00+00:00",
+  "close_time": "2026-05-06T03:30:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

@@ -224,6 +224,83 @@ the NN reproduces the LSIP target sign with ~89% accuracy.
 pip install -r requirements.txt
 ```
 
+## BTC 1-Hour Current Handoff
+
+This repo contains several experiments, but the active BTC/Kalshi work is now
+centered on the KXBTCD 1-hour cumulative markets.
+
+Current operational state as of the May 5, 2026 evening run:
+
+| Track | Script | Mode | Strategy | Status / Purpose |
+|---|---|---|---|---|
+| Production live | `scripts/btc_1hr_research_live.py` | Real Kalshi prod orders | `research` | The only live-money executor currently intended to run |
+| Paper shadow | `scripts/btc_1hr_js_guarded_shadow.py` | Simulated fills, no orders | `js_guarded` | Watches the same websocket feed with a `$1000` mock bankroll |
+| Historical replay | `scripts/backtest_research_duckdb.py` | Offline DuckDB replay | `paper`, `research`, `js_robust`, `js_guarded` | Causal bid/ask-candle backtests |
+
+The live production bot is intentionally still `research`, not `js_guarded`.
+`js_guarded` is the best corrected-replay candidate so far, but it is being
+paper-shadowed first because its edge is not statistically locked and the old
+minute-candle replay does not exactly match live second-level execution.
+
+Quick commands from the project root:
+
+```powershell
+# Start live production research bot and watch its log.
+$ts = Get-Date -Format "yyyyMMdd_HHmmss"; Start-Process -WindowStyle Hidden -FilePath python -WorkingDirectory (Get-Location) -ArgumentList "scripts\btc_1hr_research_live.py" -RedirectStandardOutput "logs\research_live_$ts.out.log" -RedirectStandardError "logs\research_live_$ts.err.log"; Start-Sleep -Seconds 5; Get-Content "logs\research_live_$ts.out.log" -Wait -Tail 100
+
+# Start js_guarded paper shadow and watch its log.
+$ts = Get-Date -Format "yyyyMMdd_HHmmss"; Start-Process -WindowStyle Hidden -FilePath python -WorkingDirectory (Get-Location) -ArgumentList "scripts\btc_1hr_js_guarded_shadow.py" -RedirectStandardOutput "logs\js_guarded_shadow_$ts.out.log" -RedirectStandardError "logs\js_guarded_shadow_$ts.err.log"; Start-Sleep -Seconds 5; Get-Content "logs\js_guarded_shadow_$ts.out.log" -Wait -Tail 100
+
+# Watch latest live or shadow log without starting a new process.
+$log = (Get-ChildItem logs\research_live_*.out.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName; Get-Content $log -Wait -Tail 100
+$log = (Get-ChildItem logs\js_guarded_shadow_*.out.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName; Get-Content $log -Wait -Tail 100
+
+# Check whether the live and shadow Python processes are still running.
+Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*btc_1hr_research_live.py*' -or $_.CommandLine -like '*btc_1hr_js_guarded_shadow.py*' } | Select-Object ProcessId,CommandLine
+```
+
+Local runtime databases:
+
+| Path | Meaning | Commit? |
+|---|---|---|
+| `~/.btc_kalshi_bot/research_live_trades.db` | SQLite ledger for live research orders and event locks | No |
+| `~/.btc_kalshi_bot/research_live_capture.duckdb` | Websocket/live-capture dataset for exact future replay | No |
+| `~/.btc_kalshi_bot/js_guarded_shadow_trades.db` | Paper-shadow fills for `js_guarded` | No |
+| `~/.btc_kalshi_bot/js_guarded_shadow_capture.duckdb` | Paper-shadow websocket/live-capture dataset | No |
+
+Live incident/fix to know: on May 5, 2026 at `19:47:49` MDT, a live FOK order
+for `KXBTCD-26MAY0522-T81399.99` returned HTTP 409. Kalshi showed the order as
+`canceled` with `fill_count=0.00`, so no fill occurred. The local row was
+synced to `not_filled`. The executor now handles future 409/FOK no-fill cases
+by querying `/portfolio/orders`, updating the local row to
+`not_filled`/`partial_filled`/`filled`, and continuing the websocket loop
+instead of exiting.
+
+Live websocket/capture hardening from the May 5, 2026 late-evening restart:
+
+| Fix | What changed |
+|---|---|
+| Capture backpressure | Raw websocket delta/snapshot-level capture is now off by default; top-of-book, lifecycle, signal scans, order decisions, health rows, and private events remain captured. Use `--capture-raw-ws` only for short diagnostics. |
+| Scan trigger pressure | The raw scan queue was replaced with a coalesced update buffer, so duplicate bursts collapse into one bounded batch while preserving unique changed tickers and full-scan flags. |
+| Event refresh safety | If `/markets` refresh fails after an event is expired or otherwise ineligible, the executor clears the current event set instead of scanning stale markets. |
+| Kalshi REST pressure | `/markets` calls now use retry/backoff plus a local open-market cache during a still-valid event; startup/no-event/expired-event refreshes bypass the cache so the next hour is not missed. |
+| Capture health gate | Live scans skip if the capture writer is unhealthy, because exact live capture is now part of the research process. |
+
+After this patch both live processes were restarted:
+`logs/research_live_20260505_230443.out.log` and
+`logs/js_guarded_shadow_20260505_230443.out.log`. Startup showed websocket
+subscription to `KXBTCD-26MAY0602` with 188 markets and no queue-full,
+traceback, or capture-health errors.
+
+What to trust:
+
+| Use | Trust level |
+|---|---|
+| Corrected DuckDB bid/ask replay | Best historical evidence currently in repo |
+| Exact websocket capture DBs | Required next dataset for live-faithful replay |
+| Raw Kalshi CSV exports | Coverage/reference only, not executable fills |
+| Old assumed-spread CSV backtests | Historical diagnostics only; do not use for deployment decisions |
+
 ## BTC 1-Hour Kalshi Backtest Report
 
 Backtest script:
@@ -263,7 +340,7 @@ structural errors; both March and April reports had `errors: []`.
 Build the corrected research store:
 
 ```
-python scripts/download_kalshi_bidask_history.py --from-csv-dir data --out-dir data/research_datamart/kalshi_bidask_events --workers 4
+python scripts/download_kalshi_bidask_history.py --from-csv-dir data --out-dir data/research_datamart/kalshi_bidask_events --workers 2 --chunk-minutes 15 --overwrite
 python scripts/build_research_datamart.py --out-dir data/research_datamart --fill-internal-btc-gaps
 ```
 
@@ -287,24 +364,291 @@ Outputs:
 | `backtest_outputs/research_duckdb/` | Corrected research backtest report |
 | `backtest_outputs/paper_duckdb/` | Corrected original paper-signal backtest report |
 
+### What The BTC/Kalshi Data Actually Is
+
+There are three distinct data layers. They should not be treated as
+interchangeable.
+
+| Data | Location | What one row means | Used for faithful fills? |
+|---|---|---|---|
+| Raw Kalshi UI CSV exports | `data/kalshi-price-history-kxbtcd-*.csv` and `kalshi_csv_prices` | One timestamp for one hourly event, with many strike columns like `$65000 or above`; values are Kalshi chart/export prices in cents | No |
+| Corrected Kalshi bid/ask replay | `kalshi_quotes` / `kalshi_quotes.parquet` / `research_backtest.duckdb` | One market/strike/minute with observed historical `yes_bid_close` and `yes_ask_close` | Yes |
+| Coinbase BTC candles | `btc_1m` / `btc_1m.parquet` | One Coinbase BTC-USD 1-minute OHLCV candle plus rolling features | Used for signals and settlement proxy |
+
+The raw CSV files are the manual downloads from pages like
+`kxbtcd-26mar0704`, `kxbtcd-26mar0705`, etc. Each file is one hourly KXBTCD
+event, and each column is a cumulative threshold contract. Those files are
+good for coverage checks and rough diagnostics, but they are not enough for a
+production-quality backtest because the exported chart price is not a real
+executable bid/ask pair.
+
+The corrected replay uses Kalshi historical bid/ask candle data instead:
+
+```
+yes entry price = yes_ask_close
+no entry price  = 1 - yes_bid_close
+spread_cents    = (yes_ask_close - yes_bid_close) * 100
+```
+
+This matters because a NO contract is not safely priced as `1 - yes_ask`.
+To buy NO, the backtest has to cross the NO ask, which is equivalent to
+`1 - yes_bid` when only the YES bid/ask pair is available.
+
+Kalshi's event candlestick endpoint can truncate dense responses by returning
+an `adjusted_end_ts` earlier than the requested hour close. The downloader now
+fetches each hourly event in 15-minute chunks, then dedupes by
+`market_ticker, ts_end`. This keeps the data faithful because every retained
+row is still an observed Kalshi bid/ask candle; it just avoids silently losing
+later minutes in a dense event.
+
+The Coinbase BTC data is a market-data proxy for the signal model and
+settlement. The replay treats a Coinbase candle as unavailable until the
+minute closes:
+
+```
+available_at = bucket_start + 1 minute
+```
+
+That removes the major candle lookahead bug. The remaining limitation is that
+Kalshi's actual settlement source may not exactly equal Coinbase BTC-USD, so
+settlement PnL is still a proxy unless official Kalshi settlement/index data
+is collected.
+
+The compact committed DB is:
+
+| Table | Rows | Range / Meaning |
+|---|---:|---|
+| `kalshi_markets` | 235,515 | Hourly cumulative KXBTCD market metadata from roughly Mar 1, 2026 through May 5, 2026 |
+| `kalshi_quotes` | 4,667,431 | Observed historical bid/ask minute candles; no forward fill |
+| `btc_1m` | 107,737 | Coinbase BTC-USD minute candles from Feb 20, 2026 through May 5, 2026 |
+
 Datamart build on 2026-05-05:
 
 | Table | Rows | Distinct Events | Notes |
 |---|---:|---:|---|
-| `kalshi_markets` | 233,241 | n/a | SQLite markets plus bid/ask/CSV-inferred market metadata |
-| `kalshi_quotes` | 2,627,142 | 1,474 | Bid/ask candle data from SQLite plus event candlestick API |
+| `kalshi_markets` | 235,515 | n/a | SQLite markets plus bid/ask/CSV-inferred market metadata |
+| `kalshi_quotes` | 4,667,431 | 1,492 | Bid/ask candle data from SQLite plus chunked event candlestick API |
 | `kalshi_csv_prices` | 2,193,773 | 1,470 | Raw downloaded midpoint-style CSV history; not used for fills |
-| `btc_1m` | 107,317 | n/a | Coinbase minute OHLCV from 2026-02-20 to 2026-05-05 |
+| `btc_1m` | 107,737 | n/a | Coinbase minute OHLCV from 2026-02-20 to 2026-05-05 |
+
+Coverage after chunking:
+
+| Measure | Corrected Bid/Ask | Raw CSV Price | Notes |
+|---|---:|---:|---|
+| Rows | 4,667,431 | 2,193,773 | Bid/ask has more market/strike observations because it keeps actual quote rows |
+| Events | 1,492 | 1,470 | Extra bid/ask events come from SQLite history around the edge of the range |
+| Event-minutes | 95,334 | 88,188 | Bid/ask includes some extra SQLite minutes |
+| Raw CSV event-minutes covered by bid/ask | 88,160 / 88,188 | n/a | 99.97% coverage of the raw CSV minute grid |
 
 Corrected faithful replay:
 
-Sources: `backtest_outputs/research_duckdb/backtest_research_duckdb_summary.csv`
-and `backtest_outputs/paper_duckdb/backtest_paper_duckdb_summary.csv`.
+Sources:
+`backtest_outputs/research_duckdb_chunked_bidask/backtest_research_duckdb_summary.csv`
+and
+`backtest_outputs/paper_duckdb_chunked_bidask/backtest_paper_duckdb_summary.csv`,
+plus the later JS-family runs in
+`backtest_outputs/js_robust_chunked_bidask_full/` and
+`backtest_outputs/js_guarded_chunked_bidask_full/`.
 
 | Strategy | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Win Rate | Profit Factor | Max Active Premium ($) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| paper_duckdb | 1,931 | -83.85 | 1,041.85 | -8.05% | -85.63 | 49.61% | 0.84 | 6.58 |
-| research_duckdb | 128 | 7.04 | 87.96 | 8.00% | -5.07 | 74.22% | 1.32 | 0.77 |
+| paper_duckdb | 2,532 | -83.39 | 1,362.39 | -6.12% | -84.78 | 50.51% | 0.87 | 7.78 |
+| research_duckdb | 173 | 6.25 | 118.75 | 5.26% | -5.93 | 72.25% | 1.20 | 0.77 |
+| js_robust_duckdb | 160 | 5.79 | 114.21 | 5.07% | -4.40 | 75.00% | 1.21 | 0.80 |
+| js_guarded_duckdb | 120 | 7.56 | 85.44 | 8.85% | -1.98 | 77.50% | 1.40 | 0.82 |
+
+Equity/drawdown chart:
+`backtest_outputs/plots/research_equity_corrected_bidask.png`.
+Research/JS overlay chart:
+`backtest_outputs/plots/js_guarded_vs_research_corrected_bidask.png`.
+
+### Third Strategy: `js_robust`
+
+Implemented in `scripts/backtest_research_duckdb.py` as `--strategy js_robust`.
+This is a conservative research variant, not a production live bot yet. It was
+designed from train-period diagnostics and market-microstructure constraints:
+
+| Component | Rule |
+|---|---|
+| Probability model | Same empirical/lognormal model as `research` |
+| Market prior | Shrink model probability 25% toward Kalshi bid/ask mid |
+| Edge | Taker-fee-adjusted edge must beat an uncertainty-adjusted threshold |
+| Execution | Observed historical bid/ask candle only; no forward fill |
+| Positioning | One active market per hourly event |
+| Entry | Favorite-priced contracts only, `0.55 <= entry <= 0.80` |
+| Spread | `spread_cents <= 2` |
+
+Chronological split by event close time:
+
+| Split | Event Close Range (UTC) |
+|---|---|
+| Train | `< 2026-04-01 00:00` |
+| Validation | `2026-04-01 00:00` to `< 2026-04-21 00:00` |
+| Test | `>= 2026-04-21 00:00` |
+
+Source: `backtest_outputs/strategy_split_comparison.csv`.
+Latest combined source with guarded variants:
+`backtest_outputs/js_guarded_strategy_comparison.csv`.
+
+| Strategy | Split | Trades | PnL ($) | Premium ($) | Return on Premium | Win Rate | Max DD ($) |
+|---|---|---:|---:|---:|---:|---:|---:|
+| paper | train | 1,051 | -41.90 | 560.90 | -7.47% | 49.38% | -43.78 |
+| paper | validation | 837 | -17.53 | 453.53 | -3.87% | 52.09% | -24.29 |
+| paper | test | 644 | -23.96 | 347.96 | -6.89% | 50.31% | -28.19 |
+| research | train | 66 | 4.49 | 46.51 | 9.65% | 77.27% | -1.89 |
+| research | validation | 54 | -0.65 | 36.65 | -1.77% | 66.67% | -5.93 |
+| research | test | 53 | 2.41 | 35.59 | 6.77% | 71.70% | -3.27 |
+| js_robust | train | 64 | 1.69 | 46.31 | 3.65% | 75.00% | -1.99 |
+| js_robust | validation | 51 | 0.97 | 36.03 | 2.69% | 72.55% | -4.40 |
+| js_robust | test | 45 | 3.13 | 31.87 | 9.82% | 77.78% | -1.69 |
+| js_guarded | train | 44 | 1.42 | 31.58 | 4.50% | 75.00% | -1.81 |
+| js_guarded | validation | 42 | 2.23 | 29.77 | 7.49% | 76.19% | -1.98 |
+| js_guarded | test | 34 | 3.91 | 24.09 | 16.23% | 82.35% | -1.42 |
+
+Interpretation: `js_robust` is less explosive than the original research
+strategy on train, but it is positive on train, validation, and test.
+`js_guarded` is the current best replay candidate because it improves full
+sample PnL, return on premium, held-out test PnL, and max drawdown at once. The
+trade count is still small, so this is a stronger candidate for live-capture
+paper validation, not proof of a production edge.
+
+### Fourth Strategy: `js_guarded`
+
+Implemented in `scripts/backtest_research_duckdb.py` as
+`--strategy js_guarded`. This was selected from train/validation diagnostics,
+then checked on the held-out `>= 2026-04-21` test split.
+
+Rules:
+
+| Component | Rule |
+|---|---|
+| Base model | Same as `js_robust` |
+| UTC-hour guard | Do not enter during UTC hours `17` through `23` |
+| Moneyness guard | Require `abs(entry_spot - strike) / entry_spot <= 60 bps` |
+| Entry/order rules | Same favorite-priced, fee-adjusted, one-position-per-event JS robust rules |
+
+Full corrected replay:
+
+| Strategy | Trades | PnL ($) | Premium ($) | Return on Premium | Win Rate | Max DD ($) |
+|---|---:|---:|---:|---:|---:|---:|
+| research | 173 | 6.25 | 118.75 | 5.26% | 72.25% | -5.93 |
+| js_robust | 160 | 5.79 | 114.21 | 5.07% | 75.00% | -4.40 |
+| js_guarded | 120 | 7.56 | 85.44 | 8.85% | 77.50% | -1.98 |
+
+Rejected guarded variants:
+
+| Variant | Train PnL ($) | Validation PnL ($) | Test PnL ($) | Decision |
+|---|---:|---:|---:|---|
+| `js_guarded_skipmid` | -0.12 | 2.37 | 3.61 | Rejected: train turned negative when replayed as a real strategy |
+| `js_guarded_late` | 2.51 | 0.13 | 1.39 | Rejected for primary use: too little validation capacity |
+
+Event-block bootstrap over hourly opportunities estimated
+`P(js_guarded PnL > js_robust PnL) ~= 0.70`; the 95% interval for the PnL
+difference still crossed zero. Treat the result as materially better but not
+statistically locked. The next gate is exact websocket live-capture replay.
+
+Side research: `scripts/diagnose_cross_hour_continuity.py` explores whether
+same-strike prices jump when one hourly event closes and the next opens.
+The first diagnostic found 161,188 same-strike cross-hour pairs. Extreme
+contracts usually had zero median transition, but near-the-money buckets had
+larger absolute one-minute transition moves. This is a promising separate
+hypothesis, but it is not included in `js_robust` and needs its own
+leakage-safe strategy test.
+
+Leakage-safe cross-hour reset test: `scripts/backtest_cross_hour_reset.py`
+turns the same-strike continuity idea into an executable strategy that waits
+for the next event's first observed quote, uses only bid/ask candle data, and
+holds to settlement. It was tested only on train and validation; the test split
+was left unused because the idea failed validation.
+
+| Split | Trades | PnL ($) | Premium ($) | Return on Premium | Win Rate | Max DD ($) |
+|---|---:|---:|---:|---:|---:|---:|
+| train | 63 | -1.21 | 46.21 | -2.62% | 71.43% | -3.97 |
+| validation | 51 | -1.81 | 36.81 | -4.92% | 68.63% | -5.35 |
+
+Cross-hour overlay research: `scripts/research_cross_hour_overlay.py` fits a
+regularized train-only model using first-minutes current quotes plus previous
+adjacent event same-strike boundary information. The cross-hour features did
+slightly improve train probability diagnostics, and the validation AUC nudged
+higher, but executable trades failed validation after bid/ask and fees.
+
+First observed minute only, train-fitted model:
+
+| Split | Threshold | Trades | PnL ($) | Premium ($) | Return on Premium | Win Rate | Max DD ($) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| train | 8c | 108 | 5.01 | 67.99 | 7.37% | 67.59% | -8.19 |
+| validation | 8c | 97 | -16.23 | 61.23 | -26.51% | 46.39% | -18.63 |
+
+Interpretation: there is cross-hour statistical structure, but this version is
+not a tradable overlay. Do not deploy it unless a new frozen rule passes
+validation first.
+
+Inter-market overlap test: `scripts/research_intermarket_overlap.py` trains a
+train-only current-market classifier and a train-only inter-market classifier,
+then uses the inter-market edge as a filter on existing `research` and
+`js_robust` trades. The inter-market model slightly improved train fit, but it
+did not beat the current-only model on validation:
+
+| Split | Model | Rows | Log Loss | Brier | AUC |
+|---|---|---:|---:|---:|---:|
+| train | current_only | 1,195,058 | 0.081834 | 0.024193 | 0.995901 |
+| train | intermarket | 1,195,058 | 0.081526 | 0.024082 | 0.995927 |
+| validation | current_only | 1,101,798 | 0.065651 | 0.019557 | 0.997353 |
+| validation | intermarket | 1,101,798 | 0.066119 | 0.019716 | 0.997318 |
+
+Validation overlap examples:
+
+| Strategy | Rule | Trades | PnL ($) | Return on Premium |
+|---|---|---:|---:|---:|
+| js_robust | baseline_all | 51 | 0.97 | 2.69% |
+| js_robust | intermarket_edge_ge_-5c | 36 | -0.24 | -0.95% |
+| research | baseline_all | 54 | -0.65 | -1.77% |
+| research | intermarket_edge_ge_-5c | 38 | 0.23 | 0.89% |
+
+Interpretation: the overlap helped `research` validation at a loose threshold,
+but hurt `js_robust` and did not show clean model-level validation improvement.
+This is not robust enough to deploy.
+
+Dynamic exit research: `scripts/research_dynamic_exits.py` replays take-profit,
+stop-loss, trailing, and panic-exit rules on existing faithful trade logs.
+Early exits sell at the executable bid side (`yes_bid_close` for long YES,
+`1 - yes_ask_close` for long NO) and subtract a second Kalshi taker fee at the
+exit price. Holding to settlement has no exit order fee. The script defaults to
+`--splits train validation` to preserve the unseen test set.
+
+| Strategy | Split | Best Rule | PnL ($) | Return on Premium | Max DD ($) | Interpretation |
+|---|---|---|---:|---:|---:|---|
+| js_robust | train | hold | 1.69 | 3.65% | -1.99 | All tested exits underperformed after exit spread/fees |
+| js_robust | validation | hold | 0.97 | 2.69% | -4.40 | No routine exit should be added |
+| research | train | hold | 4.49 | 9.65% | -1.89 | Early exits clipped winners |
+| research | validation | panic_bid_le_40 | -0.03 | -0.08% | -2.99 | Defensive only; it hurt train and is not robust |
+
+Model emergency exit research: `scripts/research_model_emergency_exits.py`
+tests a rarer rule: exit only when the updated held-side model win probability
+is low and the executable bid, after a second taker fee, is richer than the
+model's hold value. The most stable frozen candidate so far is
+`pwin_le_30_mkt_plus_5`: exit when held-side `p_win <= 30%` and
+`exit_bid - exit_fee >= p_win + 5c`.
+
+| Strategy | Split | Rule | Early Exits | PnL ($) | Return on Premium | Max DD ($) |
+|---|---|---|---:|---:|---:|---:|
+| js_robust | train | hold | 0 | 1.69 | 3.65% | -1.99 |
+| js_robust | train | pwin_le_30_mkt_plus_5 | 11 | 1.93 | 4.17% | -1.72 |
+| js_robust | validation | hold | 0 | 0.97 | 2.69% | -4.40 |
+| js_robust | validation | pwin_le_30_mkt_plus_5 | 7 | 1.10 | 3.05% | -4.62 |
+| js_robust | test | hold | 0 | 3.13 | 9.82% | -1.69 |
+| js_robust | test | pwin_le_30_mkt_plus_5 | 2 | 2.86 | 8.97% | -1.84 |
+| research | train | hold | 0 | 4.49 | 9.65% | -1.89 |
+| research | train | pwin_le_30_mkt_plus_5 | 14 | 4.90 | 10.54% | -1.19 |
+| research | validation | hold | 0 | -0.65 | -1.77% | -5.93 |
+| research | validation | pwin_le_30_mkt_plus_5 | 11 | 1.68 | 4.58% | -3.88 |
+| research | test | hold | 0 | 2.41 | 6.77% | -3.27 |
+| research | test | pwin_le_30_mkt_plus_5 | 8 | 1.89 | 5.31% | -2.61 |
+
+Interpretation: unlike blunt stops, this is a plausible emergency-only exit
+candidate, but it did not improve held-out test returns after being frozen.
+It may be useful only as a drawdown-control paper experiment, not as a
+production alpha improvement.
 
 Event-prefix splits:
 
@@ -332,6 +676,79 @@ charges Kalshi taker fees, and defaults to one active position per event. It
 still uses historical minute candle closes rather than full orderbook-depth
 snapshots, and the BTC cache reported 15 internal minute gaps on the full
 build. Those gaps are not forward-filled by this replay.
+
+What we learned:
+
+| Finding | Practical meaning |
+|---|---|
+| The old CSV assumed-spread backtests were too optimistic | They used chart/export prices plus an assumed spread, so their large March/April returns are not production-grade evidence |
+| The first corrected replay was still sparse | The old bid/ask downloader ignored Kalshi `adjusted_end_ts`, so dense event hours were often truncated |
+| Chunking fixed most of that incompleteness | Corrected bid/ask now covers 99.97% of raw CSV event-minutes while remaining observed bid/ask data only |
+| Fees materially matter | The corrected replay includes Kalshi taker fees in both edge filtering and realized PnL |
+| The original paper strategy does not survive the corrected replay | It took 2,532 trades and lost $83.39, or -6.12% on premium |
+| The research strategy survives, but the edge is smaller | It took 173 trades and made $6.25, or +5.26% on premium |
+| More trades was worse for research | Allowing multiple active markets per hourly event dropped return on premium to +1.72% and increased drawdown |
+| The live bot should stay pinned to the corrected research constraints | One selected signal per event, real bid/ask pricing, taker fees, duplicate protection, and bankroll sizing are part of the tested setup |
+| There is still live-execution risk | Minute candles do not prove fillability, queue priority, exact depth, or sub-minute latency |
+| There is still settlement-index risk | Coinbase BTC is used as the settlement proxy; exact Kalshi settlement/index data would be better |
+
+### May 5 Live Replay Audit
+
+Source data: `data/research_datamart/research.duckdb`, rebuilt
+`2026-05-06T00:05:18Z` from corrected Kalshi bid/ask event candles plus the
+Coinbase BTC minute cache. The recent corrected bid/ask window now runs from
+`KXBTCD-26APR2519` through `KXBTCD-26MAY0520`. Four synthetic hourly slots
+inside that range, `KXBTCD-26APR3002` through `KXBTCD-26APR3005`, returned
+Kalshi API 404s and have no local raw or corrected data, so they are marked as
+unavailable rather than filled.
+
+Replay window: `2026-05-05T05:00:00Z` through `2026-05-06T00:05:18Z`
+(`May 4 11:00 PM MDT` through the latest rebuilt data).
+
+| Run | Path | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) |
+|---|---|---:|---:|---:|---:|---:|
+| strict research replay | `backtest_outputs/may5_0500_to_now_research_final` | 1 | 0.28 | 0.72 | 38.89% | 0.00 |
+| research replay allowing multiple same-event markets | `backtest_outputs/may5_0500_to_now_research_final_multi` | 4 | 1.17 | 2.83 | 41.34% | 0.00 |
+| original paper thresholds on corrected data | `backtest_outputs/may5_0500_to_now_paper_final` | 30 | -1.88 | 16.88 | -11.14% | -4.71 |
+
+Live reconciliation from `~/.btc_kalshi_bot/research_live_trades.db` over the
+same window found 9 filled research trades, each sized to 3 contracts, with
+estimated realized PnL `-$2.0088` on `$17.0088` of premium plus fees. Only 1 of
+those live fills matched the strict replay; only 2 matched the looser
+same-event replay. Reconciliation output:
+`backtest_outputs/may5_0500_to_now_live_reconciliation.csv`.
+
+What failed:
+
+| Issue | Meaning |
+|---|---|
+| Live duplicate protection was ticker-level, not event-level | The strict replay assumes one active position per hourly event, but live could buy a second market in the same `KXBTCD-...HH` event on a later scan. This was patched in `scripts/btc_1hr_research_live.py`. |
+| Historical Kalshi replay is minute-candle bid/ask, not second-level book replay | Live saw orderbook prices inside a minute that the replay cannot know until the candle closes; using the minute low/high would be lookahead. |
+| Live spot is Coinbase spot, replay spot is Coinbase completed-minute candle close | In the audit the live-vs-replay BTC spot difference reached about `$56`, enough to move edge filters on near-the-money contracts. |
+
+Current implication: the corrected DuckDB replay is still the best historical
+replay in the repo, but it is not an exact live execution simulator. Exact
+matching requires recording decision-time Coinbase spot snapshots and
+decision-time Kalshi orderbook snapshots.
+
+No-leakage replay rule: valid replays must use only causal Kalshi quotes. In
+`scripts/backtest_research_live_approx.py`, that means `--quote-timing causal`.
+The `--quote-timing containing` mode is blocked unless
+`--allow-lookahead-diagnostic` is explicitly passed, because it uses the
+current minute's completed candle and therefore includes information from after
+the bot's decision second.
+
+No-leakage May 5 rerun from the actual overnight bot start
+(`2026-05-05T06:29:27Z`) through `2026-05-06T00:20:25Z`:
+
+| Replay | Path | Trades | PnL ($) | Live Trades | Live PnL ($) | Matched Live Setups |
+|---|---|---:|---:|---:|---:|---:|
+| Logged scans, old ticker dedupe, causal quotes | `backtest_outputs/may5_no_leak_live_replay/replay_causal_close_ticker.csv` | 3 | 2.70 | 9 | -2.0088 | 2/9 |
+| Logged scans, fixed event dedupe, causal quotes | `backtest_outputs/may5_no_leak_live_replay/replay_causal_close_event.csv` | 1 | 0.85 | 9 | -2.0088 | 2/9 |
+| Canonical research replay, causal quotes | `backtest_outputs/may5_no_leak_canonical_research` | 1 | 0.28 per contract | n/a | n/a | n/a |
+
+Interpretation: without leakage, the replay misses most of the live fills. That
+is the honest result from the current historical candle dataset.
 
 The paper row uses the original `scripts/btc_1hr_paper.py` signal thresholds
 and simple rolling BTC volatility model, but applies the official taker fee
@@ -374,25 +791,247 @@ Source:
 ### Production Selection
 
 If running the research strategy, use `scripts/btc_1hr_research_live.py`
-rather than the older paper or hardened scripts. However, the March/April
-selection was based on the assumed-spread CSV replay above. After the corrected
-DuckDB replay, the edge is much smaller and should be treated as a modest
-historical bid/ask-candle edge, not proof of live production profitability.
-The next data upgrade is full orderbook-depth snapshots plus Coinbase spot
-snapshots at decision time.
+rather than the older paper or hardened scripts. It now defaults to websocket
+market data for the deployed research model; use `--polling` only to force the
+old REST polling loop. However, the March/April selection was based on the
+assumed-spread CSV replay above. After the corrected DuckDB replay, the edge is
+much smaller and should be treated as a modest historical bid/ask-candle edge,
+not proof of live production profitability.
+
+Default live command:
+
+```powershell
+python scripts\btc_1hr_research_live.py
+```
+
+The websocket executor writes a live replay database at
+`~/.btc_kalshi_bot/research_live_capture.duckdb`. That capture is intentionally
+outside the repo and should not be committed. It stores Kalshi orderbook
+reconstructed top-of-book, lifecycle/private messages, Coinbase BTC websocket
+ticks, signal scans, and order decisions. Raw orderbook deltas and raw snapshot
+levels are suppressed by default to avoid overwhelming DuckDB during live
+trading; enable `--capture-raw-ws` only when intentionally running a short
+diagnostic capture. This is the high-quality dataset we need for future
+no-leakage replay testing.
+
+`scripts/btc_1hr_js_guarded_shadow.py` mirrors this websocket path for the
+`js_guarded` candidate but defaults to `--paper`, `--shadow-bankroll 1000`,
+`~/.btc_kalshi_bot/js_guarded_shadow_trades.db`, and
+`~/.btc_kalshi_bot/js_guarded_shadow_capture.duckdb`. It prints a shadow PnL
+report every minute and near the top of each hour:
+
+```
+SHADOW report strategy=js_guarded start=$1000.00 equity=$1000.00 realized_pnl=$0.00 bankroll_return=0.000% ...
+```
 
 Live execution safeguards:
 
 | Guard | Behavior |
 |---|---|
+| Websocket market data | Maintains an in-memory Kalshi orderbook from authenticated `orderbook_delta` snapshots and deltas, plus Coinbase BTC spot from websocket ticker updates. |
+| Event subscription control | Uses Kalshi lifecycle messages plus a low-rate metadata refresh to subscribe only to the current eligible KXBTCD event and remove old event markets. |
+| Stale-event refresh failure | If event metadata refresh fails while the prior event is no longer eligible, the bot clears the event set and refuses to scan until a fresh eligible event is loaded. |
+| Full initial book gate | Does not scan/trade a new hourly event until every market in that event has received its initial websocket orderbook snapshot. |
+| Reconnect/gap safety | Clears in-memory books on reconnect, ignores duplicate/out-of-order websocket messages, and reconnects on any Kalshi sequence gap before trading again. |
+| Fresh BTC spot gate | Refuses to scan/trade unless the Coinbase websocket is connected and the BTC spot tick is recent. |
 | Correct event | Trades only the current KXBTCD hourly event whose API close time matches the event ticker's New York close hour. |
 | Correct market | Trades only cumulative `-T` markets inside that exact event; bucket markets and next-day events are rejected. |
-| Duplicate protection | Blocks existing DB `submitted`, `filled`, or `partial_filled` rows and all nonzero live Kalshi positions by ticker. |
+| Duplicate protection | Blocks existing DB `submitted`, `filled`, or `partial_filled` rows, all nonzero live Kalshi positions, and an atomic per-event SQLite lock before any paper/live order attempt. |
 | Bankroll control | Reads Kalshi `balance` and `portfolio_value` every live cycle, blocks orders that exceed available cash, per-market exposure, or total active exposure. |
 | Scaled sizing | Keeps the backtested one-contract signal filter, then sizes the final live order up to 3 contracts when bankroll, exposure, and visible orderbook depth allow it. |
-| Order pricing | Uses real YES and NO orderbook bids. YES ask is `1 - best NO bid`; NO ask is `1 - best YES bid`. |
+| Order pricing | Uses real YES and NO orderbook bids from the maintained websocket book. YES ask is `1 - best NO bid`; NO ask is `1 - best YES bid`. |
 | Order type | Uses Kalshi V2 FOK orders with `cancel_order_on_pause` and self-trade prevention. |
+| 409 / FOK no-fill sync | If Kalshi returns HTTP 409, the bot queries `/portfolio/orders` by `client_order_id`; canceled zero-fill orders become `not_filled`, partials stay protected, and the websocket loop continues. |
 | Unknown order state | Inserts a local `submitted` row before POSTing; timeout/unknown state blocks re-entry instead of retrying blindly. |
+| Capture load control | Captures top-of-book and decisions by default, coalesces scan triggers, and disables raw websocket delta capture unless explicitly requested. |
+
+### Multi-Crypto Scout
+
+Two scripts extend the corrected DuckDB replay method beyond BTC hourly
+KXBTCD:
+
+```powershell
+python scripts\build_crypto_research_datamart.py --out-dir data\crypto_research_datamart --max-hourly-events 12 --max-15m-events 48 --workers 2 --chunk-minutes 15
+python scripts\backtest_crypto_research.py --db data\crypto_research_datamart\crypto_research.duckdb --output-dir backtest_outputs\crypto_research
+```
+
+The datamart builder uses Kalshi's public cutoff endpoint and recorded
+`market_settled_ts=2026-03-06T00:00:00Z` on this run. Events before that cutoff
+route through historical market endpoints; recent events use event
+candlesticks. It keeps only observed `yes_bid`/`yes_ask` minute candles and
+uses `NO ask = 1 - YES bid`, the same corrected execution convention as the
+BTC replay. Coinbase spot data is stored with `available_at = bucket_start + 1
+minute`.
+
+Primary 24-hour crypto focus run:
+
+```powershell
+python scripts\build_crypto_research_datamart.py --out-dir data\crypto_research_datamart --series KXBTC15M KXETH15M KXETHD --start 2026-05-05T04:00:00Z --end 2026-05-06T04:00:00Z --max-hourly-events 40 --max-15m-events 120 --workers 1 --chunk-minutes 15
+python scripts\backtest_crypto_research.py --db data\crypto_research_datamart\crypto_research.duckdb --output-dir backtest_outputs\crypto_research_primary_24h_final_20260505_230624 --series KXBTC15M --series KXETH15M --series KXETHD
+```
+
+Primary 24-hour datamart, built `2026-05-06T04:42:43Z`:
+
+| Item | Count / Range |
+|---|---:|
+| Kalshi events | 216 |
+| Kalshi markets | 1,957 |
+| Kalshi bid/ask rows | 36,450 |
+| Coinbase spot rows | 32,606 |
+| Series | `KXBTC15M`, `KXETH15M`, `KXETHD` |
+| Event close span | `2026-05-05T04:00:00Z` through `2026-05-06T03:45:00Z` |
+| Fetch failures | 0 |
+
+The primary split is chronological 60/20/20 by unique event close timestamp,
+so simultaneous BTC/ETH close-time buckets stay in the same split:
+
+| Split | Events | Close Range UTC |
+|---|---:|---|
+| Train | 129 | `2026-05-05T04:00:00Z` to `2026-05-05T18:00:00Z` |
+| Validation | 42 | `2026-05-05T18:15:00Z` to `2026-05-05T22:45:00Z` |
+| Test | 45 | `2026-05-05T23:00:00Z` to `2026-05-06T03:45:00Z` |
+
+Primary 24-hour backtest summary:
+
+| Strategy | Split | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Read |
+|---|---|---:|---:|---:|---:|---:|---|
+| `ported_research` | train | 1 | 0.28 | 0.72 | 38.89% | 0.00 | Sparse ETHD-style hit |
+| `ported_research` | test | 2 | 0.94 | 1.06 | 88.68% | 0.00 | Too few trades to trust |
+| `ported_js_guarded` | train | 1 | 0.28 | 0.72 | 38.89% | 0.00 | No validation/test trades |
+| `crypto_fair_value` | train | 13 | -0.58 | 8.58 | -6.76% | -2.00 | Fails train |
+| `crypto_fair_value` | validation | 2 | -0.04 | 1.04 | -3.85% | -0.44 | Fails validation |
+| `crypto_fair_value` | test | 3 | 1.29 | 1.71 | 75.44% | 0.00 | Positive only after failing train/validation |
+| `crypto_fair_value_loose` | train | 22 | -0.19 | 14.19 | -1.34% | -1.51 | Too weak |
+| `crypto_fair_value_loose` | validation | 2 | -0.04 | 1.04 | -3.85% | -0.44 | Fails validation |
+| `crypto_fair_value_loose` | test | 9 | 0.08 | 5.92 | 1.35% | -1.56 | Not enough edge |
+| `micro_updown_guarded` | train | 11 | -0.59 | 6.59 | -8.95% | -1.51 | Fails train |
+| `micro_updown_guarded` | validation | 1 | 0.40 | 0.60 | 66.67% | 0.00 | One trade only |
+| `micro_updown_guarded` | test | 2 | -0.32 | 1.32 | -24.24% | -0.67 | Fails test |
+| `updown15_fast` | train | 22 | 0.07 | 13.93 | 0.50% | -1.39 | No real edge |
+| `updown15_fast` | validation | 3 | 0.35 | 1.65 | 21.21% | -0.39 | Tiny positive |
+| `updown15_fast` | test | 7 | -1.57 | 4.57 | -34.35% | -2.27 | Reject |
+| `eth_1h_fair_value` | train | 4 | 0.35 | 2.65 | 13.21% | -0.36 | Interesting but sparse |
+| `eth_1h_fair_value` | test | 2 | 0.94 | 1.06 | 88.68% | 0.00 | Too few trades to deploy |
+
+Read: the 15-minute up/down ideas are not deployment candidates from this
+primary run. ETH 1-hour above/below remains the most interesting non-BTC path,
+but the 24-hour sample has only six total `eth_1h_fair_value` trades and needs
+multi-week data before promotion.
+
+Longer-term data note: a 7-day or 30-day version of this primary dataset is
+the next research gate, but it should run with a slow Kalshi throttle or
+off-hours because it competes with the live bot for `/markets` and candlestick
+rate limits. The 24-hour run above is useful for plumbing and early rejection,
+not enough to declare a new production edge.
+
+Earlier broad scout dataset:
+
+| Item | Count / Range |
+|---|---:|
+| Kalshi events | 336 |
+| Kalshi markets | 6,878 |
+| Kalshi bid/ask rows | 110,499 |
+| Coinbase spot rows | 80,808 |
+| Families | 48 hourly above/below, 48 hourly range, 240 15-minute up/down events |
+| Series | `KXETHD`, `KXSOLD`, `KXDOGED`, `KXXRPD`, `KXETH`, `KXSOLE`, `KXDOGE`, `KXXRP`, `KXBTC15M`, `KXETH15M`, `KXSOL15M`, `KXDOGE15M`, `KXXRP15M` |
+| Event close span | `2026-05-05T15:00:00Z` through `2026-05-06T02:45:00Z` |
+
+Backtest split is chronological 60/20/20 by event close inside that collected
+sample:
+
+| Split | Events | Close Range UTC |
+|---|---:|---|
+| Train | 201 | `2026-05-05T15:00:00Z` to `2026-05-05T22:00:00Z` |
+| Validation | 67 | `2026-05-05T22:00:00Z` to `2026-05-06T00:15:00Z` |
+| Test | 68 | `2026-05-06T00:15:00Z` to `2026-05-06T02:45:00Z` |
+
+Results are fee-adjusted and settle against Kalshi's market result when
+available. The first run was a combined replay grouped by series. After that,
+each series was run again by itself with `--series <ticker>` so the per-market
+results are not hidden by the combined split:
+
+```powershell
+python scripts\backtest_crypto_research.py --db data\crypto_research_datamart\crypto_research.duckdb --series KXDOGE --output-dir backtest_outputs\crypto_research_by_series\KXDOGE
+```
+
+Full standalone grids are written here:
+
+| File | Contents |
+|---|---|
+| `backtest_outputs/crypto_research_by_series/all_series_strategy_grid.csv` | One row for every series and strategy, including zero-trade rows |
+| `backtest_outputs/crypto_research_by_series/all_series_strategy_grid_by_split.csv` | One row for every series, strategy, and train/validation/test split |
+
+<details open>
+<summary><strong>Combined replay: strategy summary</strong></summary>
+
+| Strategy | Split | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) | Notes |
+|---|---|---:|---:|---:|---:|---:|---|
+| `crypto_fair_value` | train | 11 | 2.54 | 7.46 | 34.05% | -0.67 | Broad cross-crypto above/up/down fair-value rule |
+| `crypto_fair_value` | validation | 3 | 0.22 | 1.78 | 12.36% | -0.44 | Positive but tiny sample |
+| `crypto_fair_value` | test | 2 | 0.83 | 1.17 | 70.94% | 0.00 | Two winners only |
+| `micro_updown_guarded` | train | 8 | 1.79 | 5.21 | 34.36% | -0.67 | 15-minute up/down only |
+| `micro_updown_guarded` | validation | 1 | -0.67 | 0.67 | -100.00% | -0.67 | Failed validation on one trade |
+| `micro_updown_guarded` | test | 2 | 0.83 | 1.17 | 70.94% | 0.00 | Same two test trades as `crypto_fair_value` |
+| `ported_research` | train | 2 | 0.68 | 1.32 | 51.52% | 0.00 | Existing BTC research logic ported directly |
+| `ported_research` | validation | 1 | 0.46 | 0.54 | 85.19% | 0.00 | Too sparse |
+| `ported_js_guarded` | train | 2 | 0.68 | 1.32 | 51.52% | 0.00 | BTC UTC guard leaves almost no trades |
+| `range_fair_value` | train | 3 | 0.05 | 1.95 | 2.56% | -0.81 | Range markets look weak after fees |
+| `range_fair_value` | validation | 1 | 0.39 | 0.61 | 63.93% | 0.00 | Too sparse |
+
+</details>
+
+<details>
+<summary><strong>Standalone per-series runs: nonzero trades</strong></summary>
+
+| Series | Market | Strategy | Split | Trades | PnL ($) | Premium ($) | Return on Premium | Max DD ($) |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| `KXDOGE15M` | DOGE 15m up/down | `crypto_fair_value` | train | 1 | 0.24 | 0.76 | 31.58% | 0.00 |
+| `KXDOGE15M` | DOGE 15m up/down | `micro_updown_guarded` | train | 1 | 0.24 | 0.76 | 31.58% | 0.00 |
+| `KXETH` | ETH 1h range | `range_fair_value` | train | 3 | 0.05 | 1.95 | 2.56% | -0.81 |
+| `KXETH15M` | ETH 15m up/down | `crypto_fair_value` | train | 2 | 0.72 | 1.28 | 56.25% | 0.00 |
+| `KXETH15M` | ETH 15m up/down | `crypto_fair_value` | test | 1 | 0.35 | 0.65 | 53.85% | 0.00 |
+| `KXETH15M` | ETH 15m up/down | `micro_updown_guarded` | train | 2 | 0.72 | 1.28 | 56.25% | 0.00 |
+| `KXETH15M` | ETH 15m up/down | `micro_updown_guarded` | validation | 1 | -0.67 | 0.67 | -100.00% | -0.67 |
+| `KXETH15M` | ETH 15m up/down | `micro_updown_guarded` | test | 1 | 0.35 | 0.65 | 53.85% | 0.00 |
+| `KXETHD` | ETH 1h above/below | `crypto_fair_value` | train | 1 | 0.26 | 0.74 | 35.14% | 0.00 |
+| `KXETHD` | ETH 1h above/below | `crypto_fair_value` | validation | 2 | 0.02 | 0.98 | 2.04% | -0.44 |
+| `KXETHD` | ETH 1h above/below | `ported_research` | validation | 1 | 0.46 | 0.54 | 85.19% | 0.00 |
+| `KXSOL15M` | SOL 15m up/down | `crypto_fair_value` | train | 1 | 0.34 | 0.66 | 51.52% | 0.00 |
+| `KXSOL15M` | SOL 15m up/down | `crypto_fair_value` | test | 1 | 0.48 | 0.52 | 92.31% | 0.00 |
+| `KXSOL15M` | SOL 15m up/down | `micro_updown_guarded` | train | 1 | 0.34 | 0.66 | 51.52% | 0.00 |
+| `KXSOL15M` | SOL 15m up/down | `micro_updown_guarded` | test | 1 | 0.48 | 0.52 | 92.31% | 0.00 |
+| `KXSOL15M` | SOL 15m up/down | `ported_js_guarded` | train | 1 | 0.34 | 0.66 | 51.52% | 0.00 |
+| `KXSOL15M` | SOL 15m up/down | `ported_research` | train | 1 | 0.34 | 0.66 | 51.52% | 0.00 |
+| `KXSOLD` | SOL 1h above/below | `crypto_fair_value` | train | 2 | 0.58 | 1.42 | 40.85% | 0.00 |
+| `KXSOLD` | SOL 1h above/below | `ported_js_guarded` | train | 1 | 0.34 | 0.66 | 51.52% | 0.00 |
+| `KXSOLD` | SOL 1h above/below | `ported_research` | train | 1 | 0.34 | 0.66 | 51.52% | 0.00 |
+| `KXXRP` | XRP 1h range | `range_fair_value` | validation | 1 | 0.39 | 0.61 | 63.93% | 0.00 |
+| `KXXRP15M` | XRP 15m up/down | `crypto_fair_value` | train | 4 | 0.40 | 2.60 | 15.38% | -0.67 |
+| `KXXRP15M` | XRP 15m up/down | `crypto_fair_value` | validation | 1 | 0.20 | 0.80 | 25.00% | 0.00 |
+| `KXXRP15M` | XRP 15m up/down | `micro_updown_guarded` | train | 4 | 0.49 | 2.51 | 19.52% | -0.67 |
+
+</details>
+
+<details>
+<summary><strong>Standalone per-series runs: no trades</strong></summary>
+
+| Series | Market | Events | Markets | Quote Rows | Result |
+|---|---|---:|---:|---:|---|
+| `KXBTC15M` | BTC 15m up/down | 48 | 48 | 720 | No trades passed filters |
+| `KXDOGE` | DOGE 1h range | 12 | 689 | 8,879 | No trades passed filters |
+| `KXDOGED` | DOGE 1h above/below | 12 | 689 | 10,073 | No trades passed filters |
+| `KXSOLE` | SOL 1h range | 12 | 900 | 11,738 | No trades passed filters |
+| `KXXRPD` | XRP 1h above/below | 12 | 865 | 14,573 | No trades passed filters |
+
+</details>
+
+Interpretation: this scout found a possible 15-minute/up-down and non-BTC
+above/below signal worth collecting more data for, but the sample is only
+about 12 hours and the trade counts are far too small for production. DOGE
+hourly was included as both `KXDOGE` and `KXDOGED`; neither standalone run
+found a fee-adjusted trade. The BTC `js_guarded` time-of-day guard should not
+be blindly ported to these markets. Range buckets did not show a robust enough
+edge after bid/ask and fees.
 
 
 

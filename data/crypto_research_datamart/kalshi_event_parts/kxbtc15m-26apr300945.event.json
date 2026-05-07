@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXBTC15M-26APR300945",
+  "series_ticker": "KXBTC15M",
+  "asset": "BTC",
+  "product_id": "BTC-USD",
+  "family": "updown15",
+  "frequency": "fifteen_min",
+  "title": "BTC Up or Down - 15 minutes",
+  "sub_title": "Apr 30 - 9:30AM EDT to 9:45AM EDT",
+  "open_time": "2026-04-30T13:30:00+00:00",
+  "close_time": "2026-04-30T13:45:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

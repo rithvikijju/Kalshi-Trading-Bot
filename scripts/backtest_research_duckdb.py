@@ -34,6 +34,19 @@ BRTI_DAMPENING = 0.80
 MIN_TTL_MIN = 5.0
 MAX_TTL_MIN = 65.0
 PAPER_MAX_SIGNALS_PER_SCAN = int(CFG.get("max_concurrent_signals", 3))
+JS_MARKET_SHRINK = 0.25
+JS_MIN_EDGE_CENTS = 8.0
+JS_MAX_SPREAD_CENTS = 2.0
+JS_MIN_ENTRY = 0.55
+JS_MAX_ENTRY = 0.80
+JS_GUARDED_MAX_ABS_MONEYNESS_BPS = 60.0
+JS_GUARDED_EXCLUDED_UTC_HOURS = set(range(17, 24))
+JS_GUARDED_SKIP_TTL_LOW_MIN = 20.0
+JS_GUARDED_SKIP_TTL_HIGH_MIN = 30.0
+JS_GUARDED_LATE_MAX_TTL_MIN = 20.0
+RESEARCH_STYLE_STRATEGIES = ("research", "js_robust", "js_guarded", "js_guarded_skipmid", "js_guarded_late")
+JS_STYLE_STRATEGIES = ("js_robust", "js_guarded", "js_guarded_skipmid", "js_guarded_late")
+JS_GUARDED_STRATEGIES = ("js_guarded", "js_guarded_skipmid", "js_guarded_late")
 
 
 @dataclass(frozen=True)
@@ -43,11 +56,17 @@ class OpenPosition:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest BTC 1-hour strategies from DuckDB bid/ask datamart.")
-    parser.add_argument("--strategy", choices=("research", "paper"), default="research")
+    parser.add_argument(
+        "--strategy",
+        choices=("research", "paper", "js_robust", "js_guarded", "js_guarded_skipmid", "js_guarded_late"),
+        default="research",
+    )
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "backtest_outputs" / "research_duckdb")
     parser.add_argument("--start")
     parser.add_argument("--end")
+    parser.add_argument("--event-close-start", help="Inclusive event close-time lower bound for chronological splits.")
+    parser.add_argument("--event-close-end", help="Exclusive event close-time upper bound for chronological splits.")
     parser.add_argument("--event-prefix", action="append", help="Filter by event ticker prefix, e.g. KXBTCD-26APR.")
     parser.add_argument("--train-days", type=int, default=7)
     parser.add_argument("--progress-every-events", type=int, default=25)
@@ -63,7 +82,7 @@ def parse_args() -> argparse.Namespace:
 def apply_strategy_config(strategy: str) -> None:
     if strategy == "paper":
         CFG.update(PAPER_CFG)
-    elif strategy == "research":
+    elif strategy in RESEARCH_STYLE_STRATEGIES:
         CFG.update(RESEARCH_CFG)
     else:
         raise ValueError(f"unknown strategy {strategy}")
@@ -82,6 +101,8 @@ def load_tables(
     db_path: Path,
     start: pd.Timestamp | None,
     end: pd.Timestamp | None,
+    event_close_start: pd.Timestamp | None,
+    event_close_end: pd.Timestamp | None,
     event_prefixes: list[str] | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     con = duckdb.connect(str(db_path), read_only=True)
@@ -93,6 +114,12 @@ def load_tables(
     if end is not None:
         where.append("q.available_at <= ?")
         params.append(end.to_pydatetime())
+    if event_close_start is not None:
+        where.append("m.close_time >= ?")
+        params.append(event_close_start.to_pydatetime())
+    if event_close_end is not None:
+        where.append("m.close_time < ?")
+        params.append(event_close_end.to_pydatetime())
     if event_prefixes:
         prefix_clauses = []
         for prefix in event_prefixes:
@@ -183,6 +210,10 @@ def signals_for_time(
             return pd.DataFrame()
     elif ttl_min <= MIN_TTL_MIN or ttl_min > MAX_TTL_MIN:
         return pd.DataFrame()
+    elif strategy == "js_guarded_skipmid" and JS_GUARDED_SKIP_TTL_LOW_MIN < ttl_min <= JS_GUARDED_SKIP_TTL_HIGH_MIN:
+        return pd.DataFrame()
+    elif strategy == "js_guarded_late" and ttl_min > JS_GUARDED_LATE_MAX_TTL_MIN:
+        return pd.DataFrame()
     rv60 = btc.iloc[idx].get("rv_60m", np.nan)
     current_vol = float(rv60) if np.isfinite(rv60) else None
     strikes = quotes["floor_strike"].to_numpy(dtype=float)
@@ -210,9 +241,9 @@ def signals_for_time(
         return pd.DataFrame()
     q = quotes.loc[valid].copy()
     strikes = q["floor_strike"].to_numpy(dtype=float)
-    brti_dampening = BRTI_DAMPENING if strategy == "research" else 1.0
+    brti_dampening = BRTI_DAMPENING if strategy in RESEARCH_STYLE_STRATEGIES else 1.0
     model_p = vectorized_p_above(strikes, spot, ttl_min, emp_cache, current_vol, brti_dampening)
-    if strategy == "research":
+    if strategy in RESEARCH_STYLE_STRATEGIES:
         normal_p = lognormal_p_above(strikes, spot, ttl_min, current_vol)
         model_p = np.where(np.isfinite(normal_p), 0.70 * model_p + 0.30 * normal_p, model_p)
     finite = np.isfinite(model_p)
@@ -220,6 +251,11 @@ def signals_for_time(
         return pd.DataFrame()
     q = q.iloc[np.where(finite)[0]].copy()
     model_p = model_p[finite]
+    if strategy in JS_STYLE_STRATEGIES:
+        market_mid = 0.5 * (
+            q["yes_bid_close"].to_numpy(dtype=float) + q["yes_ask_close"].to_numpy(dtype=float)
+        )
+        model_p = (1.0 - JS_MARKET_SHRINK) * model_p + JS_MARKET_SHRINK * market_mid
     yes_ask = q["yes_ask_exe"].to_numpy(dtype=float)
     no_ask = q["no_ask_exe"].to_numpy(dtype=float)
     edge_yes = model_p - yes_ask
@@ -236,6 +272,12 @@ def signals_for_time(
         max_spread = MAX_SPREAD_CENTS
         min_entry = MIN_ENTRY
         max_entry = MAX_ENTRY
+    elif strategy in JS_STYLE_STRATEGIES:
+        threshold = JS_MIN_EDGE_CENTS + edge_uncertainty_cents(model_p, emp_cache)
+        strong = np.ones(len(model_p), dtype=bool)
+        max_spread = JS_MAX_SPREAD_CENTS
+        min_entry = JS_MIN_ENTRY
+        max_entry = JS_MAX_ENTRY
     else:
         threshold = np.full(len(model_p), float(CFG["min_edge_cents"]), dtype=float)
         strong = np.ones(len(model_p), dtype=bool)
@@ -249,6 +291,13 @@ def signals_for_time(
         & (entry_price >= min_entry)
         & (entry_price <= max_entry)
     )
+    if strategy in JS_GUARDED_STRATEGIES:
+        scan_hour = int(scan_ts.tz_convert("UTC").hour)
+        moneyness_bps = 10000.0 * (spot - q["floor_strike"].to_numpy(dtype=float)) / max(1.0, spot)
+        passed &= (
+            ~np.isin(np.full(len(q), scan_hour), list(JS_GUARDED_EXCLUDED_UTC_HOURS))
+            & (np.abs(moneyness_bps) <= JS_GUARDED_MAX_ABS_MONEYNESS_BPS)
+        )
     if not passed.any():
         return pd.DataFrame()
     q = q.iloc[np.where(passed)[0]].copy()
@@ -308,6 +357,7 @@ def run_backtest(
     open_positions: dict[str, OpenPosition] = {}
     open_events: set[str] = set()
     event_cache: dict[str, dict] = {}
+    one_position_per_event = strategy in RESEARCH_STYLE_STRATEGIES and not allow_multiple_markets_per_event
     events = list(quotes.groupby("event_ticker", sort=True))
     if max_events:
         events = events[:max_events]
@@ -323,17 +373,17 @@ def run_backtest(
             event_cache[event_ticker] = emp_cache
         for scan_ts, scan_quotes in event_quotes.groupby("available_at", sort=True):
             settle_due(open_positions, open_events, scan_ts, btc, settled)
-            if strategy == "research" and not allow_multiple_markets_per_event and event_ticker in open_events:
+            if one_position_per_event and event_ticker in open_events:
                 continue
             signals = signals_for_time(strategy, scan_quotes, btc, emp_cache, scan_ts)
             if signals.empty:
                 continue
-            selected = signals.head(1 if strategy == "research" else PAPER_MAX_SIGNALS_PER_SCAN)
+            selected = signals.head(1 if strategy in RESEARCH_STYLE_STRATEGIES else PAPER_MAX_SIGNALS_PER_SCAN)
             for _, sig in selected.iterrows():
                 ticker = sig["market_ticker"]
                 if ticker in open_positions:
                     continue
-                if strategy == "research" and not allow_multiple_markets_per_event and sig["event_ticker"] in open_events:
+                if one_position_per_event and sig["event_ticker"] in open_events:
                     continue
                 open_positions[ticker] = OpenPosition(
                     row={
@@ -415,7 +465,9 @@ def main() -> int:
     apply_strategy_config(args.strategy)
     start = ts_arg(args.start)
     end = ts_arg(args.end)
-    quotes, btc = load_tables(args.db, start, end, args.event_prefix)
+    event_close_start = ts_arg(args.event_close_start)
+    event_close_end = ts_arg(args.event_close_end)
+    quotes, btc = load_tables(args.db, start, end, event_close_start, event_close_end, args.event_prefix)
     if quotes.empty:
         raise SystemExit("No quotes found for requested range.")
     btc = feature_frame_for_strategy(args.strategy, btc)
@@ -439,11 +491,35 @@ def main() -> int:
         "strategy": args.strategy,
         "start": str(start),
         "end": str(end),
+        "event_close_start": str(event_close_start),
+        "event_close_end": str(event_close_end),
         "event_prefix": args.event_prefix,
         "quote_rows": len(quotes),
         "btc_rows": len(btc),
-        "allow_multiple_markets_per_event": bool(args.allow_multiple_markets_per_event) if args.strategy == "research" else True,
+        "allow_multiple_markets_per_event": (
+            bool(args.allow_multiple_markets_per_event)
+            if args.strategy in RESEARCH_STYLE_STRATEGIES
+            else True
+        ),
         "paper_notes": "paper uses original btc_1hr_paper.py signal thresholds with official taker fees in edge and PnL" if args.strategy == "paper" else None,
+        "js_robust_notes": (
+            "js_robust uses research empirical/lognormal probability, shrinks 25% toward Kalshi mid, "
+            "requires favorite-priced entries, one position per event, and a larger uncertainty-adjusted edge"
+            if args.strategy == "js_robust"
+            else None
+        ),
+        "js_guarded_notes": (
+            f"{args.strategy} is js_robust plus train/validation-selected guardrails: "
+            "exclude UTC entry hours 17-23 and abs(entry_spot - strike) / spot > 60 bps"
+            if args.strategy in JS_GUARDED_STRATEGIES
+            else None
+        ),
+        "js_guarded_ttl_notes": (
+            f"skipmid blocks entries with {JS_GUARDED_SKIP_TTL_LOW_MIN:g}-{JS_GUARDED_SKIP_TTL_HIGH_MIN:g} minutes to close; "
+            f"late only permits entries with <= {JS_GUARDED_LATE_MAX_TTL_MIN:g} minutes to close"
+            if args.strategy in ("js_guarded_skipmid", "js_guarded_late")
+            else None
+        ),
         "execution_source": "observed historical Kalshi bid/ask candle close; no forward fill",
         "btc_timestamp_rule": "Coinbase bucket_start close is available at bucket_start + 1 minute",
         "trades_path": str(trades_path),

@@ -1,0 +1,26 @@
+{
+  "built_at": "2026-05-06T04:42:43.114098+00:00",
+  "kalshi_cutoff_market_settled_ts": "2026-03-06T00:00:00+00:00",
+  "series": [
+    "KXBTC15M",
+    "KXETH15M",
+    "KXETHD"
+  ],
+  "events": 216,
+  "markets": 1957,
+  "quotes": 36450,
+  "spot_rows": 32606,
+  "families": {
+    "above_below": 24,
+    "updown15": 192
+  },
+  "quote_events": 216,
+  "failures": [],
+  "db_path": "data\\crypto_research_datamart\\crypto_research.duckdb",
+  "notes": [
+    "Kalshi quotes are observed 1-minute bid/ask candles; no forward fill.",
+    "NO ask is represented as 1 - observed YES bid.",
+    "Coinbase spot rows use available_at = bucket_start + 1 minute.",
+    "Recent events use event candlesticks; markets older than the cutoff route to historical market candlesticks."
+  ]
+}

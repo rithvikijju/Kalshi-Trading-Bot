@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXBTC15M-26APR301745",
+  "series_ticker": "KXBTC15M",
+  "asset": "BTC",
+  "product_id": "BTC-USD",
+  "family": "updown15",
+  "frequency": "fifteen_min",
+  "title": "BTC 15 min \u00b7 $76,301.22 target",
+  "sub_title": "Apr 30 - 5:30PM EDT to 5:45PM EDT",
+  "open_time": "2026-04-30T21:30:00+00:00",
+  "close_time": "2026-04-30T21:45:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

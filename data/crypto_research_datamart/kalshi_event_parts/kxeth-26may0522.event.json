@@ -1,0 +1,14 @@
+{
+  "event_ticker": "KXETH-26MAY0522",
+  "series_ticker": "KXETH",
+  "asset": "ETH",
+  "product_id": "ETH-USD",
+  "family": "range",
+  "frequency": "hourly",
+  "title": "Ethereum price range on May 5, 2026 at 10pm EDT?",
+  "sub_title": "On May 5, 2026 at 10pm EDT",
+  "open_time": "2026-05-06T01:00:00+00:00",
+  "close_time": "2026-05-06T02:00:00+00:00",
+  "api_tier": "live",
+  "truncated_chunks": 0
+}

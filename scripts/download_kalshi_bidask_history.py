@@ -23,9 +23,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.download_kalshi_event_history import (
     BASE_URL,
     EventId,
-    fetch_event_candlesticks,
     iter_event_range,
     parse_event_ticker,
+    request_json,
 )
 
 
@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--max-events", type=int)
+    parser.add_argument(
+        "--chunk-minutes",
+        type=int,
+        default=15,
+        help=(
+            "Fetch each event in smaller windows to avoid Kalshi event candlestick "
+            "adjusted_end_ts truncation. Default: 15."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -126,6 +135,74 @@ def price_mean(candle: dict) -> float | None:
     return None
 
 
+def fetch_event_candlesticks_chunked(
+    session: requests.Session,
+    series_ticker: str,
+    event_ticker: str,
+    start_ts: int,
+    end_ts: int,
+    period_interval: int,
+    chunk_minutes: int,
+) -> tuple[dict[str, list[dict]], int]:
+    """Fetch event candlesticks in bounded windows and dedupe by candle end time.
+
+    Kalshi's event candlestick endpoint can return an adjusted_end_ts earlier
+    than the requested end when an event has many markets. Treating that as a
+    complete response silently drops later minutes. Chunking keeps every row
+    we use as observed API data while avoiding inferred forward fills.
+    """
+    step_seconds = max(period_interval * 60, chunk_minutes * 60)
+    by_ticker: dict[str, dict[int, dict]] = {}
+    truncated_chunks = 0
+    cursor = start_ts
+
+    while cursor < end_ts:
+        target_end = min(end_ts, cursor + step_seconds)
+        while cursor < target_end:
+            data = request_json(
+                session,
+                f"/series/{series_ticker}/events/{event_ticker}/candlesticks",
+                params={
+                    "period_interval": period_interval,
+                    "start_ts": cursor,
+                    "end_ts": target_end,
+                },
+            )
+            tickers = data.get("market_tickers") or []
+            candles = data.get("market_candlesticks") or []
+            if len(tickers) != len(candles):
+                raise RuntimeError(
+                    f"{event_ticker}: response had {len(tickers)} tickers but "
+                    f"{len(candles)} candlestick arrays."
+                )
+
+            for ticker, ticker_candles in zip(tickers, candles):
+                lookup = by_ticker.setdefault(ticker, {})
+                for candle in ticker_candles:
+                    ts = candle.get("end_period_ts")
+                    if ts:
+                        lookup[int(ts)] = candle
+
+            adjusted_end = int(data.get("adjusted_end_ts") or target_end)
+            if adjusted_end < target_end:
+                truncated_chunks += 1
+            if adjusted_end >= target_end:
+                break
+            if adjusted_end <= cursor:
+                raise RuntimeError(
+                    f"{event_ticker}: adjusted_end_ts did not advance "
+                    f"({adjusted_end} <= {cursor})"
+                )
+            cursor = adjusted_end
+
+        cursor = target_end
+
+    return {
+        ticker: [candles[ts] for ts in sorted(candles)]
+        for ticker, candles in by_ticker.items()
+    }, truncated_chunks
+
+
 def candle_rows(event_ticker: str, market_ticker: str, candles: Iterable[dict]) -> list[dict]:
     rows = []
     for candle in candles:
@@ -163,7 +240,7 @@ def candle_rows(event_ticker: str, market_ticker: str, candles: Iterable[dict]) 
     return rows
 
 
-def download_event(event: EventId, out_dir: Path, overwrite: bool) -> tuple[str, bool, str]:
+def download_event(event: EventId, out_dir: Path, overwrite: bool, chunk_minutes: int) -> tuple[str, bool, str]:
     out_path = out_dir / f"{event.ticker.lower()}.parquet"
     if out_path.exists() and not overwrite:
         return event.ticker, False, "exists"
@@ -174,13 +251,14 @@ def download_event(event: EventId, out_dir: Path, overwrite: bool) -> tuple[str,
     end_ts = int(close_dt.timestamp())
 
     with requests.Session() as session:
-        candles_by_ticker = fetch_event_candlesticks(
+        candles_by_ticker, truncated_chunks = fetch_event_candlesticks_chunked(
             session,
             series_ticker=event.series,
             event_ticker=event.ticker,
             start_ts=start_ts,
             end_ts=end_ts,
             period_interval=1,
+            chunk_minutes=chunk_minutes,
         )
 
     rows: list[dict] = []
@@ -191,7 +269,8 @@ def download_event(event: EventId, out_dir: Path, overwrite: bool) -> tuple[str,
 
     out_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(out_path, index=False)
-    return event.ticker, True, f"{len(rows)} rows"
+    chunks = max(1, (end_ts - start_ts + max(1, chunk_minutes) * 60 - 1) // (max(1, chunk_minutes) * 60))
+    return event.ticker, True, f"{len(rows)} rows chunks={chunks} truncated_chunks={truncated_chunks}"
 
 
 def main() -> int:
@@ -212,7 +291,10 @@ def main() -> int:
     skipped = 0
     failed = 0
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        futures = {executor.submit(download_event, event, args.out_dir, args.overwrite): event for event in events}
+        futures = {
+            executor.submit(download_event, event, args.out_dir, args.overwrite, args.chunk_minutes): event
+            for event in events
+        }
         for idx, future in enumerate(as_completed(futures), start=1):
             ticker = futures[future].ticker
             try:
