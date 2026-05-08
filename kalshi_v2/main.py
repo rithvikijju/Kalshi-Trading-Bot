@@ -303,3 +303,214 @@ def disable_live():
     CFG["mode"] = "paper"
     CFG["live_enabled"] = False
     print("LIVE DISABLED. mode=paper.")
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  Live diagnostic — what the bot is actually thinking
+# ════════════════════════════════════════════════════════════════════════
+def dashboard():
+    """Single-snapshot view of the full pipeline. Re-run any time.
+
+    Sections:
+      A. Connectivity     — threads + WS + REST status
+      B. What we're tracking — event, TTL, book count, sample quotes
+      C. What scan_signals sees — full per-market edge breakdown,
+         including markets that fail each filter and the reason
+      D. Robust filter outcomes — last 10 decisions with pass rate
+      E. Risk preflight blocks — last 10 rejections with reasons
+      F. Recent paper trades + open positions
+    """
+    from .data import causal_sigma_from_spot
+    from .strategy import scan_signals, kalshi_fee
+    from .model import fair_value
+    from .robust import robust_filter
+    from .paper_db import open_trades, settled_trades, _conn
+    import pandas as pd
+
+    print("=" * 78)
+    print(f"  V2 DASHBOARD @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 78)
+
+    # ─────── A. Connectivity ───────
+    print("\nA. CONNECTIVITY")
+    threads = BOT_STATE.get("threads", [])
+    alive = sum(1 for t in threads if t.is_alive())
+    print(f"   threads alive:  {alive}/{len(threads)}")
+    for t in threads:
+        flag = "✓" if t.is_alive() else "✗"
+        print(f"     {flag} {t.name}")
+    print(f"   ws connected:   {WS_STATE.get('connected')}  "
+          f"(mode={WS_STATE.get('mode')}, msgs={WS_STATE.get('msg_count')})")
+    print(f"   ws subscribed:  {WS_STATE.get('subscribed_event')}")
+
+    # ─────── B. What we're tracking ───────
+    print("\nB. TRACKING")
+    spot  = SPOT.get("price")
+    sigma = causal_sigma_from_spot()
+    event = TRACKED.get("event")
+    ct    = TRACKED.get("close_time")
+    ttl_min = ((ct - datetime.now(timezone.utc)).total_seconds() / 60) if ct else None
+    print(f"   spot:           ${spot:,.2f}" if spot else "   spot:           (no data)")
+    print(f"   causal sigma:   {sigma:.4f}" if sigma else "   causal sigma:   (need 15+ ticks)")
+    print(f"   event:          {event}")
+    if ct:
+        print(f"   closes:         {ct.strftime('%H:%M UTC')}  (ttl {ttl_min:+.1f} min)")
+    print(f"   books in mem:   {len(BOOKS)}")
+    if BOOKS:
+        sample = sorted(BOOKS.items())[:3]
+        print(f"   sample books:")
+        for tk, b in sample:
+            yb, ya, fl = b.get("yes_bid"), b.get("yes_ask"), b.get("floor")
+            print(f"     {tk:35s} yes_bid={yb}  yes_ask={ya}  floor={fl}")
+
+    # ─────── C. What scan_signals sees ───────
+    print("\nC. SCANNER (this snapshot, not the running worker)")
+    if not (spot and sigma and event):
+        print("   skipped — missing spot / sigma / event")
+    else:
+        # Build per-market edge breakdown manually so we can show rejections
+        rows = []
+        for tk, b in list(BOOKS.items()):
+            if not tk.startswith(event):
+                continue
+            yb, ya = b.get("yes_bid"), b.get("yes_ask")
+            floor = b.get("floor"); cap = b.get("cap")
+            reason = None
+            edge_c = None
+            side = None; entry = None
+            if yb is None or ya is None:
+                reason = "no quote"
+            elif (ya - yb) > CFG["max_spread_cents"] / 100:
+                reason = f"spread {(ya-yb)*100:.1f}c > {CFG['max_spread_cents']}c"
+            elif floor is None:
+                reason = "no floor"
+            else:
+                try:
+                    floor_f = float(floor)
+                except (ValueError, TypeError):
+                    reason = "bad floor"
+                else:
+                    p_yes = fair_value(tk, spot, floor_f, cap, ttl_min, sigma,
+                                          kurt=0.0, empirical_bank=_EMPIRICAL_BANK)
+                    if p_yes is None:
+                        reason = "fair_value None"
+                    else:
+                        edge_yes = (p_yes - ya) * 100 - kalshi_fee(ya) * 100
+                        edge_no  = (yb - p_yes) * 100 - kalshi_fee(1 - yb) * 100
+                        if edge_yes >= edge_no:
+                            side, edge_c, entry = "yes", edge_yes, ya
+                        else:
+                            side, edge_c, entry = "no",  edge_no,  1 - yb
+                        if edge_c < CFG["min_edge_cents"]:
+                            reason = f"edge {edge_c:+.1f}c < {CFG['min_edge_cents']}c"
+                        elif entry < CFG["min_entry_price"]:
+                            reason = f"entry {entry:.3f} < {CFG['min_entry_price']}"
+                        elif entry > CFG["max_entry_price"]:
+                            reason = f"entry {entry:.3f} > {CFG['max_entry_price']}"
+                        else:
+                            reason = "PASSES edge filters"
+            rows.append({"ticker": tk, "side": side, "entry": entry,
+                          "edge_c": edge_c, "verdict": reason})
+        if rows:
+            df = pd.DataFrame(rows).sort_values(
+                "edge_c", ascending=False, na_position="last")
+            passes = df[df["verdict"] == "PASSES edge filters"]
+            print(f"   {len(rows)} markets in event scope, {len(passes)} pass edge filters")
+            top = df.head(8)
+            for _, r in top.iterrows():
+                e = f"{r['edge_c']:+.1f}c" if pd.notna(r["edge_c"]) else "  —  "
+                en = f"{r['entry']:.3f}" if pd.notna(r["entry"]) else "  —  "
+                sd = r["side"] or "—"
+                print(f"     {r['ticker']:32s} {sd:>3s} entry={en} edge={e}  · {r['verdict']}")
+        else:
+            print("   no markets in event scope")
+
+        # Also call the real scan_signals to show what robust filter does
+        try:
+            sigs = scan_signals(empirical_bank=_EMPIRICAL_BANK,
+                                  ambiguity_set=_AMBIGUITY_SET)
+            print(f"\n   scan_signals → {len(sigs)} signals after robust filter")
+            if len(sigs):
+                cols = ["ticker", "side", "entry_price", "edge_c",
+                        "robust_pass_rate", "robust_mean_edge_c"]
+                cols = [c for c in cols if c in sigs.columns]
+                print("   " + sigs[cols].to_string(index=False).replace("\n", "\n   "))
+        except Exception as e:
+            print(f"   scan_signals error: {e}")
+
+    # ─────── D. Robust filter outcomes ───────
+    print("\nD. ROBUST FILTER (last 10 decisions)")
+    try:
+        conn = _conn()
+        rd = pd.read_sql_query(
+            "SELECT ts, ticker, side, entry_price, pass_rate, mean_edge_c, "
+            "min_edge_c, max_edge_c, passed FROM robust_decisions "
+            "ORDER BY ts DESC LIMIT 10", conn)
+        conn.close()
+        if len(rd) == 0:
+            print("   no robust decisions logged yet")
+        else:
+            for _, r in rd.iterrows():
+                pf = "✓" if r["passed"] else "✗"
+                print(f"   {pf} {r['ts'][11:19]} {r['ticker']:32s} {r['side']:>3s}  "
+                      f"entry=${r['entry_price']:.3f}  pass_rate={r['pass_rate']:.2f}  "
+                      f"edge=[{r['min_edge_c']:+.1f}, {r['max_edge_c']:+.1f}]")
+    except Exception as e:
+        print(f"   error: {e}")
+
+    # ─────── E. Risk-block log ───────
+    print("\nE. RISK BLOCKS (last 10)")
+    if not RISK_BLOCKS:
+        print("   none")
+    else:
+        for rb in RISK_BLOCKS[-10:]:
+            print(f"   {rb['ts'][11:19]} {rb['ticker']:32s} {rb['side']:>3s}  "
+                  f"→ {'; '.join(rb['reasons'])}")
+
+    # ─────── F. Trades ───────
+    print("\nF. TRADES")
+    op = open_trades()
+    st = settled_trades()
+    print(f"   open:     {len(op)}")
+    print(f"   settled:  {len(st)}")
+    if len(st):
+        wins = (st['pnl_dollars'] > 0).sum()
+        print(f"   realized: ${st['pnl_dollars'].sum():+.2f}  "
+              f"(win rate {wins}/{len(st)} = {wins/len(st)*100:.1f}%)")
+    if len(op):
+        print(f"   open positions:")
+        cols = ["id", "market_ticker", "side", "contracts", "entry_price",
+                "entry_edge_cents", "trade_type"]
+        cols = [c for c in cols if c in op.columns]
+        for _, r in op.iterrows():
+            print(f"     #{r['id']} {r['market_ticker']:32s} {r['side']:>3s} "
+                  f"x{r['contracts']} @ ${r['entry_price']:.3f}  "
+                  f"({r.get('trade_type', '?')})")
+
+    # ─────── log tail ───────
+    print("\nG. RECENT LOG")
+    for line in BOT_STATE.get("log", [])[-15:]:
+        print(f"   {line}")
+    print()
+
+
+def tail_log(n: int = 30, follow_secs: float = 0):
+    """Print the last n log lines. With follow_secs > 0, blocks and
+    streams new lines for that duration."""
+    seen = 0
+    if follow_secs <= 0:
+        for line in BOT_STATE.get("log", [])[-n:]:
+            print(line)
+        return
+    end = time.time() + follow_secs
+    while time.time() < end:
+        log = BOT_STATE.get("log", [])
+        # Print from `seen` onward (capped at last n on first pass)
+        if seen == 0:
+            start = max(0, len(log) - n)
+        else:
+            start = seen
+        for line in log[start:]:
+            print(line, flush=True)
+        seen = len(log)
+        time.sleep(1.0)

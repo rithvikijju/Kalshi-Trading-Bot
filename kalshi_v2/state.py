@@ -19,7 +19,7 @@ import threading
 from typing import Dict
 
 
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 
 # Coinbase BTC spot (updated by spot_poller in data.py)
 SPOT: Dict = {"price": None, "ts": None, "history": []}
