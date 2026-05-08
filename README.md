@@ -227,37 +227,51 @@ pip install -r requirements.txt
 ## BTC 1-Hour Current Handoff
 
 This repo contains several experiments, but the active BTC/Kalshi work is now
-centered on the KXBTCD 1-hour cumulative markets.
-
-Current operational state as of the May 5, 2026 evening run:
+centered on the KXBTCD 1-hour cumulative markets. Current state as of May 8,
+2026:
 
 | Track | Script | Mode | Strategy | Status / Purpose |
 |---|---|---|---|---|
-| Production live | `scripts/btc_1hr_research_live.py` | Real Kalshi prod orders | `research` | The only live-money executor currently intended to run |
-| Paper shadow | `scripts/btc_1hr_js_guarded_shadow.py` | Simulated fills, no orders | `js_guarded` | Watches the same websocket feed with a `$1000` mock bankroll |
-| Historical replay | `scripts/backtest_research_duckdb.py` | Offline DuckDB replay | `paper`, `research`, `js_robust`, `js_guarded` | Causal bid/ask-candle backtests |
+| Production live | `scripts/btc_1hr_risk_adjusted_research_live.py` | Real Kalshi prod orders | `research` signal with risk-adjusted sizing | Current live-money executor. This wraps the websocket research executor and keeps the signal logic aligned with `btc_1hr_research_live.py`. |
+| Core executor/model | `scripts/btc_1hr_research_live.py` | Live or paper, websocket or polling | `research`, `js_guarded` selectable | Shared engine: Kalshi websocket books, Kraken/Coinbase BTC data, event guards, order placement, capture DB, and scan loop. |
+| Paper shadow | `scripts/btc_1hr_js_guarded_shadow.py` | Simulated fills, no Kalshi orders | `js_guarded` with `$1000` mock bankroll | Watches the same websocket-style path and reports bankroll/PnL for the guarded Jane-Street-style candidate. |
+| Risk model helper | `scripts/risk_adjusted_research.py` | Imported helper | Conservative Kelly sizing | Caps live size by bankroll, visible depth, entry risk, and model confidence. |
+| May 8 research sweep | `scripts/may8examine.py` | Offline replay | Current model plus guardrail variants | Tests calibration shrinkage, basis/near-strike guards, momentum-exhaustion guards, and no-dump-chase guards across historical DuckDB, CSV diagnostics, and optional live capture snapshots. |
+| Corrected replay | `scripts/backtest_research_duckdb.py` | Offline DuckDB replay | `paper`, `research`, `js_robust`, `js_guarded` | Earlier causal bid/ask-candle benchmark used for model comparison. |
 
-The live production bot is intentionally still `research`, not `js_guarded`.
-`js_guarded` is the best corrected-replay candidate so far, but it is being
-paper-shadowed first because its edge is not statistically locked and the old
-minute-candle replay does not exactly match live second-level execution.
+The production bot is no longer the raw fixed-size research script. Use the
+risk-adjusted wrapper for live money unless deliberately reproducing an old
+run. The live signal is still the successful `research` model, but final
+contract size is risk-adjusted. The shadow bot is still paper-only.
 
 Quick commands from the project root:
 
 ```powershell
-# Start live production research bot and watch its log.
-$ts = Get-Date -Format "yyyyMMdd_HHmmss"; Start-Process -WindowStyle Hidden -FilePath python -WorkingDirectory (Get-Location) -ArgumentList "scripts\btc_1hr_research_live.py" -RedirectStandardOutput "logs\research_live_$ts.out.log" -RedirectStandardError "logs\research_live_$ts.err.log"; Start-Sleep -Seconds 5; Get-Content "logs\research_live_$ts.out.log" -Wait -Tail 100
+# Start live production risk-adjusted research bot and watch its log.
+$ts = Get-Date -Format "yyyyMMdd_HHmmss"; Start-Process -WindowStyle Hidden -FilePath python -WorkingDirectory (Get-Location) -ArgumentList "scripts\btc_1hr_risk_adjusted_research_live.py" -RedirectStandardOutput "logs\risk_adjusted_research_$ts.out.log" -RedirectStandardError "logs\risk_adjusted_research_$ts.err.log"; Start-Sleep -Seconds 5; Get-Content "logs\risk_adjusted_research_$ts.out.log" -Wait -Tail 100
 
 # Start js_guarded paper shadow and watch its log.
 $ts = Get-Date -Format "yyyyMMdd_HHmmss"; Start-Process -WindowStyle Hidden -FilePath python -WorkingDirectory (Get-Location) -ArgumentList "scripts\btc_1hr_js_guarded_shadow.py" -RedirectStandardOutput "logs\js_guarded_shadow_$ts.out.log" -RedirectStandardError "logs\js_guarded_shadow_$ts.err.log"; Start-Sleep -Seconds 5; Get-Content "logs\js_guarded_shadow_$ts.out.log" -Wait -Tail 100
 
 # Watch latest live or shadow log without starting a new process.
-$log = (Get-ChildItem logs\research_live_*.out.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName; Get-Content $log -Wait -Tail 100
+$log = (Get-ChildItem logs\risk_adjusted_research_*.out.log,logs\research_live_*.out.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName; Get-Content $log -Wait -Tail 100
 $log = (Get-ChildItem logs\js_guarded_shadow_*.out.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName; Get-Content $log -Wait -Tail 100
 
 # Check whether the live and shadow Python processes are still running.
-Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*btc_1hr_research_live.py*' -or $_.CommandLine -like '*btc_1hr_js_guarded_shadow.py*' } | Select-Object ProcessId,CommandLine
+Get-CimInstance Win32_Process -Filter "name = 'python.exe'" | Where-Object { $_.CommandLine -like '*btc_1hr_risk_adjusted_research_live.py*' -or $_.CommandLine -like '*btc_1hr_research_live.py*' -or $_.CommandLine -like '*btc_1hr_js_guarded_shadow.py*' } | Select-Object ProcessId,CommandLine
 ```
+
+Current model details:
+
+| Component | Detail |
+|---|---|
+| Market universe | Current-hour KXBTCD cumulative `-T` BTC above/below markets only. Bucket markets, next-day markets, wrong close hour, and stale events are rejected. |
+| Price feed | Kraken websocket is the preferred live BTC feed; Coinbase candle/cache support remains in the engine for history and fallback. Kalshi pricing comes from real websocket orderbook state, not `NO = 1 - YES` assumptions. |
+| Fair value | 7-day causal empirical BTC move cache frozen at event open, blended with lognormal fair value and dampened using `BRTI_DAMPENING = 0.80`. |
+| Entry filter | Fee-aware net edge must clear the base 12c threshold plus uncertainty. Spread must be <= 2c, entry between 25c and 75c, and side probability must be strong enough (`YES >= 0.65` or `NO <= 0.35`). |
+| Execution | Kalshi V2 FOK event orders with real visible depth, pre-inserted local order rows, event locks, position checks, balance checks, and 409/FOK no-fill reconciliation. |
+| Sizing | Risk-adjusted helper uses conservative probability, fractional Kelly, bankroll and exposure caps, visible-depth caps, and entry-risk caps. It is allowed to use up to 3 contracts but is not forced to use 3. |
+| Capture | Live top-of-book, lifecycle, signal scans, order decisions, private events, and health rows are written to `~/.btc_kalshi_bot/research_live_capture.duckdb`; raw websocket deltas are intentionally off by default. |
 
 Local runtime databases:
 
@@ -268,38 +282,81 @@ Local runtime databases:
 | `~/.btc_kalshi_bot/js_guarded_shadow_trades.db` | Paper-shadow fills for `js_guarded` | No |
 | `~/.btc_kalshi_bot/js_guarded_shadow_capture.duckdb` | Paper-shadow websocket/live-capture dataset | No |
 
-Live incident/fix to know: on May 5, 2026 at `19:47:49` MDT, a live FOK order
-for `KXBTCD-26MAY0522-T81399.99` returned HTTP 409. Kalshi showed the order as
-`canceled` with `fill_count=0.00`, so no fill occurred. The local row was
-synced to `not_filled`. The executor now handles future 409/FOK no-fill cases
-by querying `/portfolio/orders`, updating the local row to
-`not_filled`/`partial_filled`/`filled`, and continuing the websocket loop
-instead of exiting.
+Research/backtest data map:
 
-Live websocket/capture hardening from the May 5, 2026 late-evening restart:
-
-| Fix | What changed |
+| Path | Purpose | Commit? |
 |---|---|
-| Capture backpressure | Raw websocket delta/snapshot-level capture is now off by default; top-of-book, lifecycle, signal scans, order decisions, health rows, and private events remain captured. Use `--capture-raw-ws` only for short diagnostics. |
-| Scan trigger pressure | The raw scan queue was replaced with a coalesced update buffer, so duplicate bursts collapse into one bounded batch while preserving unique changed tickers and full-scan flags. |
-| Event refresh safety | If `/markets` refresh fails after an event is expired or otherwise ineligible, the executor clears the current event set instead of scanning stale markets. |
-| Kalshi REST pressure | `/markets` calls now use retry/backoff plus a local open-market cache during a still-valid event; startup/no-event/expired-event refreshes bypass the cache so the next hour is not missed. |
-| Capture health gate | Live scans skip if the capture writer is unhealthy, because exact live capture is now part of the research process. |
+| `data/research_datamart/research.duckdb` | Full local historical bid/ask DuckDB; too large for GitHub, ignored. |
+| `data/research_datamart/research_backtest.duckdb` | Compact commit-safe DuckDB used by other people to reproduce core replay work. | Yes |
+| `data/research_datamart/kalshi_quotes.parquet` | Historical observed bid/ask minute candles; ignored because generated. |
+| `data/research_datamart/kalshi_markets.parquet` | Market/event metadata and settlement proxy fields; ignored because generated. |
+| `data/research_datamart/kalshi_bidask_events/` | Raw per-event historical bid/ask pulls; ignored because generated. |
+| `data/btc_1m_research_live_cache.parquet` | BTC minute cache used by live/research scripts; generated. |
+| `data/*.csv` | Original manual Kalshi chart-price exports; retained for coverage/reference but not deployment evidence. |
+| `backtest_outputs/may8examine_historical/` | May 8 high-quality historical DuckDB backtest outputs. Ignored. |
+| `backtest_outputs/may8examine_csv_2c/` | May 8 CSV diagnostic outputs with assumed 2c spread. Ignored. |
+| `backtest_outputs/may8examine_combined/` | Combined summary/trade CSV from May 8 runs. Ignored. |
 
-After this patch both live processes were restarted:
-`logs/research_live_20260505_230443.out.log` and
-`logs/js_guarded_shadow_20260505_230443.out.log`. Startup showed websocket
-subscription to `KXBTCD-26MAY0602` with 188 markets and no queue-full,
-traceback, or capture-health errors.
+May 8 guardrail research:
+
+```powershell
+python scripts\may8examine.py --output-dir backtest_outputs\may8examine_historical --progress-every-events 50
+python scripts\may8examine.py --skip-historical --include-csv --assumed-spread-cents 2 --output-dir backtest_outputs\may8examine_csv_2c --progress-every-events 100
+```
+
+`scripts/may8examine.py` reuses the live research feature logic, applies the
+same Kalshi taker-fee estimate, and enforces causal training windows. It
+does not model early exits. Historical and CSV settlements use BTC minute
+close proxies because official Kalshi `expiration_value` is not stored for all
+older datasets. The current live-capture DB was locked by the running bot, so
+the May 8 run did not stop the bot to snapshot it.
+
+High-quality historical DuckDB result (`data/research_datamart/research.duckdb`,
+1,488 events, 4,538,666 quote rows):
+
+| Variant | Train Trades | Train PnL | Val Trades | Val PnL | Test Trades | Test PnL | Test Return on Premium | Test Max DD | Read |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `baseline_current` | 66 | +4.49 | 54 | -0.65 | 53 | +2.41 | 6.77% | -3.27 | Current signal still has edge on held-out test, but validation was negative. |
+| `market_shrink_25` | 7 | +0.09 | 6 | +1.14 | 7 | +1.12 | 28.87% | -0.64 | Most stable split profile, but the sample is too small to deploy. |
+| `vol_dist_075` | 46 | +3.38 | 38 | -0.26 | 37 | +1.24 | 4.63% | -2.45 | Reduces trade count and drawdown, but does not fix validation. |
+| `momentum_exhaustion_guard` | 39 | +1.14 | 42 | -1.82 | 35 | +4.04 | 17.60% | -2.42 | Directly attacks the live failure mode, but validation failure blocks deployment. |
+| `no_dump_chase_guard` | 52 | +2.12 | 47 | -2.05 | 41 | +3.82 | 14.05% | -2.16 | Helps held-out test and aligns with live diagnosis, but validation was bad. |
+| `basis_shrink_75` | 4 | -0.81 | 1 | -0.54 | 0 | 0.00 | n/a | n/a | Too sparse and negative. |
+| `may8_guarded` | 0 | 0.00 | 0 | 0.00 | 0 | 0.00 | n/a | n/a | Over-filtered on faithful bid/ask data. |
+| `may8_conservative` | 0 | 0.00 | 0 | 0.00 | 0 | 0.00 | n/a | n/a | Over-filtered on faithful bid/ask data. |
+
+CSV diagnostic result with assumed 2c spread (`data/*.csv`, 1,366 events,
+2,020,851 quote rows) looked much better, for example `may8_guarded` produced
++94.38 train, +105.98 validation, and +61.61 test. Do not treat those numbers
+as deployable evidence. They use exported chart prices plus an assumed spread,
+which is exactly the data source that previously made the strategy look
+unrealistically strong.
+
+Live reality check from settled fills before May 8: the current research family
+had a good hit rate but weak realized economics. Across 20 settled live fills
+the bot won 14 and lost 6, but realized PnL was about `-$0.87` on `$26.87` of
+premium (`-3.23%` return on premium). YES-side fills were positive; NO-side
+fills lost money, especially after sharp selloffs where the model over-trusted
+continued downside. FOK rejections were useful: missed/not-filled attempts
+would have lost materially if forced through at stale assumptions. This is why
+risk-adjusted sizing and exact live capture matter more than adding larger
+fixed size.
 
 What to trust:
 
 | Use | Trust level |
 |---|---|
-| Corrected DuckDB bid/ask replay | Best historical evidence currently in repo |
-| Exact websocket capture DBs | Required next dataset for live-faithful replay |
-| Raw Kalshi CSV exports | Coverage/reference only, not executable fills |
-| Old assumed-spread CSV backtests | Historical diagnostics only; do not use for deployment decisions |
+| Corrected DuckDB bid/ask replay | Best historical evidence currently in repo, but still minute-candle replay with BTC proxy settlement. |
+| Exact websocket capture DBs | Best future dataset for live-faithful replay once enough duration is collected. |
+| Live SQLite trade ledger | Source of truth for what we actually attempted/filled. |
+| Raw Kalshi CSV exports | Coverage/reference only, not executable fills. |
+| Old assumed-spread CSV backtests | Historical diagnostics only; do not use for deployment decisions. |
+
+Current research conclusion: keep the risk-adjusted research live bot as the
+production candidate, keep `js_guarded` paper-shadowed, and do not deploy the
+May 8 guardrail variants yet. `market_shrink_25` is the cleanest-looking new
+idea, while momentum/no-dump guards match the live loss diagnosis, but none
+passed train/validation/test strongly enough for live promotion.
 
 ## BTC 1-Hour Kalshi Backtest Report
 
@@ -312,17 +369,17 @@ python scripts/backtest_1hr_collected_data.py
 Live execution script:
 
 ```
-python scripts/btc_1hr_research_live.py
+python scripts/btc_1hr_risk_adjusted_research_live.py
 ```
 
-The deployed live script is pinned to the successful research backtest:
+The deployed live script is pinned to the successful research signal:
 KXBTCD hourly BTC markets only, cumulative "$X or above" markets only,
-one selected signal per minute, 7-day empirical training window frozen at
+one selected signal per event, 7-day empirical training window frozen at
 event open, official Kalshi taker fee estimate, and real orderbook execution
-checks. The signal filter remains the one-contract research filter; the live
-order count is then bankroll-scaled up to 3 contracts. Running it with no
-flags starts live prod execution. Use `--dry-run --once` for a one-cycle
-validation scan.
+checks. The signal filter remains the one-contract research filter; final live
+size is then risk-adjusted from bankroll, entry risk, model confidence, and
+visible depth. Running the wrapper with no flags starts live prod execution.
+Use the core executor's dry-run flags only when deliberately doing diagnostics.
 
 ### Data Verification
 
@@ -790,24 +847,25 @@ Source:
 
 ### Production Selection
 
-If running the research strategy, use `scripts/btc_1hr_research_live.py`
-rather than the older paper or hardened scripts. It now defaults to websocket
-market data for the deployed research model; use `--polling` only to force the
-old REST polling loop. However, the March/April selection was based on the
-assumed-spread CSV replay above. After the corrected DuckDB replay, the edge is
-much smaller and should be treated as a modest historical bid/ask-candle edge,
-not proof of live production profitability.
+If running live money, use `scripts/btc_1hr_risk_adjusted_research_live.py`
+rather than the raw research, paper, or hardened scripts. The wrapper uses the
+websocket research executor but applies the risk-adjusted sizing policy. Use
+`scripts/btc_1hr_research_live.py` directly only for controlled diagnostics,
+paper runs, or strategy-engine work. The old March/April selection was based
+on assumed-spread CSV replay; after corrected DuckDB replay and real fills, the
+edge should be treated as modest and sizing-sensitive, not proof of unlimited
+live profitability.
 
 Default live command:
 
 ```powershell
-python scripts\btc_1hr_research_live.py
+python scripts\btc_1hr_risk_adjusted_research_live.py
 ```
 
 The websocket executor writes a live replay database at
 `~/.btc_kalshi_bot/research_live_capture.duckdb`. That capture is intentionally
 outside the repo and should not be committed. It stores Kalshi orderbook
-reconstructed top-of-book, lifecycle/private messages, Coinbase BTC websocket
+reconstructed top-of-book, lifecycle/private messages, BTC websocket
 ticks, signal scans, and order decisions. Raw orderbook deltas and raw snapshot
 levels are suppressed by default to avoid overwhelming DuckDB during live
 trading; enable `--capture-raw-ws` only when intentionally running a short
@@ -828,17 +886,17 @@ Live execution safeguards:
 
 | Guard | Behavior |
 |---|---|
-| Websocket market data | Maintains an in-memory Kalshi orderbook from authenticated `orderbook_delta` snapshots and deltas, plus Coinbase BTC spot from websocket ticker updates. |
+| Websocket market data | Maintains an in-memory Kalshi orderbook from authenticated `orderbook_delta` snapshots and deltas, plus live BTC spot from Kraken websocket with Coinbase/cache support elsewhere in the engine. |
 | Event subscription control | Uses Kalshi lifecycle messages plus a low-rate metadata refresh to subscribe only to the current eligible KXBTCD event and remove old event markets. |
 | Stale-event refresh failure | If event metadata refresh fails while the prior event is no longer eligible, the bot clears the event set and refuses to scan until a fresh eligible event is loaded. |
 | Full initial book gate | Does not scan/trade a new hourly event until every market in that event has received its initial websocket orderbook snapshot. |
 | Reconnect/gap safety | Clears in-memory books on reconnect, ignores duplicate/out-of-order websocket messages, and reconnects on any Kalshi sequence gap before trading again. |
-| Fresh BTC spot gate | Refuses to scan/trade unless the Coinbase websocket is connected and the BTC spot tick is recent. |
+| Fresh BTC spot gate | Refuses to scan/trade unless the BTC websocket feed is connected and the spot tick is recent. |
 | Correct event | Trades only the current KXBTCD hourly event whose API close time matches the event ticker's New York close hour. |
 | Correct market | Trades only cumulative `-T` markets inside that exact event; bucket markets and next-day events are rejected. |
 | Duplicate protection | Blocks existing DB `submitted`, `filled`, or `partial_filled` rows, all nonzero live Kalshi positions, and an atomic per-event SQLite lock before any paper/live order attempt. |
 | Bankroll control | Reads Kalshi `balance` and `portfolio_value` every live cycle, blocks orders that exceed available cash, per-market exposure, or total active exposure. |
-| Scaled sizing | Keeps the backtested one-contract signal filter, then sizes the final live order up to 3 contracts when bankroll, exposure, and visible orderbook depth allow it. |
+| Risk-adjusted sizing | Keeps the backtested one-contract signal filter, then sizes the final live order with conservative Kelly, bankroll, exposure, entry-risk, and visible-depth caps. |
 | Order pricing | Uses real YES and NO orderbook bids from the maintained websocket book. YES ask is `1 - best NO bid`; NO ask is `1 - best YES bid`. |
 | Order type | Uses Kalshi V2 FOK orders with `cancel_order_on_pause` and self-trade prevention. |
 | 409 / FOK no-fill sync | If Kalshi returns HTTP 409, the bot queries `/portfolio/orders` by `client_order_id`; canceled zero-fill orders become `not_filled`, partials stay protected, and the websocket loop continues. |
