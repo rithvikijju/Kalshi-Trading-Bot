@@ -31,10 +31,13 @@ from scripts.btc_1hr_research_live import (
     LiveMarketState,
     LiveOrderbook,
     PortfolioSnapshot,
+    StaleBtcCandleData,
     TradeSignal,
     WsResearchExecutor,
     acquire_event_lock,
     bankroll_allows_trade,
+    btc_candles_are_fresh,
+    btc_candle_age_sec,
     build_research_event,
     choose_contracts_for_signal,
     db_active_events,
@@ -50,6 +53,7 @@ from scripts.btc_1hr_research_live import (
     record_trade,
     release_event_lock,
     resize_signal,
+    refresh_btc_data_cached,
     safe_put_update,
     set_sizing_policy,
     set_signal_strategy,
@@ -410,6 +414,23 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         _, _, _, _, ok, reason = state.snapshot_scan_inputs()
         self.assertTrue(ok)
         self.assertEqual(reason, "ok")
+
+    def test_btc_candle_freshness_gate(self) -> None:
+        now = datetime.now(timezone.utc)
+        fresh = pd.DataFrame({"time": [now - timedelta(seconds=90)]})
+        stale = pd.DataFrame({"time": [now - timedelta(minutes=10)]})
+
+        self.assertLess(btc_candle_age_sec(fresh, now=now), 180.0)
+        self.assertTrue(btc_candles_are_fresh(fresh, now=now))
+        self.assertFalse(btc_candles_are_fresh(stale, now=now))
+
+    def test_required_btc_refresh_fails_closed_on_stale_return(self) -> None:
+        stale = pd.DataFrame({"time": [datetime.now(timezone.utc) - timedelta(minutes=10)]})
+        with patch("scripts.btc_1hr_research_live.base_strategy.refresh_btc_data", return_value=stale), patch(
+            "scripts.btc_1hr_research_live.write_btc_cache"
+        ):
+            with self.assertRaises(StaleBtcCandleData):
+                refresh_btc_data_cached(stale, require_fresh=True)
 
     def test_websocket_sequence_status_rejects_stale_and_gaps(self) -> None:
         ws = KalshiWsClient(None, LiveMarketState(), DummyRecorder(), queue.Queue())

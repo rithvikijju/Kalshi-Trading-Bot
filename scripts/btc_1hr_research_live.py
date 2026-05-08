@@ -107,6 +107,7 @@ KALSHI_PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 KALSHI_DEMO_WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 BTC_SPOT_MAX_AGE_SEC = 15.0
+BTC_CANDLE_MAX_AGE_SEC = 180.0
 WS_SCAN_STATUS_TTL_SEC = 30.0
 WS_EVENT_REFRESH_SEC = 180.0
 WS_EVENT_REFRESH_JITTER_SEC = 30.0
@@ -145,6 +146,10 @@ EVENT_TICKER_RE = re.compile(r"^KXBTCD-(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<day>\d{
 
 class ExpectedWsReconnect(RuntimeError):
     """Raised when a subscription change intentionally forces fresh snapshots."""
+
+
+class StaleBtcCandleData(RuntimeError):
+    """Raised when Coinbase candle history is too stale for faithful signals."""
 
 
 def set_signal_strategy(strategy: str) -> None:
@@ -1869,8 +1874,51 @@ def load_btc_history_cached(days_back: int):
     return btc_1m
 
 
-def refresh_btc_data_cached(btc_1m):
+def btc_last_candle_time(btc_1m) -> datetime | None:
+    if btc_1m is None or len(btc_1m) == 0 or "time" not in btc_1m.columns:
+        return None
+    try:
+        times = pd.to_datetime(btc_1m["time"], utc=True, errors="coerce").dropna()
+    except Exception:
+        return None
+    if times.empty:
+        return None
+    return times.max().to_pydatetime()
+
+
+def btc_candle_age_sec(btc_1m, now: datetime | None = None) -> float | None:
+    last = btc_last_candle_time(btc_1m)
+    if last is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (now - last.astimezone(timezone.utc)).total_seconds()
+
+
+def btc_candles_are_fresh(btc_1m, now: datetime | None = None) -> bool:
+    age = btc_candle_age_sec(btc_1m, now=now)
+    return age is not None and age <= BTC_CANDLE_MAX_AGE_SEC
+
+
+def describe_btc_candle_freshness(btc_1m) -> str:
+    last = btc_last_candle_time(btc_1m)
+    age = btc_candle_age_sec(btc_1m)
+    if last is None or age is None:
+        return "last_candle=none"
+    return f"last_candle={last.astimezone(timezone.utc).isoformat()} age={age:.1f}s max_age={BTC_CANDLE_MAX_AGE_SEC:.1f}s"
+
+
+def refresh_btc_data_cached(btc_1m, require_fresh: bool = False):
+    before_last = btc_last_candle_time(btc_1m)
     refreshed = base_strategy.refresh_btc_data(btc_1m)
+    after_last = btc_last_candle_time(refreshed)
+    if after_last is None:
+        raise StaleBtcCandleData("BTC candle refresh returned no usable candles")
+    if before_last is not None and after_last <= before_last and not btc_candles_are_fresh(refreshed):
+        log.warning("BTC candle refresh did not advance stale data: %s", describe_btc_candle_freshness(refreshed))
+    if require_fresh and not btc_candles_are_fresh(refreshed):
+        raise StaleBtcCandleData(f"BTC candle data is stale; refusing to trade: {describe_btc_candle_freshness(refreshed)}")
     write_btc_cache(refreshed)
     return refreshed
 
@@ -3353,7 +3401,7 @@ def run_once(args, data_client: KalshiApi, trade_client: KalshiApi | None, conn:
         if not status.get("exchange_active") or not status.get("trading_active"):
             raise RuntimeError(f"Exchange is not trading: {status}")
 
-    btc_1m = refresh_btc_data_cached(btc_1m)
+    btc_1m = refresh_btc_data_cached(btc_1m, require_fresh=True)
     events = scan_research_events(data_client)
     events = events[:1]
     signals, cache_by_event = find_signals(data_client=data_client, btc_1m=btc_1m, events=events)
@@ -3646,6 +3694,7 @@ def run_websocket_loop(
         next_health = time.monotonic() + 30.0
         next_paper_report = time.monotonic() + min(60.0, float(args.paper_report_sec))
         last_hourly_report_key: str | None = None
+        last_stale_btc_log = 0.0
         full_snapshot_scanned_key: tuple[str, ...] | None = None
         while True:
             now = time.monotonic()
@@ -3711,8 +3760,13 @@ def run_websocket_loop(
                 try:
                     btc_1m = refresh_btc_data_cached(btc_1m)
                     executor.set_btc_1m(btc_1m)
-                    reasons.add("btc_candle_refresh")
-                    full_scan = True
+                    if btc_candles_are_fresh(btc_1m):
+                        reasons.add("btc_candle_refresh")
+                        full_scan = True
+                    elif now - last_stale_btc_log >= 30.0:
+                        log.warning("BTC candle refresh stale; scans blocked until fresh: %s", describe_btc_candle_freshness(btc_1m))
+                        record_capture_health(recorder, state, args, "stale_btc_candles", describe_btc_candle_freshness(btc_1m))
+                        last_stale_btc_log = now
                 except Exception:
                     log.exception("BTC candle refresh failed")
                 next_btc_refresh = now + WS_BTC_CANDLE_REFRESH_SEC
@@ -3728,7 +3782,13 @@ def run_websocket_loop(
             if updates or full_scan:
                 reason = "+".join(sorted(reasons)) if reasons else "websocket"
                 ready_before_scan, total_before_scan = state.orderbook_coverage()
-                executor.scan(None if full_scan else changed_tickers, reason=reason)
+                if not btc_candles_are_fresh(executor.btc_1m):
+                    if now - last_stale_btc_log >= 30.0:
+                        log.warning("WS scan blocked: stale BTC candles %s reason=%s", describe_btc_candle_freshness(executor.btc_1m), reason)
+                        record_capture_health(recorder, state, args, "scan_blocked", f"stale_btc_candles reason={reason} {describe_btc_candle_freshness(executor.btc_1m)}")
+                        last_stale_btc_log = now
+                else:
+                    executor.scan(None if full_scan else changed_tickers, reason=reason)
                 if not args.loop:
                     if not total_before_scan or ready_before_scan >= total_before_scan:
                         break
@@ -3840,7 +3900,7 @@ def main() -> None:
 
     log.info("fetching initial BTC data days=%d", RESEARCH_BOOTSTRAP_BTC_DAYS)
     btc_1m = load_btc_history_cached(RESEARCH_BOOTSTRAP_BTC_DAYS)
-    btc_1m = refresh_btc_data_cached(btc_1m)
+    btc_1m = refresh_btc_data_cached(btc_1m, require_fresh=True)
 
     try:
         if args.market_data == "websocket":
