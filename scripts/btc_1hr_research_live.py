@@ -108,6 +108,7 @@ KALSHI_DEMO_WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 BTC_SPOT_MAX_AGE_SEC = 15.0
+COINBASE_TICKER_MAX_EXCHANGE_AGE_SEC = 20.0
 BTC_CANDLE_MAX_AGE_SEC = 180.0
 BTC_CANDLE_REFRESH_LOOKBACK_MIN = 10
 BTC_CANDLE_FALLBACK_SOURCE = os.getenv("BTC_1HR_BTC_CANDLE_FALLBACK", "kraken").strip().lower()
@@ -569,6 +570,10 @@ def ns_to_utc_iso(ns: int | None) -> str | None:
     if ns is None:
         return None
     return datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc).isoformat()
+
+
+def dt_to_ns(dt: datetime) -> int:
+    return int(dt.astimezone(timezone.utc).timestamp() * 1_000_000_000)
 
 
 def parse_ws_levels(msg: dict, side: str) -> list[tuple[float, float]]:
@@ -1608,6 +1613,7 @@ class CoinbaseWsSpot:
         self.update_queue = update_queue
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._last_stale_log = 0.0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._thread_main, name="coinbase-ws", daemon=True)
@@ -1672,7 +1678,37 @@ class CoinbaseWsSpot:
         price = optional_float(data.get("price"))
         if price is None or price <= 0:
             return
-        self.state.set_btc_spot(price, received_at_ns)
+        exchange_dt = utc_dt(data.get("time"))
+        if exchange_dt is None:
+            log.warning("Coinbase ticker missing/unparseable exchange time; ignoring price=%s", data.get("price"))
+            return
+        exchange_age_sec = (datetime.now(timezone.utc) - exchange_dt).total_seconds()
+        if exchange_age_sec < -5.0 or exchange_age_sec > COINBASE_TICKER_MAX_EXCHANGE_AGE_SEC:
+            now = time.monotonic()
+            if now - self._last_stale_log >= 30.0:
+                log.warning(
+                    "Coinbase ticker stale; ignoring price=%.2f exchange_time=%s age=%.1fs max_age=%.1fs",
+                    price,
+                    exchange_dt.isoformat(),
+                    exchange_age_sec,
+                    COINBASE_TICKER_MAX_EXCHANGE_AGE_SEC,
+                )
+                self._last_stale_log = now
+            self.recorder.record(
+                "ws_control",
+                {
+                    "received_at_ns": received_at_ns,
+                    "received_at_utc": ns_to_utc_iso(received_at_ns),
+                    "source": "coinbase",
+                    "message_type": "stale_ticker_ignored",
+                    "sid": None,
+                    "seq": data.get("sequence"),
+                    "payload_json": json.dumps(data, sort_keys=True),
+                },
+            )
+            return
+        exchange_ns = dt_to_ns(exchange_dt)
+        self.state.set_btc_spot(price, exchange_ns)
         self.recorder.record(
             "coinbase_ticker",
             {
@@ -3855,8 +3891,7 @@ def run_websocket_loop(
     try:
         try:
             initial_spot = base_strategy.get_btc_spot()
-            state.set_btc_spot(initial_spot, utc_now_ns())
-            log.info("initial Coinbase BTC spot %.2f", initial_spot)
+            log.info("initial Coinbase REST BTC spot %.2f (diagnostic only; waiting for fresh websocket ticker)", initial_spot)
         except Exception:
             log.exception("initial BTC spot fetch failed; waiting for Coinbase websocket")
 

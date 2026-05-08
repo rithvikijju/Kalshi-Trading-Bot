@@ -25,6 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.btc_1hr_research_live import (
     BookQuote,
     CoalescedUpdateBuffer,
+    CoinbaseWsSpot,
     KalshiWsClient,
     KalshiApi,
     LiveCaptureWriter,
@@ -470,6 +471,51 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         self.assertTrue(btc_candles_are_fresh(refreshed))
         self.assertIn("rv_60m", refreshed.columns)
         self.assertGreaterEqual(len(refreshed), 4)
+
+    def test_coinbase_ws_ignores_stale_exchange_ticker(self) -> None:
+        state = LiveMarketState()
+        updates = queue.Queue()
+        ws = CoinbaseWsSpot(state, DummyRecorder(), updates)
+        stale_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+
+        ws._handle_message(
+            json.dumps(
+                {
+                    "type": "ticker",
+                    "product_id": "BTC-USD",
+                    "price": "100000.00",
+                    "time": stale_time,
+                    "sequence": 1,
+                }
+            )
+        )
+
+        self.assertIsNone(state.btc_spot)
+        self.assertIsNone(state.btc_spot_received_at_ns)
+        with self.assertRaises(queue.Empty):
+            updates.get_nowait()
+
+    def test_coinbase_ws_accepts_fresh_exchange_ticker(self) -> None:
+        state = LiveMarketState()
+        updates = queue.Queue()
+        ws = CoinbaseWsSpot(state, DummyRecorder(), updates)
+        fresh_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+        ws._handle_message(
+            json.dumps(
+                {
+                    "type": "ticker",
+                    "product_id": "BTC-USD",
+                    "price": "100001.00",
+                    "time": fresh_time,
+                    "sequence": 2,
+                }
+            )
+        )
+
+        self.assertEqual(state.btc_spot, 100001.0)
+        self.assertIsNotNone(state.btc_spot_received_at_ns)
+        self.assertEqual(updates.get_nowait()["kind"], "btc_spot")
 
     def test_websocket_sequence_status_rejects_stale_and_gaps(self) -> None:
         ws = KalshiWsClient(None, LiveMarketState(), DummyRecorder(), queue.Queue())
