@@ -157,12 +157,20 @@ def _ticker_close_time(event_ticker: str) -> Optional[datetime]:
 
 
 def event_tracker(kalshi_md: KalshiClient):
-    """Find the nearest open BTC event whose TTL is in the configured window."""
+    """Find the nearest open BTC event whose TTL is in the configured window.
+
+    Resolution order for close_time, mirroring kalshi_gnn_arb_live:
+      1. event['markets'][0]['close_time'] / 'expected_expiration_time'
+      2. fresh get_markets(event_ticker=..) call
+      3. _ticker_close_time(et) regex on the event ticker
+    """
     from dateutil import parser as dtparser
     while BOT_STATE["running"]:
         try:
             now = datetime.now(timezone.utc)
             best_event, best_close = None, None
+            candidates = 0
+            in_window  = 0
             for series in CFG["event_series"]:
                 try:
                     resp = kalshi_md.get_events(series_ticker=series,
@@ -170,27 +178,54 @@ def event_tracker(kalshi_md: KalshiClient):
                 except Exception as e:
                     _log(f"tracker {series}: {e}")
                     continue
-                for ev in resp.get("events", []):
+                events = resp.get("events", [])
+                for ev in events:
                     et = ev.get("event_ticker", "")
-                    # First try ticker-encoded close time (cheap, no extra API call)
-                    ct = _ticker_close_time(et)
+                    candidates += 1
+                    ct = None
+
+                    # 1. Embedded markets in event response
+                    embedded = ev.get("markets", []) or []
+                    if embedded:
+                        ct_str = (embedded[0].get("close_time")
+                                  or embedded[0].get("expected_expiration_time"))
+                        if ct_str:
+                            try:
+                                ct = dtparser.isoparse(ct_str)
+                            except Exception:
+                                ct = None
+
+                    # 2. Fall back to a fresh markets fetch
                     if ct is None:
-                        # Fallback: fetch markets to read close_time
                         try:
                             mkts = kalshi_md.get_markets(event_ticker=et,
                                                           limit=5).get("markets", [])
                             if mkts:
-                                ct_str = mkts[0].get("close_time")
+                                ct_str = (mkts[0].get("close_time")
+                                          or mkts[0].get("expected_expiration_time"))
                                 if ct_str:
                                     ct = dtparser.isoparse(ct_str)
                         except Exception:
-                            continue
-                    if ct is None: continue
+                            pass
+
+                    # 3. Last resort: parse close_time from the ticker name
+                    if ct is None:
+                        ct = _ticker_close_time(et)
+
+                    if ct is None:
+                        continue
+                    if ct.tzinfo is None:
+                        ct = ct.replace(tzinfo=timezone.utc)
                     ttl_min = (ct - now).total_seconds() / 60
                     if not (CFG["scan_min_ttl_min"] < ttl_min < CFG["scan_max_ttl_hours"]*60):
                         continue
+                    in_window += 1
                     if best_close is None or ct < best_close:
                         best_event, best_close = et, ct
+
+            if best_event is None:
+                _log(f"tracker: {candidates} events found, {in_window} in TTL "
+                     f"window ({CFG['scan_min_ttl_min']}-{CFG['scan_max_ttl_hours']*60:.0f} min)")
 
             with LOCK:
                 old = TRACKED.get("event")
