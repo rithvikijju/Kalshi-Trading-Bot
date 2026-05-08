@@ -425,12 +425,51 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         self.assertFalse(btc_candles_are_fresh(stale, now=now))
 
     def test_required_btc_refresh_fails_closed_on_stale_return(self) -> None:
-        stale = pd.DataFrame({"time": [datetime.now(timezone.utc) - timedelta(minutes=10)]})
-        with patch("scripts.btc_1hr_research_live.base_strategy.refresh_btc_data", return_value=stale), patch(
+        stale = pd.DataFrame(
+            {
+                "time": [datetime.now(timezone.utc) - timedelta(minutes=10)],
+                "open": [100.0],
+                "high": [101.0],
+                "low": [99.0],
+                "close": [100.5],
+                "volume": [1.0],
+            }
+        )
+        with patch("scripts.btc_1hr_research_live.fetch_btc_candles_with_fallback", side_effect=RuntimeError("down")), patch(
             "scripts.btc_1hr_research_live.write_btc_cache"
         ):
             with self.assertRaises(StaleBtcCandleData):
                 refresh_btc_data_cached(stale, require_fresh=True)
+
+    def test_btc_refresh_accepts_fresh_fallback_candles(self) -> None:
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        old = pd.DataFrame(
+            {
+                "time": [now - timedelta(minutes=12), now - timedelta(minutes=11)],
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [101.0, 101.5],
+                "volume": [1.0, 1.0],
+            }
+        )
+        fresh = pd.DataFrame(
+            {
+                "time": [now - timedelta(minutes=2), now - timedelta(minutes=1)],
+                "open": [102.0, 103.0],
+                "high": [103.0, 104.0],
+                "low": [101.0, 102.0],
+                "close": [103.0, 103.5],
+                "volume": [1.0, 1.0],
+            }
+        )
+        with patch("scripts.btc_1hr_research_live.fetch_btc_candles_with_fallback", return_value=(fresh, "kraken")), patch(
+            "scripts.btc_1hr_research_live.write_btc_cache"
+        ):
+            refreshed = refresh_btc_data_cached(old, require_fresh=True)
+        self.assertTrue(btc_candles_are_fresh(refreshed))
+        self.assertIn("rv_60m", refreshed.columns)
+        self.assertGreaterEqual(len(refreshed), 4)
 
     def test_websocket_sequence_status_rejects_stale_and_gaps(self) -> None:
         ws = KalshiWsClient(None, LiveMarketState(), DummyRecorder(), queue.Queue())

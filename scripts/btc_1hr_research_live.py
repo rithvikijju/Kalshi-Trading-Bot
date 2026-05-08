@@ -106,8 +106,11 @@ KALSHI_WS_PATH = "/trade-api/ws/v2"
 KALSHI_PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 KALSHI_DEMO_WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
 BTC_SPOT_MAX_AGE_SEC = 15.0
 BTC_CANDLE_MAX_AGE_SEC = 180.0
+BTC_CANDLE_REFRESH_LOOKBACK_MIN = 10
+BTC_CANDLE_FALLBACK_SOURCE = os.getenv("BTC_1HR_BTC_CANDLE_FALLBACK", "kraken").strip().lower()
 WS_SCAN_STATUS_TTL_SEC = 30.0
 WS_EVENT_REFRESH_SEC = 180.0
 WS_EVENT_REFRESH_JITTER_SEC = 30.0
@@ -1834,12 +1837,160 @@ def trim_btc_history(btc_1m, days_back: int):
     return btc_1m[btc_1m["time"] >= cutoff].sort_values("time").reset_index(drop=True)
 
 
+def normalize_btc_candles(btc_1m):
+    if btc_1m is None or len(btc_1m) == 0:
+        return pd.DataFrame(columns=["time", "low", "high", "open", "close", "volume", "log_ret", "rv_15m", "rv_60m", "rv_1d", "rkurt_60m"])
+    required = {"time", "low", "high", "open", "close", "volume"}
+    if not required.issubset(set(btc_1m.columns)):
+        missing = sorted(required - set(btc_1m.columns))
+        raise ValueError(f"BTC candle dataframe missing columns: {missing}")
+    df = btc_1m.copy()
+    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    for column in ["low", "high", "open", "close", "volume"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=["time", "low", "high", "open", "close"])
+    df = df[(df["open"] > 0) & (df["high"] > 0) & (df["low"] > 0) & (df["close"] > 0)]
+    df = df.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+    if df.empty:
+        return df
+
+    df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
+    af = MINUTES_PER_YEAR
+    df["rv_15m"] = df["log_ret"].rolling(15).std() * np.sqrt(af)
+
+    log_ho = np.log(df["high"] / df["open"])
+    log_lo = np.log(df["low"] / df["open"])
+    log_co = np.log(df["close"] / df["open"])
+    log_oc = np.log(df["open"] / df["close"].shift(1))
+    close_vol = log_oc.rolling(60).var()
+    open_vol = log_co.rolling(60).var()
+    rs_vol = (log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)).rolling(60).mean()
+    k = 0.34 / (1.34 + 61 / 59)
+    df["rv_60m"] = np.sqrt((close_vol + k * open_vol + (1 - k) * rs_vol) * af)
+    df["rv_1d"] = df["log_ret"].rolling(1440).std() * np.sqrt(af)
+    df["rkurt_60m"] = df["log_ret"].rolling(60).kurt()
+    return df
+
+
 def write_btc_cache(btc_1m) -> None:
     try:
         BTC_LIVE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        trim_btc_history(btc_1m, RESEARCH_BOOTSTRAP_BTC_DAYS).to_parquet(BTC_LIVE_CACHE_PATH, index=False)
+        trim_btc_history(normalize_btc_candles(btc_1m), RESEARCH_BOOTSTRAP_BTC_DAYS).to_parquet(BTC_LIVE_CACHE_PATH, index=False)
     except Exception as exc:
         log.warning("could not write BTC live cache: %s", exc)
+
+
+def fetch_kraken_btc_candles(start: datetime, end: datetime):
+    if BTC_CANDLE_FALLBACK_SOURCE not in {"kraken", "on", "true", "1", "yes"}:
+        raise RuntimeError("Kraken BTC candle fallback disabled")
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
+    if end <= start:
+        return pd.DataFrame()
+
+    rows: list[dict[str, float | datetime]] = []
+    session = requests.Session()
+    since = max(0, int(start.timestamp()) - 60)
+    end_ts = int(end.timestamp())
+    for _ in range(60):
+        response = session.get(
+            KRAKEN_OHLC_URL,
+            params={"pair": "XBTUSD", "interval": 1, "since": since},
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        errors = payload.get("error") or []
+        if errors:
+            raise RuntimeError(f"Kraken OHLC error: {errors}")
+        result = payload.get("result") or {}
+        pair_key = next((key for key in result.keys() if key != "last"), None)
+        candles = result.get(pair_key, []) if pair_key else []
+        if not candles:
+            break
+        last_ts = since
+        for candle in candles:
+            if len(candle) < 7:
+                continue
+            ts = int(float(candle[0]))
+            last_ts = max(last_ts, ts)
+            rows.append(
+                {
+                    "time": datetime.fromtimestamp(ts, tz=timezone.utc),
+                    "open": float(candle[1]),
+                    "high": float(candle[2]),
+                    "low": float(candle[3]),
+                    "close": float(candle[4]),
+                    "volume": float(candle[6]),
+                }
+            )
+        if last_ts >= end_ts - 60:
+            break
+        next_since = last_ts + 60
+        if next_since <= since:
+            break
+        since = next_since
+        time.sleep(0.20)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = normalize_btc_candles(df)
+    return df[(df["time"] >= start) & (df["time"] <= end)].reset_index(drop=True)
+
+
+def fetch_btc_candles_with_fallback(start: datetime, end: datetime):
+    errors: list[str] = []
+    try:
+        coinbase = base_strategy.fetch_coinbase_candles(start=start, end=end)
+        coinbase = normalize_btc_candles(coinbase)
+        if not coinbase.empty:
+            return coinbase, "coinbase_exchange"
+        errors.append("coinbase_exchange returned no rows")
+    except Exception as exc:
+        errors.append(f"coinbase_exchange: {exc}")
+
+    try:
+        fallback = fetch_kraken_btc_candles(start, end)
+        fallback = normalize_btc_candles(fallback)
+        if not fallback.empty:
+            log.warning(
+                "using Kraken BTC candle fallback for %s -> %s rows=%d; Coinbase error=%s",
+                start.astimezone(timezone.utc).isoformat(),
+                end.astimezone(timezone.utc).isoformat(),
+                len(fallback),
+                "; ".join(errors)[-500:],
+            )
+            return fallback, "kraken"
+        errors.append("kraken returned no rows")
+    except Exception as exc:
+        errors.append(f"kraken: {exc}")
+    raise RuntimeError("all BTC candle sources failed: " + "; ".join(errors))
+
+
+def fetch_btc_history_with_fallback(days_back: int):
+    now = datetime.now(timezone.utc)
+    try:
+        coinbase = base_strategy.fetch_historical_minutes(days_back=days_back)
+        coinbase = normalize_btc_candles(coinbase)
+        if not coinbase.empty and btc_candles_are_fresh(coinbase, now=now):
+            return trim_btc_history(coinbase, days_back)
+        log.warning("Coinbase BTC history unavailable/stale: %s", describe_btc_candle_freshness(coinbase))
+    except Exception as exc:
+        log.warning("Coinbase BTC history failed; using fallback: %s", exc)
+
+    start = now - timedelta(days=days_back)
+    fallback = fetch_kraken_btc_candles(start, now)
+    fallback = normalize_btc_candles(fallback)
+    if fallback.empty or not btc_candles_are_fresh(fallback, now=now):
+        raise StaleBtcCandleData(f"fallback BTC history is stale/unusable: {describe_btc_candle_freshness(fallback)}")
+    log.warning(
+        "using Kraken BTC history fallback for %s -> %s rows=%d",
+        start.isoformat(),
+        now.isoformat(),
+        len(fallback),
+    )
+    return trim_btc_history(fallback, days_back)
 
 
 def load_btc_history_cached(days_back: int):
@@ -1848,8 +1999,7 @@ def load_btc_history_cached(days_back: int):
     if BTC_LIVE_CACHE_PATH.exists():
         try:
             cached = pd.read_parquet(BTC_LIVE_CACHE_PATH)
-            cached["time"] = pd.to_datetime(cached["time"], utc=True)
-            cached = cached.drop_duplicates("time").sort_values("time").reset_index(drop=True)
+            cached = normalize_btc_candles(cached)
             if not cached.empty:
                 first = cached["time"].iloc[0].to_pydatetime()
                 last = cached["time"].iloc[-1].to_pydatetime()
@@ -1861,6 +2011,17 @@ def load_btc_history_cached(days_back: int):
                         len(cached),
                     )
                     return trim_btc_history(cached, days_back)
+                if first <= required_start:
+                    log.info(
+                        "BTC live cache stale: %s -> %s; refreshing missing gap",
+                        first.isoformat(),
+                        last.isoformat(),
+                    )
+                    try:
+                        refreshed = refresh_btc_data_cached(cached, require_fresh=True)
+                        return trim_btc_history(refreshed, days_back)
+                    except Exception as exc:
+                        log.warning("BTC cache gap refresh failed; rebuilding: %s", exc)
                 log.info(
                     "BTC live cache stale/short: %s -> %s; rebuilding",
                     first.isoformat(),
@@ -1869,7 +2030,7 @@ def load_btc_history_cached(days_back: int):
         except Exception as exc:
             log.warning("could not read BTC live cache; rebuilding: %s", exc)
 
-    btc_1m = base_strategy.fetch_historical_minutes(days_back=days_back)
+    btc_1m = fetch_btc_history_with_fallback(days_back)
     write_btc_cache(btc_1m)
     return btc_1m
 
@@ -1910,8 +2071,32 @@ def describe_btc_candle_freshness(btc_1m) -> str:
 
 
 def refresh_btc_data_cached(btc_1m, require_fresh: bool = False):
+    now = datetime.now(timezone.utc)
     before_last = btc_last_candle_time(btc_1m)
-    refreshed = base_strategy.refresh_btc_data(btc_1m)
+    if before_last is None:
+        start = now - timedelta(minutes=BTC_CANDLE_REFRESH_LOOKBACK_MIN)
+    else:
+        start = min(now - timedelta(minutes=BTC_CANDLE_REFRESH_LOOKBACK_MIN), before_last.astimezone(timezone.utc) - timedelta(minutes=1))
+    current_min = now.replace(second=0, microsecond=0)
+    try:
+        fresh, source = fetch_btc_candles_with_fallback(start, now)
+        fresh = fresh[fresh["time"] < current_min].copy()
+        if fresh.empty:
+            refreshed = normalize_btc_candles(btc_1m)
+            log.warning("BTC candle refresh source=%s returned no completed minutes; %s", source, describe_btc_candle_freshness(refreshed))
+        else:
+            refreshed = normalize_btc_candles(pd.concat([normalize_btc_candles(btc_1m), fresh], ignore_index=True))
+            log.info(
+                "BTC candle refresh source=%s rows=%d %s",
+                source,
+                len(fresh),
+                describe_btc_candle_freshness(refreshed),
+            )
+    except Exception as exc:
+        refreshed = normalize_btc_candles(btc_1m)
+        if require_fresh:
+            raise StaleBtcCandleData(f"BTC candle refresh failed; refusing to trade: {exc}") from exc
+        log.warning("BTC candle refresh failed; keeping prior data: %s; %s", exc, describe_btc_candle_freshness(refreshed))
     after_last = btc_last_candle_time(refreshed)
     if after_last is None:
         raise StaleBtcCandleData("BTC candle refresh returned no usable candles")
