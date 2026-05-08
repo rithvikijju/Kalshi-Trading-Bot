@@ -8,7 +8,7 @@ RSA-signed handshake. Subscribes to ticker / orderbook_delta / fill channels.
 Falls back to REST polling on auth failure.
 """
 from __future__ import annotations
-import asyncio, json, threading, time, requests
+import asyncio, inspect, json, threading, time, requests
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 
@@ -18,6 +18,24 @@ import websockets
 
 from .config import CFG
 from .client import KalshiClient, parse_market_fields
+
+
+# Older websockets (≤10.x) use `extra_headers`; v13+ use `additional_headers`.
+# Detect once at import so `_ws_loop` can pass the right kwarg.
+def _ws_header_param() -> str:
+    try:
+        sig = inspect.signature(websockets.connect)
+        if "additional_headers" in sig.parameters:
+            return "additional_headers"
+        if "extra_headers" in sig.parameters:
+            return "extra_headers"
+    except (ValueError, TypeError):
+        pass
+    # Default to the modern name; the runtime error will surface if it's wrong.
+    return "additional_headers"
+
+
+_WS_HEADER_PARAM = _ws_header_param()
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -325,7 +343,7 @@ async def _ws_loop(kalshi_md: KalshiClient, kalshi_live: Optional[KalshiClient])
 
         try:
             async with websockets.connect(
-                    CFG["ws_url"], additional_headers=auth_headers) as ws:
+                    CFG["ws_url"], **{_WS_HEADER_PARAM: auth_headers}) as ws:
                 WS_STATE["connected"]       = True
                 WS_STATE["reconnect_count"] = 0
                 WS_STATE["mode"]            = "websocket"
