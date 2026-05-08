@@ -19,7 +19,7 @@ from dateutil import parser as dtparser
 
 from .config import CFG, LIVE_OR_SHADOW
 from .client import KalshiClient
-from .data import BOOKS, LOCK
+from .state import BOOKS, LOCK
 from .paper_db import _conn, settle_trade, open_trades, record_trade
 
 

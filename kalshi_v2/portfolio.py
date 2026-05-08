@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .config import CFG, PAPER_TAGS, LIVE_OR_SHADOW
-from .data import BOOKS, LOCK
+from .state import BOOKS, LOCK
 
 
 def _portfolio_view(label: str, tags, bankroll: float, account_label: str,

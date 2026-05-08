@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 
 from .config import CFG
-from .data import BOOKS, LOCK, TRACKED, causal_sigma_from_spot
+from .state import BOOKS, LOCK, TRACKED
+from .data import causal_sigma_from_spot
 from .model import fair_value, detect_market_type
 from .robust import robust_filter, build_ambiguity_set, SIZER
 from .paper_db import log_robust_decision
@@ -47,7 +48,7 @@ def scan_signals(empirical_bank: Optional[dict] = None,
     with LOCK:
         spot     = spot_override or (None)
         if spot is None:
-            from .data import SPOT
+            from .state import SPOT
             spot = SPOT.get("price")
         event    = TRACKED.get("event")
         close_t  = TRACKED.get("close_time")

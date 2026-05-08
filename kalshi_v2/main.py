@@ -9,8 +9,8 @@ from typing import Optional
 
 from .config import CFG, LIVE_OR_SHADOW
 from .client import KalshiClient
-from .data import (BOT_STATE, WS_STATE, LOCK, SPOT, BOOKS, TRACKED,
-                    spot_poller, ws_listener, event_tracker, _log,
+from .state import BOT_STATE, WS_STATE, LOCK, SPOT, BOOKS, TRACKED
+from .data import (spot_poller, ws_listener, event_tracker, _log,
                     fetch_historical_minutes, add_rv_features)
 from .strategy import scan_signals
 from .execution import (manage_open_positions, check_settlements,

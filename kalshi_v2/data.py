@@ -18,6 +18,7 @@ import websockets
 
 from .config import CFG
 from .client import KalshiClient, parse_market_fields
+from .state import LOCK, SPOT, BOOKS, TRACKED, WS_STATE, BOT_STATE
 
 
 # Older websockets (≤10.x) use `extra_headers`; v13+ use `additional_headers`.
@@ -89,38 +90,10 @@ def add_rv_features(btc_1m: pd.DataFrame) -> pd.DataFrame:
 
 
 # ════════════════════════════════════════════════════════════════════════
-#  Live data state (shared across threads)
+#  Live data state — single canonical home is `state.py`. Re-exported
+#  here for backwards compatibility with consumers that still do
+#  `from .data import BOT_STATE`. New code should import from .state.
 # ════════════════════════════════════════════════════════════════════════
-LOCK = threading.Lock()
-
-# Coinbase BTC spot (updated by spot_poller)
-SPOT = {"price": None, "ts": None, "history": []}
-
-# Kalshi orderbooks per ticker (updated by ws_listener or REST fallback)
-BOOKS: Dict[str, Dict] = {}
-
-# Currently tracked event (updated by event_tracker)
-TRACKED = {"event": None, "close_time": None, "refreshed_at": None}
-
-# WebSocket connection state
-WS_STATE = {
-    "connected":           False,
-    "subscribed_event":    None,
-    "reconnect_count":     0,
-    "last_msg_ts":         None,
-    "msg_count":           0,
-    "needs_resubscribe":   False,
-    "mode":                "websocket",   # 'websocket' or 'rest_fallback'
-}
-
-# Bot lifecycle state
-BOT_STATE = {
-    "running":  False,
-    "threads":  [],
-    "log":      [],
-    "iter":     0,
-    "trades":   0,
-}
 
 
 def _log(msg: str):
