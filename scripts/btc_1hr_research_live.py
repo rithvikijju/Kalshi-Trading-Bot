@@ -105,10 +105,9 @@ FLOAT_EPSILON = 1e-9
 KALSHI_WS_PATH = "/trade-api/ws/v2"
 KALSHI_PROD_WS_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
 KALSHI_DEMO_WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
-COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 KRAKEN_OHLC_URL = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_WS_URL = "wss://ws.kraken.com"
 BTC_SPOT_MAX_AGE_SEC = 15.0
-COINBASE_TICKER_MAX_EXCHANGE_AGE_SEC = 20.0
 BTC_CANDLE_MAX_AGE_SEC = 180.0
 BTC_CANDLE_REFRESH_LOOKBACK_MIN = 10
 BTC_CANDLE_FALLBACK_SOURCE = os.getenv("BTC_1HR_BTC_CANDLE_FALLBACK", "kraken").strip().lower()
@@ -572,10 +571,6 @@ def ns_to_utc_iso(ns: int | None) -> str | None:
     return datetime.fromtimestamp(ns / 1_000_000_000, tz=timezone.utc).isoformat()
 
 
-def dt_to_ns(dt: datetime) -> int:
-    return int(dt.astimezone(timezone.utc).timestamp() * 1_000_000_000)
-
-
 def parse_ws_levels(msg: dict, side: str) -> list[tuple[float, float]]:
     if side == "yes":
         raw = msg.get("yes_dollars_fp") or msg.get("yes_dollars") or msg.get("yes") or []
@@ -708,6 +703,9 @@ class LiveMarketState:
         with self._lock:
             self.coinbase_connected = connected
 
+    def mark_spot_feed_connected(self, connected: bool) -> None:
+        self.mark_coinbase_connected(connected)
+
     def apply_orderbook_snapshot(self, sid: int | None, seq: int | None, msg: dict, received_at_ns: int) -> BookQuote | None:
         ticker = str(msg.get("market_ticker") or "").upper()
         if not ticker:
@@ -748,7 +746,7 @@ class LiveMarketState:
                 reason = "kalshi_ws_disconnected"
             elif not self.coinbase_connected:
                 market_ok = False
-                reason = "coinbase_ws_disconnected"
+                reason = "spot_ws_disconnected"
             elif self.btc_spot_received_at_ns is None:
                 market_ok = False
                 reason = "no_btc_spot"
@@ -787,7 +785,7 @@ class LiveMarketState:
                 reason = "kalshi_ws_disconnected"
             elif not self.coinbase_connected:
                 market_ok = False
-                reason = "coinbase_ws_disconnected"
+                reason = "spot_ws_disconnected"
             elif self.btc_spot_received_at_ns is None:
                 market_ok = False
                 reason = "no_btc_spot"
@@ -1606,17 +1604,16 @@ class KalshiWsClient:
         safe_put_update(self.update_queue, {"kind": "private", "message_type": msg_type, "market_ticker": market_ticker})
 
 
-class CoinbaseWsSpot:
+class KrakenWsSpot:
     def __init__(self, state: LiveMarketState, recorder: LiveCaptureWriter, update_queue: queue.Queue) -> None:
         self.state = state
         self.recorder = recorder
         self.update_queue = update_queue
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._last_stale_log = 0.0
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._thread_main, name="coinbase-ws", daemon=True)
+        self._thread = threading.Thread(target=self._thread_main, name="kraken-ws", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -1630,7 +1627,7 @@ class CoinbaseWsSpot:
     async def _run_forever(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
-            self.state.mark_coinbase_connected(False)
+            self.state.mark_spot_feed_connected(False)
             try:
                 await self._run_connection()
                 backoff = 1.0
@@ -1638,21 +1635,21 @@ class CoinbaseWsSpot:
                 raise
             except Exception:
                 if not self._stop.is_set():
-                    log.exception("Coinbase websocket connection failed")
+                    log.exception("Kraken websocket connection failed")
                     await asyncio.sleep(backoff)
                     backoff = min(30.0, backoff * 2.0)
 
     async def _run_connection(self) -> None:
-        ws = await connect_websocket(COINBASE_WS_URL)
-        log.info("Coinbase websocket connected: %s", COINBASE_WS_URL)
-        self.state.mark_coinbase_connected(True)
+        ws = await connect_websocket(KRAKEN_WS_URL)
+        log.info("Kraken websocket connected: %s", KRAKEN_WS_URL)
+        self.state.mark_spot_feed_connected(True)
         try:
             await ws.send(
                 json.dumps(
                     {
-                        "type": "subscribe",
-                        "product_ids": ["BTC-USD"],
-                        "channels": ["ticker", "heartbeat"],
+                        "event": "subscribe",
+                        "pair": ["XBT/USD"],
+                        "subscription": {"name": "ticker"},
                     }
                 )
             )
@@ -1663,9 +1660,9 @@ class CoinbaseWsSpot:
                     continue
                 self._handle_message(raw)
         finally:
-            self.state.mark_coinbase_connected(False)
+            self.state.mark_spot_feed_connected(False)
             await ws.close()
-            log.info("Coinbase websocket disconnected")
+            log.info("Kraken websocket disconnected")
 
     def _handle_message(self, raw: str) -> None:
         received_at_ns = utc_now_ns()
@@ -1673,56 +1670,55 @@ class CoinbaseWsSpot:
             data = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if data.get("type") != "ticker" or data.get("product_id") != "BTC-USD":
+
+        if isinstance(data, dict):
+            event_type = data.get("event")
+            if event_type in {"systemStatus", "heartbeat"}:
+                return
+            if event_type == "subscriptionStatus":
+                self.recorder.record(
+                    "ws_control",
+                    {
+                        "received_at_ns": received_at_ns,
+                        "received_at_utc": ns_to_utc_iso(received_at_ns),
+                        "source": "kraken",
+                        "message_type": f"subscription_{data.get('status')}",
+                        "sid": data.get("channelID"),
+                        "seq": None,
+                        "payload_json": json.dumps(data, sort_keys=True),
+                    },
+                )
+                return
             return
-        price = optional_float(data.get("price"))
+
+        if not isinstance(data, list) or len(data) < 4 or data[-2] != "ticker" or data[-1] != "XBT/USD":
+            return
+
+        ticker = data[1] if isinstance(data[1], dict) else {}
+        best_ask = optional_float((ticker.get("a") or [None])[0])
+        best_bid = optional_float((ticker.get("b") or [None])[0])
+        last_trade = optional_float((ticker.get("c") or [None])[0])
+        if best_bid is not None and best_ask is not None and best_bid > 0 and best_ask > 0:
+            price = (best_bid + best_ask) / 2.0
+        else:
+            price = last_trade
         if price is None or price <= 0:
             return
-        exchange_dt = utc_dt(data.get("time"))
-        if exchange_dt is None:
-            log.warning("Coinbase ticker missing/unparseable exchange time; ignoring price=%s", data.get("price"))
-            return
-        exchange_age_sec = (datetime.now(timezone.utc) - exchange_dt).total_seconds()
-        if exchange_age_sec < -5.0 or exchange_age_sec > COINBASE_TICKER_MAX_EXCHANGE_AGE_SEC:
-            now = time.monotonic()
-            if now - self._last_stale_log >= 30.0:
-                log.warning(
-                    "Coinbase ticker stale; ignoring price=%.2f exchange_time=%s age=%.1fs max_age=%.1fs",
-                    price,
-                    exchange_dt.isoformat(),
-                    exchange_age_sec,
-                    COINBASE_TICKER_MAX_EXCHANGE_AGE_SEC,
-                )
-                self._last_stale_log = now
-            self.recorder.record(
-                "ws_control",
-                {
-                    "received_at_ns": received_at_ns,
-                    "received_at_utc": ns_to_utc_iso(received_at_ns),
-                    "source": "coinbase",
-                    "message_type": "stale_ticker_ignored",
-                    "sid": None,
-                    "seq": data.get("sequence"),
-                    "payload_json": json.dumps(data, sort_keys=True),
-                },
-            )
-            return
-        exchange_ns = dt_to_ns(exchange_dt)
-        self.state.set_btc_spot(price, exchange_ns)
+        self.state.set_btc_spot(price, received_at_ns)
         self.recorder.record(
             "coinbase_ticker",
             {
                 "received_at_ns": received_at_ns,
                 "received_at_utc": ns_to_utc_iso(received_at_ns),
-                "product_id": data.get("product_id"),
+                "product_id": "KRAKEN:XBT/USD",
                 "price": price,
-                "best_bid": optional_float(data.get("best_bid")),
-                "best_ask": optional_float(data.get("best_ask")),
-                "sequence": data.get("sequence"),
-                "exchange_time": data.get("time"),
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "sequence": data[0],
+                "exchange_time": None,
             },
         )
-        safe_put_update(self.update_queue, {"kind": "btc_spot", "source": "coinbase"})
+        safe_put_update(self.update_queue, {"kind": "btc_spot", "source": "kraken"})
 
 
 def order_from_response(response: dict) -> dict:
@@ -3887,19 +3883,15 @@ def run_websocket_loop(
     executor = WsResearchExecutor(args, data_client, trade_client, conn, state, recorder)
     executor.set_btc_1m(btc_1m)
     kalshi_ws: KalshiWsClient | None = None
-    coinbase_ws: CoinbaseWsSpot | None = None
+    spot_ws: KrakenWsSpot | None = None
     try:
-        try:
-            initial_spot = base_strategy.get_btc_spot()
-            log.info("initial Coinbase REST BTC spot %.2f (diagnostic only; waiting for fresh websocket ticker)", initial_spot)
-        except Exception:
-            log.exception("initial BTC spot fetch failed; waiting for Coinbase websocket")
+        log.info("waiting for fresh Kraken websocket BTC spot")
 
         market_tickers = executor.refresh_events()
         kalshi_ws = KalshiWsClient(data_client, state, recorder, update_queue, env=args.trade_env)
-        coinbase_ws = CoinbaseWsSpot(state, recorder, update_queue)
+        spot_ws = KrakenWsSpot(state, recorder, update_queue)
         kalshi_ws.start(market_tickers)
-        coinbase_ws.start()
+        spot_ws.start()
         log.info(
             "websocket mode active capture=%s raw_ws_capture=%s capture_db=%s scan_workers=%d",
             not args.no_capture,
@@ -4043,8 +4035,8 @@ def run_websocket_loop(
         record_capture_health(recorder, state, args, "shutdown")
         if kalshi_ws:
             kalshi_ws.stop()
-        if coinbase_ws:
-            coinbase_ws.stop()
+        if spot_ws:
+            spot_ws.stop()
         executor.close()
         recorder.close()
 

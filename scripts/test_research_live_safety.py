@@ -25,9 +25,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.btc_1hr_research_live import (
     BookQuote,
     CoalescedUpdateBuffer,
-    CoinbaseWsSpot,
     KalshiWsClient,
     KalshiApi,
+    KrakenWsSpot,
     LiveCaptureWriter,
     LiveMarketState,
     LiveOrderbook,
@@ -403,7 +403,7 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         )
         _, _, _, _, ok, reason = state.snapshot_scan_inputs()
         self.assertFalse(ok)
-        self.assertEqual(reason, "coinbase_ws_disconnected")
+        self.assertEqual(reason, "spot_ws_disconnected")
 
         state.mark_coinbase_connected(True)
         state.set_btc_spot(100000.0, utc_now_ns() - 20_000_000_000)
@@ -472,50 +472,46 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         self.assertIn("rv_60m", refreshed.columns)
         self.assertGreaterEqual(len(refreshed), 4)
 
-    def test_coinbase_ws_ignores_stale_exchange_ticker(self) -> None:
+    def test_kraken_ws_ignores_control_messages(self) -> None:
         state = LiveMarketState()
         updates = queue.Queue()
-        ws = CoinbaseWsSpot(state, DummyRecorder(), updates)
-        stale_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+        ws = KrakenWsSpot(state, DummyRecorder(), updates)
 
-        ws._handle_message(
-            json.dumps(
-                {
-                    "type": "ticker",
-                    "product_id": "BTC-USD",
-                    "price": "100000.00",
-                    "time": stale_time,
-                    "sequence": 1,
-                }
-            )
-        )
+        ws._handle_message(json.dumps({"event": "heartbeat"}))
 
         self.assertIsNone(state.btc_spot)
         self.assertIsNone(state.btc_spot_received_at_ns)
         with self.assertRaises(queue.Empty):
             updates.get_nowait()
 
-    def test_coinbase_ws_accepts_fresh_exchange_ticker(self) -> None:
+    def test_kraken_ws_accepts_ticker_midpoint(self) -> None:
         state = LiveMarketState()
         updates = queue.Queue()
-        ws = CoinbaseWsSpot(state, DummyRecorder(), updates)
-        fresh_time = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        recorder = DummyRecorder()
+        ws = KrakenWsSpot(state, recorder, updates)
 
         ws._handle_message(
             json.dumps(
-                {
-                    "type": "ticker",
-                    "product_id": "BTC-USD",
-                    "price": "100001.00",
-                    "time": fresh_time,
-                    "sequence": 2,
-                }
+                [
+                    12345,
+                    {
+                        "a": ["100002.00", 1, "1.0"],
+                        "b": ["100000.00", 1, "1.0"],
+                        "c": ["100001.50", "0.1"],
+                    },
+                    "ticker",
+                    "XBT/USD",
+                ]
             )
         )
 
         self.assertEqual(state.btc_spot, 100001.0)
         self.assertIsNotNone(state.btc_spot_received_at_ns)
-        self.assertEqual(updates.get_nowait()["kind"], "btc_spot")
+        update = updates.get_nowait()
+        self.assertEqual(update["kind"], "btc_spot")
+        self.assertEqual(update["source"], "kraken")
+        rows = [row for table, row in recorder.rows if table == "coinbase_ticker"]
+        self.assertEqual(rows[-1]["product_id"], "KRAKEN:XBT/USD")
 
     def test_websocket_sequence_status_rejects_stale_and_gaps(self) -> None:
         ws = KalshiWsClient(None, LiveMarketState(), DummyRecorder(), queue.Queue())
@@ -529,7 +525,7 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         updates = CoalescedUpdateBuffer(max_tickers=500)
         for idx in range(100_000):
             safe_put_update(updates, {"kind": "orderbook", "market_ticker": f"KXBTCD-26MAY0502-T{idx % 188}", "source": "delta"})
-        safe_put_update(updates, {"kind": "btc_spot", "source": "coinbase"})
+        safe_put_update(updates, {"kind": "btc_spot", "source": "kraken"})
         safe_put_update(updates, {"kind": "lifecycle", "event_ticker": "KXBTCD-26MAY0502"})
         batch = updates.get_nowait()
         self.assertEqual(batch["kind"], "batch")
