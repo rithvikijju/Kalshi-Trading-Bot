@@ -38,6 +38,17 @@ Current shadow executor:
 python scripts\btc_1hr_market_shrink_no_cautious_shadow.py
 ```
 
+Multi-strategy paper shadow:
+
+```powershell
+python scripts\btc_1hr_multi_strategy_shadow.py
+```
+
+Default strategies are `research`, `market_shrink_no_cautious`,
+`market_shrink_no_cautious_shape_adjacent`, and `js_guarded`. It uses one shared
+Kalshi/Kraken websocket stream and separate SQLite ledgers per strategy under
+`~/.btc_kalshi_bot/multi_strategy_shadow/`.
+
 Watch logs:
 
 ```powershell
@@ -74,6 +85,8 @@ Current model:
 | Live websocket capture | `~/.btc_kalshi_bot/research_live_capture.duckdb` | Best future replay source, but locked while the bot runs. Snapshot/checkpoint before analysis. |
 | Raw CSV exports | `data/kalshi-price-history-kxbtcd-*.csv` | Reference only. These are chart/export prices with assumed spread, not executable bid/ask. |
 | Backtest outputs | `backtest_outputs/` | Derived artifacts. Useful for provenance, not source data. |
+
+Live-capture replays must follow [docs/live_capture_backtest_rules.md](docs/live_capture_backtest_rules.md).
 
 Known fidelity limits:
 

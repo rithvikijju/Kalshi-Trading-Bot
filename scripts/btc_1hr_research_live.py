@@ -64,7 +64,7 @@ from scripts.risk_adjusted_research import RiskSizingConfig, choose_risk_adjuste
 
 EXECUTOR_NAME = os.getenv("BTC_1HR_EXECUTOR_NAME", "btc_1hr_research_live")
 SIGNAL_STRATEGY = os.getenv("BTC_1HR_SIGNAL_STRATEGY", "research").strip().lower() or "research"
-SUPPORTED_SIGNAL_STRATEGIES = {"research", "js_guarded", "market_shrink_no_cautious"}
+SUPPORTED_SIGNAL_STRATEGIES = {"research", "js_guarded", "market_shrink_no_cautious", "market_shrink_no_cautious_shape_adjacent"}
 SIZING_POLICY = os.getenv("BTC_1HR_SIZING_POLICY", "flat_max").strip().lower() or "flat_max"
 SUPPORTED_SIZING_POLICIES = {"flat_max", "risk_adjusted"}
 
@@ -103,6 +103,10 @@ MARKET_SHRINK_NO_CAUTIOUS_MARKET_SHRINK = 0.25
 MARKET_SHRINK_NO_CAUTIOUS_MIN_EDGE_CENTS = 8.0
 MARKET_SHRINK_NO_CAUTIOUS_MAX_NO_P = 0.20
 MARKET_SHRINK_NO_CAUTIOUS_NO_EDGE_ADD_CENTS = 3.0
+SHAPE_ADJACENT_MAX_SHAPE_VIOLATION_CENTS = 2.0
+SHAPE_ADJACENT_MIN_EVENT_VALID_MARKETS = 4
+SHAPE_ADJACENT_MAX_EVENT_MEDIAN_SPREAD_CENTS = 2.0
+SHAPE_ADJACENT_MIN_ADJACENT_GROSS_EDGE_CENTS = 4.0
 ORDERBOOK_BATCH_SIZE = 100
 ACTIVE_TRADE_STATUSES = ("paper_filled", "filled", "partial_filled", "submitted")
 FLOAT_EPSILON = 1e-9
@@ -173,6 +177,18 @@ def set_sizing_policy(policy: str) -> None:
     if policy not in SUPPORTED_SIZING_POLICIES:
         raise ValueError(f"unsupported sizing policy {policy!r}; expected one of {sorted(SUPPORTED_SIZING_POLICIES)}")
     SIZING_POLICY = policy
+
+
+def strategy_uses_market_shrink(strategy: str | None) -> bool:
+    return str(strategy or SIGNAL_STRATEGY).strip().lower() in {
+        "js_guarded",
+        "market_shrink_no_cautious",
+        "market_shrink_no_cautious_shape_adjacent",
+    }
+
+
+def strategy_requires_full_chain(strategy: str | None) -> bool:
+    return str(strategy or SIGNAL_STRATEGY).strip().lower() in {"market_shrink_no_cautious_shape_adjacent"}
 
 
 @dataclass(frozen=True)
@@ -2221,6 +2237,7 @@ def signal_from_book(
     min_edge_cents: float,
     max_spread_cents: float,
     now: datetime | None = None,
+    signal_strategy: str | None = None,
 ) -> TradeSignal | None:
     parsed = base_strategy.parse_market(market)
     ticker = str(parsed.get("ticker") or "").upper()
@@ -2234,8 +2251,8 @@ def signal_from_book(
     if not math.isfinite(p_yes):
         return None
     floor = optional_float(parsed.get("floor"))
-    signal_strategy = SIGNAL_STRATEGY
-    if signal_strategy in {"js_guarded", "market_shrink_no_cautious"}:
+    signal_strategy = str(signal_strategy or SIGNAL_STRATEGY).strip().lower()
+    if strategy_uses_market_shrink(signal_strategy):
         if floor is None or spot <= 0:
             return None
         if quote.yes_bid is None or quote.yes_ask is None:
@@ -2291,7 +2308,7 @@ def signal_from_book(
         max_spread = JS_MAX_SPREAD_CENTS
         min_entry = JS_MIN_ENTRY
         max_entry = JS_MAX_ENTRY
-    elif signal_strategy == "market_shrink_no_cautious":
+    elif signal_strategy in {"market_shrink_no_cautious", "market_shrink_no_cautious_shape_adjacent"}:
         threshold = MARKET_SHRINK_NO_CAUTIOUS_MIN_EDGE_CENTS + edge_uncertainty_cents(p_yes, emp_cache)
         if side == "no":
             threshold += MARKET_SHRINK_NO_CAUTIOUS_NO_EDGE_ADD_CENTS
@@ -3054,6 +3071,124 @@ def select_one_per_event(signals: list[TradeSignal], max_count: int) -> list[Tra
     return selected
 
 
+def shape_adjacent_context_for_event(
+    event: dict,
+    quotes: dict[str, BookQuote],
+    btc_1m,
+    emp_cache: dict,
+    spot: float,
+    signal_strategy: str,
+) -> dict[str, dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for market in event.get("markets", []):
+        ticker = str(market.get("ticker") or "").upper()
+        quote = quotes.get(ticker)
+        if quote is None:
+            continue
+        parsed = base_strategy.parse_market(market)
+        floor = optional_float(parsed.get("floor"))
+        event_ticker = str(event.get("event_ticker") or "").upper()
+        event_close = utc_dt(event.get("close_time"))
+        if floor is None or event_close is None or not market_is_research_cumulative(event_ticker, market, event_close):
+            continue
+        if quote.yes_bid is None or quote.yes_ask is None or quote.no_ask is None:
+            continue
+        yes_spread = quote.yes_spread_cents
+        if yes_spread is None or not math.isfinite(yes_spread):
+            continue
+        p_yes, _ttl_min = model_probability(event, market, btc_1m, emp_cache, spot)
+        if not math.isfinite(p_yes):
+            continue
+        market_mid = 0.5 * (quote.yes_bid + quote.yes_ask)
+        if strategy_uses_market_shrink(signal_strategy):
+            shrink = JS_MARKET_SHRINK if signal_strategy == "js_guarded" else MARKET_SHRINK_NO_CAUTIOUS_MARKET_SHRINK
+            p_yes = (1.0 - shrink) * p_yes + shrink * market_mid
+        edge_yes_cents = (p_yes - quote.yes_ask) * 100.0
+        edge_no_cents = ((1.0 - p_yes) - quote.no_ask) * 100.0
+        side = "yes" if edge_yes_cents > edge_no_cents else "no"
+        rows.append(
+            {
+                "ticker": ticker,
+                "strike": float(floor),
+                "market_mid": float(market_mid),
+                "spread_cents": float(yes_spread),
+                "side": side,
+                "candidate_edge_cents": float(edge_yes_cents if side == "yes" else edge_no_cents),
+            }
+        )
+    if not rows:
+        return {}
+
+    event_valid_markets = len(rows)
+    spreads = [row["spread_cents"] for row in rows if math.isfinite(row["spread_cents"])]
+    event_median_spread_cents = float(np.median(spreads)) if spreads else float("inf")
+    ordered = sorted(rows, key=lambda row: row["strike"])
+    by_ticker = {row["ticker"]: row for row in rows}
+    for row in rows:
+        row["event_valid_markets"] = event_valid_markets
+        row["event_median_spread_cents"] = event_median_spread_cents
+        row["shape_violation_cents"] = 0.0
+        row["adjacent_ok"] = False
+
+    for idx in range(len(ordered) - 1):
+        left = ordered[idx]
+        right = ordered[idx + 1]
+        # Cumulative "above strike" YES mids should not increase as strike rises.
+        violation = max(0.0, right["market_mid"] - left["market_mid"]) * 100.0
+        left["shape_violation_cents"] = max(float(left["shape_violation_cents"]), violation)
+        right["shape_violation_cents"] = max(float(right["shape_violation_cents"]), violation)
+    for idx, row in enumerate(ordered):
+        for neighbor_idx in (idx - 1, idx + 1):
+            if neighbor_idx < 0 or neighbor_idx >= len(ordered):
+                continue
+            neighbor = ordered[neighbor_idx]
+            if (
+                neighbor["side"] == row["side"]
+                and neighbor["candidate_edge_cents"] >= SHAPE_ADJACENT_MIN_ADJACENT_GROSS_EDGE_CENTS
+            ):
+                row["adjacent_ok"] = True
+                break
+    return by_ticker
+
+
+def apply_shape_adjacent_filter(
+    signals: list[TradeSignal],
+    events: list[dict],
+    quotes: dict[str, BookQuote],
+    btc_1m,
+    cache_by_event: dict[str, dict],
+    spot: float,
+    signal_strategy: str,
+) -> list[TradeSignal]:
+    if not signals or signal_strategy != "market_shrink_no_cautious_shape_adjacent":
+        return signals
+    contexts: dict[str, dict[str, dict[str, Any]]] = {}
+    for event in events:
+        event_ticker = str(event.get("event_ticker") or "").upper()
+        emp_cache = cache_by_event.get(event_ticker)
+        if not emp_cache:
+            continue
+        contexts[event_ticker] = shape_adjacent_context_for_event(event, quotes, btc_1m, emp_cache, spot, signal_strategy)
+
+    passed: list[TradeSignal] = []
+    for signal in signals:
+        row = contexts.get(signal.event_ticker, {}).get(signal.market_ticker)
+        if not row:
+            continue
+        if row["side"] != signal.side:
+            continue
+        if row["event_valid_markets"] < SHAPE_ADJACENT_MIN_EVENT_VALID_MARKETS:
+            continue
+        if row["event_median_spread_cents"] > SHAPE_ADJACENT_MAX_EVENT_MEDIAN_SPREAD_CENTS + FLOAT_EPSILON:
+            continue
+        if row["shape_violation_cents"] > SHAPE_ADJACENT_MAX_SHAPE_VIOLATION_CENTS + FLOAT_EPSILON:
+            continue
+        if not row["adjacent_ok"]:
+            continue
+        passed.append(signal)
+    return passed
+
+
 def find_signals(
     data_client: KalshiApi,
     btc_1m,
@@ -3157,7 +3292,9 @@ def find_signals_from_quotes(
     cache_by_event: dict[str, dict],
     spot: float,
     executor: ThreadPoolExecutor | None = None,
+    signal_strategy: str | None = None,
 ) -> list[TradeSignal]:
+    signal_strategy = str(signal_strategy or SIGNAL_STRATEGY).strip().lower()
     jobs: list[tuple[dict, dict, BookQuote, dict]] = []
     for event in events:
         emp_cache = cache_by_event.get(event["event_ticker"])
@@ -3181,6 +3318,7 @@ def find_signals_from_quotes(
             contracts=RESEARCH_SIGNAL_CONTRACTS,
             min_edge_cents=RESEARCH_MIN_EDGE_CENTS,
             max_spread_cents=RESEARCH_MAX_SPREAD_CENTS,
+            signal_strategy=signal_strategy,
         )
 
     if not jobs:
@@ -3189,7 +3327,9 @@ def find_signals_from_quotes(
         signals = list(executor.map(evaluate, jobs))
     else:
         signals = [evaluate(job) for job in jobs]
-    return sorted([signal for signal in signals if signal is not None], key=lambda s: s.net_edge_cents, reverse=True)
+    out = sorted([signal for signal in signals if signal is not None], key=lambda s: s.net_edge_cents, reverse=True)
+    out = apply_shape_adjacent_filter(out, events, quotes, btc_1m, cache_by_event, spot, signal_strategy)
+    return sorted(out, key=lambda s: s.net_edge_cents, reverse=True)
 
 
 def reprice_signal_from_state(
@@ -3200,12 +3340,15 @@ def reprice_signal_from_state(
     btc_1m,
     emp_cache: dict,
     spot: float,
+    signal_strategy: str | None = None,
 ) -> TradeSignal | None:
+    signal_strategy = str(signal_strategy or SIGNAL_STRATEGY).strip().lower()
     event = events_by_ticker.get(signal.event_ticker)
     market = markets_by_ticker.get(signal.market_ticker)
     if not event or not market:
         return None
-    _, _, quotes, _, market_ok, _ = state.snapshot_scan_inputs({signal.market_ticker})
+    snapshot_tickers = None if strategy_requires_full_chain(signal_strategy) else {signal.market_ticker}
+    _, _, quotes, _, market_ok, _ = state.snapshot_scan_inputs(snapshot_tickers)
     if not market_ok:
         return None
     quote = quotes.get(signal.market_ticker)
@@ -3221,7 +3364,11 @@ def reprice_signal_from_state(
         contracts=signal.contracts,
         min_edge_cents=RESEARCH_MIN_EDGE_CENTS,
         max_spread_cents=RESEARCH_MAX_SPREAD_CENTS,
+        signal_strategy=signal_strategy,
     )
+    if fresh and strategy_requires_full_chain(signal_strategy):
+        filtered = apply_shape_adjacent_filter([fresh], [event], quotes, btc_1m, {signal.event_ticker: emp_cache}, spot, signal_strategy)
+        fresh = filtered[0] if filtered else None
     if fresh and fresh.side == signal.side:
         return fresh
     return None
@@ -3344,7 +3491,8 @@ class WsResearchExecutor:
         if not self.exchange_is_active():
             self._record_scan(started_ns, reason, changed_tickers, [], [], 0.0, "skip", "exchange_inactive")
             return
-        events, markets_by_ticker, quotes, spot, market_ok, market_reason = self.state.snapshot_scan_inputs(changed_tickers)
+        scan_tickers = None if strategy_requires_full_chain(SIGNAL_STRATEGY) else changed_tickers
+        events, markets_by_ticker, quotes, spot, market_ok, market_reason = self.state.snapshot_scan_inputs(scan_tickers)
         if not market_ok:
             self._record_scan(started_ns, reason, changed_tickers, [], [], 0.0, "skip", market_reason)
             return
@@ -3378,6 +3526,7 @@ class WsResearchExecutor:
             self.cache_by_event,
             spot,
             executor=self.executor,
+            signal_strategy=SIGNAL_STRATEGY,
         )
         if not signals:
             now = time.monotonic()
@@ -3431,6 +3580,7 @@ class WsResearchExecutor:
                 self.btc_1m,
                 emp_cache,
                 spot,
+                signal_strategy=SIGNAL_STRATEGY,
             )
             if not fresh:
                 self._record_decision(original, "skip", "failed_ws_reprice_filter", None, None, None)

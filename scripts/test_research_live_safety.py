@@ -45,6 +45,7 @@ from scripts.btc_1hr_research_live import (
     db_active_tickers,
     db_connect,
     event_from_market_ticker,
+    find_signals_from_quotes,
     local_status_from_kalshi_order,
     market_is_research_cumulative,
     paper_shadow_summary,
@@ -267,6 +268,69 @@ class ResearchLiveSafetyTests(unittest.TestCase):
                     )
         finally:
             set_signal_strategy("research")
+
+    def test_shape_adjacent_strategy_requires_clean_chain_and_adjacent_edge(self) -> None:
+        close = datetime(2026, 5, 5, 16, 0, tzinfo=timezone.utc)
+        event_ticker = "KXBTCD-26MAY0512"
+        event = {
+            "event_ticker": event_ticker,
+            "close_time": close,
+            "ttl_hours": 0.5,
+            "markets": [
+                market(event_ticker, close, "T99800.00"),
+                market(event_ticker, close, "T99900.00"),
+                market(event_ticker, close, "T100000.00"),
+                market(event_ticker, close, "T100100.00"),
+            ],
+        }
+        quotes = {
+            f"{event_ticker}-T99800.00": BookQuote(f"{event_ticker}-T99800.00", 0.54, 10, 0.56, 10, 0.44, 10, 0.46, 10),
+            f"{event_ticker}-T99900.00": BookQuote(f"{event_ticker}-T99900.00", 0.48, 10, 0.50, 10, 0.50, 10, 0.52, 10),
+            f"{event_ticker}-T100000.00": BookQuote(f"{event_ticker}-T100000.00", 0.42, 10, 0.44, 10, 0.56, 10, 0.58, 10),
+            f"{event_ticker}-T100100.00": BookQuote(f"{event_ticker}-T100100.00", 0.34, 10, 0.36, 10, 0.64, 10, 0.66, 10),
+        }
+
+        def model_prob(_event, mkt, *_args, **_kwargs):
+            ticker = str(mkt["ticker"])
+            if "T99800" in ticker:
+                return 0.88, 30.0
+            if "T99900" in ticker:
+                return 0.84, 30.0
+            if "T100000" in ticker:
+                return 0.80, 30.0
+            return 0.72, 30.0
+
+        with patch("scripts.btc_1hr_research_live.edge_uncertainty_cents", return_value=0.0):
+            with patch("scripts.btc_1hr_research_live.model_probability", side_effect=model_prob):
+                signals = find_signals_from_quotes(
+                    None,
+                    [event],
+                    quotes,
+                    {event_ticker: {30.0: [1.0] * 500}},
+                    100000.0,
+                    signal_strategy="market_shrink_no_cautious_shape_adjacent",
+                )
+        self.assertTrue(signals)
+        self.assertTrue(all(sig.market_ticker in quotes for sig in signals))
+        self.assertIn(f"{event_ticker}-T100000.00", {sig.market_ticker for sig in signals})
+
+        broken_quotes = dict(quotes)
+        broken_quotes[f"{event_ticker}-T100100.00"] = BookQuote(
+            f"{event_ticker}-T100100.00", 0.52, 10, 0.54, 10, 0.46, 10, 0.48, 10
+        )
+        with patch("scripts.btc_1hr_research_live.edge_uncertainty_cents", return_value=0.0):
+            with patch("scripts.btc_1hr_research_live.model_probability", side_effect=model_prob):
+                broken = find_signals_from_quotes(
+                    None,
+                    [event],
+                    broken_quotes,
+                    {event_ticker: {30.0: [1.0] * 500}},
+                    100000.0,
+                    signal_strategy="market_shrink_no_cautious_shape_adjacent",
+                )
+        broken_tickers = {sig.market_ticker for sig in broken}
+        self.assertNotIn(f"{event_ticker}-T100000.00", broken_tickers)
+        self.assertNotIn(f"{event_ticker}-T100100.00", broken_tickers)
 
     def test_shadow_portfolio_reports_realized_pnl_and_active_exposure(self) -> None:
         close = datetime(2026, 5, 5, 6, 0, tzinfo=timezone.utc)
