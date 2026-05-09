@@ -242,6 +242,32 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         finally:
             set_signal_strategy("research")
 
+    def test_market_shrink_no_cautious_signal_uses_backtested_filters(self) -> None:
+        close = datetime(2026, 5, 5, 16, 0, tzinfo=timezone.utc)
+        event = {"event_ticker": "KXBTCD-26MAY0512", "close_time": close, "ttl_hours": 0.5}
+        mkt = market("KXBTCD-26MAY0512", close, "T100000.00")
+        quote = BookQuote(mkt["ticker"], 0.35, 10, 0.37, 10, 0.63, 10, 0.65, 10)
+        try:
+            set_signal_strategy("market_shrink_no_cautious")
+            with patch("scripts.btc_1hr_research_live.edge_uncertainty_cents", return_value=0.0):
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.10, 30.0)):
+                    sig = signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0)
+                    self.assertIsNotNone(sig)
+                    self.assertEqual(sig.side, "no")
+                    self.assertAlmostEqual(sig.model_p_yes, 0.165, places=6)
+                    self.assertAlmostEqual(sig.edge_threshold_cents, 11.0, places=6)
+
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.17, 30.0)):
+                    self.assertIsNone(signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0))
+
+                thin_edge_quote = BookQuote(mkt["ticker"], 0.265, 10, 0.285, 10, 0.715, 10, 0.735, 10)
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.10, 30.0)):
+                    self.assertIsNone(
+                        signal_from_book(event, mkt, thin_edge_quote, None, {}, 100000.0, 1, 12.0, 2.0)
+                    )
+        finally:
+            set_signal_strategy("research")
+
     def test_shadow_portfolio_reports_realized_pnl_and_active_exposure(self) -> None:
         close = datetime(2026, 5, 5, 6, 0, tzinfo=timezone.utc)
         conn = db_connect(":memory:")

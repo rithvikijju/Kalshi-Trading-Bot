@@ -65,6 +65,9 @@ MAX_NO_P = 0.35
 @dataclass(frozen=True)
 class Variant:
     name: str
+    emp_weight: float = 0.70
+    lognormal_weight: float = 0.30
+    brti_dampening: float = BRTI_DAMPENING
     market_shrink: float = 0.0
     basis_sigma_usd: float = 0.0
     max_basis_shrink: float = 0.0
@@ -76,14 +79,45 @@ class Variant:
     no_momentum_guard_usd: float = 0.0
     no_momentum_guard_distance_usd: float = 999999.0
     no_momentum_guard_distance_sigma: float = 999.0
+    min_edge_cents: float = MIN_EDGE_CENTS
+    yes_edge_add_cents: float = 0.0
+    no_edge_add_cents: float = 0.0
+    max_spread_cents: float = MAX_SPREAD_CENTS
     min_entry: float = MIN_ENTRY
     max_entry: float = MAX_ENTRY
+    min_yes_p: float = MIN_YES_P
+    max_no_p: float = MAX_NO_P
+    allow_yes: bool = True
+    allow_no: bool = True
+    min_ttl_min: float = MIN_TTL_MIN
+    max_ttl_min: float = MAX_TTL_MIN
+    exclude_utc_hours: tuple[int, ...] = ()
+    entry_edge_add_over_65_cents: float = 0.0
+    entry_edge_add_over_70_cents: float = 0.0
+    max_shape_violation_cents: float = 999.0
+    min_event_valid_markets: int = 0
+    max_event_median_spread_cents: float = 999.0
+    adjacent_min_gross_edge_cents: float = -999.0
 
 
 VARIANTS: list[Variant] = [
     Variant("baseline_current"),
     Variant("market_shrink_25", market_shrink=0.25),
     Variant("market_shrink_50", market_shrink=0.50),
+    Variant("market_shrink_25_edge8", market_shrink=0.25, min_edge_cents=8.0),
+    Variant("market_shrink_25_edge10", market_shrink=0.25, min_edge_cents=10.0),
+    Variant("edge18", min_edge_cents=18.0),
+    Variant("no_cautious", max_no_p=0.20, no_edge_add_cents=4.0),
+    Variant("no_very_cautious", max_no_p=0.15, no_edge_add_cents=6.0),
+    Variant("yes_only", allow_no=False),
+    Variant("no_only_cautious", allow_yes=False, max_no_p=0.20, no_edge_add_cents=4.0),
+    Variant("blend_emp_only", emp_weight=1.0, lognormal_weight=0.0),
+    Variant("blend_balanced_50_50", emp_weight=0.50, lognormal_weight=0.50),
+    Variant("blend_lognormal_heavy", emp_weight=0.30, lognormal_weight=0.70),
+    Variant("brti_dampen_60", brti_dampening=0.60),
+    Variant("brti_no_dampen", brti_dampening=1.0),
+    Variant("buffer_100usd", min_abs_distance_usd=100.0, min_distance_sigma=0.50),
+    Variant("buffer_150usd", min_abs_distance_usd=150.0, min_distance_sigma=0.70),
     Variant("basis_shrink_75", basis_sigma_usd=75.0, max_basis_shrink=0.45),
     Variant("vol_dist_075", min_distance_sigma=0.75, min_abs_distance_usd=50.0),
     Variant(
@@ -97,6 +131,30 @@ VARIANTS: list[Variant] = [
         no_momentum_guard_usd=125.0,
         no_momentum_guard_distance_usd=225.0,
         no_momentum_guard_distance_sigma=1.20,
+    ),
+    Variant(
+        "live_loss_guard",
+        max_no_p=0.20,
+        no_edge_add_cents=4.0,
+        min_abs_distance_usd=75.0,
+        no_momentum_guard_usd=75.0,
+        no_momentum_guard_distance_usd=250.0,
+        no_momentum_guard_distance_sigma=1.35,
+    ),
+    Variant(
+        "market_shrink_no_cautious",
+        market_shrink=0.25,
+        min_edge_cents=8.0,
+        max_no_p=0.20,
+        no_edge_add_cents=3.0,
+    ),
+    Variant(
+        "js_time_guard",
+        market_shrink=0.25,
+        min_edge_cents=8.0,
+        min_entry=0.55,
+        max_entry=0.80,
+        exclude_utc_hours=tuple(range(17, 24)),
     ),
     Variant(
         "may8_guarded",
@@ -128,7 +186,134 @@ VARIANTS: list[Variant] = [
         no_momentum_guard_distance_sigma=1.50,
         min_entry=0.50,
     ),
+    Variant(
+        "jump_guard_moderate",
+        market_shrink=0.25,
+        min_edge_cents=10.0,
+        momentum_guard_usd=100.0,
+        momentum_guard_distance_usd=275.0,
+        momentum_guard_distance_sigma=1.35,
+        max_entry=0.65,
+    ),
+    Variant(
+        "jump_guard_strict",
+        market_shrink=0.35,
+        min_edge_cents=12.0,
+        momentum_guard_usd=75.0,
+        momentum_guard_distance_usd=325.0,
+        momentum_guard_distance_sigma=1.60,
+        max_entry=0.60,
+        min_distance_sigma=0.50,
+    ),
+    Variant(
+        "no_dump_chase_strict",
+        market_shrink=0.25,
+        min_edge_cents=10.0,
+        max_no_p=0.18,
+        no_edge_add_cents=8.0,
+        no_momentum_guard_usd=75.0,
+        no_momentum_guard_distance_usd=325.0,
+        no_momentum_guard_distance_sigma=1.60,
+        max_entry=0.60,
+    ),
+    Variant(
+        "yes_pump_chase_strict",
+        market_shrink=0.35,
+        min_edge_cents=14.0,
+        yes_edge_add_cents=4.0,
+        momentum_guard_usd=75.0,
+        momentum_guard_distance_usd=300.0,
+        momentum_guard_distance_sigma=1.50,
+        allow_no=False,
+        max_entry=0.60,
+    ),
+    Variant(
+        "strict_low_entry_core",
+        market_shrink=0.35,
+        min_edge_cents=18.0,
+        max_entry=0.60,
+        max_no_p=0.18,
+        no_edge_add_cents=8.0,
+        min_distance_sigma=0.60,
+        max_spread_cents=1.0,
+    ),
+    Variant(
+        "basis_jump_guard",
+        market_shrink=0.25,
+        basis_sigma_usd=100.0,
+        max_basis_shrink=0.50,
+        min_edge_cents=12.0,
+        momentum_guard_usd=100.0,
+        momentum_guard_distance_usd=275.0,
+        momentum_guard_distance_sigma=1.35,
+        no_momentum_guard_usd=75.0,
+        no_momentum_guard_distance_usd=325.0,
+        no_momentum_guard_distance_sigma=1.60,
+        max_entry=0.65,
+    ),
+    Variant(
+        "late_hour_reversal_guard",
+        market_shrink=0.35,
+        min_edge_cents=12.0,
+        min_ttl_min=12.0,
+        max_ttl_min=50.0,
+        momentum_guard_usd=75.0,
+        momentum_guard_distance_usd=300.0,
+        momentum_guard_distance_sigma=1.50,
+        max_entry=0.65,
+    ),
+    Variant(
+        "market_shrink_no_cautious_lowrisk",
+        market_shrink=0.50,
+        min_edge_cents=18.0,
+        max_entry=0.60,
+        max_no_p=0.18,
+        no_edge_add_cents=8.0,
+        min_distance_sigma=0.50,
+        max_spread_cents=1.0,
+    ),
+    Variant(
+        "lowrisk_high_entry_surcharge",
+        market_shrink=0.25,
+        min_edge_cents=8.0,
+        max_no_p=0.20,
+        no_edge_add_cents=3.0,
+        entry_edge_add_over_65_cents=4.0,
+        entry_edge_add_over_70_cents=4.0,
+    ),
+    Variant(
+        "lowrisk_no_extra",
+        market_shrink=0.25,
+        min_edge_cents=8.0,
+        max_no_p=0.18,
+        no_edge_add_cents=8.0,
+    ),
+    Variant(
+        "market_shrink_no_cautious_shape_loose",
+        market_shrink=0.25,
+        min_edge_cents=8.0,
+        max_no_p=0.20,
+        no_edge_add_cents=3.0,
+        max_shape_violation_cents=2.0,
+        min_event_valid_markets=4,
+        max_event_median_spread_cents=2.0,
+    ),
+    Variant(
+        "market_shrink_no_cautious_shape_adjacent",
+        market_shrink=0.25,
+        min_edge_cents=8.0,
+        max_no_p=0.20,
+        no_edge_add_cents=3.0,
+        max_shape_violation_cents=2.0,
+        min_event_valid_markets=4,
+        max_event_median_spread_cents=2.0,
+        adjacent_min_gross_edge_cents=4.0,
+    ),
 ]
+
+GLOBAL_MIN_ENTRY = min(v.min_entry for v in VARIANTS)
+GLOBAL_MAX_ENTRY = max(v.max_entry for v in VARIANTS)
+GLOBAL_MAX_SPREAD_CENTS = max(v.max_spread_cents for v in VARIANTS)
 
 
 @dataclass
@@ -158,6 +343,16 @@ def split_name(close_time: pd.Timestamp, source: str) -> str:
     if close_time < VAL_END:
         return "validation"
     return "test"
+
+
+def select_variants(names: list[str] | None) -> list[Variant]:
+    if not names:
+        return VARIANTS
+    lookup = {v.name: v for v in VARIANTS}
+    missing = [name for name in names if name not in lookup]
+    if missing:
+        raise ValueError(f"unknown variants: {missing}; available={sorted(lookup)}")
+    return [lookup[name] for name in names]
 
 
 def parse_market_strike(ticker: str) -> float | None:
@@ -210,8 +405,19 @@ def load_duckdb_quotes(
             con.close()
             return pd.DataFrame(), pd.DataFrame(), {"source": "historical_duckdb", "db": str(db_path)}
 
-    where = ["m.is_hourly_kxbtcd", "m.is_cumulative"]
-    params: list[Any] = []
+    where = [
+        "m.is_hourly_kxbtcd",
+        "m.is_cumulative",
+        "q.spread_cents <= ?",
+        "(q.yes_ask_exe BETWEEN ? AND ? OR q.no_ask_exe BETWEEN ? AND ?)",
+    ]
+    params: list[Any] = [
+        GLOBAL_MAX_SPREAD_CENTS,
+        GLOBAL_MIN_ENTRY,
+        GLOBAL_MAX_ENTRY,
+        GLOBAL_MIN_ENTRY,
+        GLOBAL_MAX_ENTRY,
+    ]
     if start is not None:
         where.append("m.close_time >= ?")
         params.append(start.to_pydatetime())
@@ -356,23 +562,38 @@ def base_candidates(quotes: pd.DataFrame, btc: pd.DataFrame, emp_cache: dict, sc
         return pd.DataFrame()
     q = quotes.loc[valid].copy()
     strikes = q["floor_strike"].to_numpy(dtype=float)
-    model_p = vectorized_p_above(strikes, spot, ttl_min, emp_cache, current_vol, BRTI_DAMPENING)
+    emp_p = vectorized_p_above(strikes, spot, ttl_min, emp_cache, current_vol, BRTI_DAMPENING)
     normal_p = lognormal_p_above(strikes, spot, ttl_min, current_vol)
-    model_p = np.where(np.isfinite(normal_p), 0.70 * model_p + 0.30 * normal_p, model_p)
-    finite = np.isfinite(model_p)
+    model_p = np.where(np.isfinite(normal_p), 0.70 * emp_p + 0.30 * normal_p, emp_p)
+    finite = np.isfinite(model_p) | np.isfinite(emp_p) | np.isfinite(normal_p)
     if not finite.any():
         return pd.DataFrame()
     q = q.iloc[np.where(finite)[0]].copy()
     model_p = model_p[finite]
+    emp_p = emp_p[finite]
+    normal_p = normal_p[finite]
     expected_move = float("nan")
     if current_vol is not None and np.isfinite(current_vol) and current_vol > 0:
         expected_move = float(spot * current_vol * math.sqrt(ttl_min / MINUTES_PER_YEAR))
     q["raw_model_p_yes"] = model_p
+    q["emp_p_default"] = emp_p
+    q["lognormal_p_yes"] = normal_p
     q["entry_spot"] = spot
     q["ttl_min"] = ttl_min
     q["current_vol"] = current_vol if current_vol is not None else np.nan
     q["expected_move_usd"] = expected_move
     q["market_mid"] = 0.5 * (q["yes_bid_close"].astype(float) + q["yes_ask_close"].astype(float))
+    q["event_valid_markets"] = int(len(q))
+    q["event_median_spread_cents"] = float(q["spread_cents"].median())
+    shape = q[["floor_strike", "market_mid"]].copy().sort_values("floor_strike")
+    mids = shape["market_mid"].to_numpy(dtype=float)
+    violation = np.zeros(len(shape), dtype=float)
+    if len(shape) >= 2:
+        # Cumulative above/below YES prices should be non-increasing as strike rises.
+        pair_violation = np.maximum(0.0, mids[1:] - mids[:-1]) * 100.0
+        violation[:-1] = np.maximum(violation[:-1], pair_violation)
+        violation[1:] = np.maximum(violation[1:], pair_violation)
+    q["shape_violation_cents"] = pd.Series(violation, index=shape.index).reindex(q.index).to_numpy(dtype=float)
     q["ret_5m"] = lookback_ret(btc, idx, 5)
     q["ret_10m"] = lookback_ret(btc, idx, 10)
     q["ret_30m"] = lookback_ret(btc, idx, 30)
@@ -384,9 +605,31 @@ def signals_for_variant(candidates: pd.DataFrame, variant: Variant, emp_cache: d
     if candidates.empty:
         return candidates
     q = candidates.copy()
-    p = q["raw_model_p_yes"].to_numpy(dtype=float)
     strikes = q["floor_strike"].to_numpy(dtype=float)
     spot = q["entry_spot"].to_numpy(dtype=float)
+    spot0 = float(q["entry_spot"].iloc[0])
+    ttl0 = float(q["ttl_min"].iloc[0])
+    current_vol0 = float(q["current_vol"].iloc[0]) if np.isfinite(float(q["current_vol"].iloc[0])) else None
+    if abs(float(variant.brti_dampening) - float(BRTI_DAMPENING)) < 1e-12:
+        p_emp = q["emp_p_default"].to_numpy(dtype=float)
+    else:
+        p_emp = vectorized_p_above(
+            strikes,
+            spot0,
+            ttl0,
+            emp_cache,
+            current_vol0,
+            variant.brti_dampening,
+        )
+    p_log = q["lognormal_p_yes"].to_numpy(dtype=float)
+    total_weight = max(1e-9, float(variant.emp_weight) + float(variant.lognormal_weight))
+    p = np.full(len(q), np.nan, dtype=float)
+    both = np.isfinite(p_emp) & np.isfinite(p_log)
+    p[both] = (variant.emp_weight * p_emp[both] + variant.lognormal_weight * p_log[both]) / total_weight
+    only_emp = np.isfinite(p_emp) & ~np.isfinite(p)
+    p[only_emp] = p_emp[only_emp]
+    only_log = np.isfinite(p_log) & ~np.isfinite(p)
+    p[only_log] = p_log[only_log]
     if variant.basis_sigma_usd > 0 and variant.max_basis_shrink > 0:
         dist_abs = np.abs(spot - strikes)
         shrink = variant.basis_sigma_usd / (dist_abs + variant.basis_sigma_usd)
@@ -406,8 +649,13 @@ def signals_for_variant(candidates: pd.DataFrame, variant: Variant, emp_cache: d
     gross_edge = np.where(choose_yes, edge_yes, edge_no) * 100.0
     fees = np.asarray([kalshi_fee_dollars(float(price), contracts=1, liquidity="taker") for price in entry])
     net_edge = gross_edge - fees * 100.0
-    threshold = MIN_EDGE_CENTS + edge_uncertainty_cents(p, emp_cache)
-    strong = np.where(side == "yes", p >= MIN_YES_P, p <= MAX_NO_P)
+    threshold = variant.min_edge_cents + edge_uncertainty_cents(p, emp_cache)
+    threshold = threshold + np.where(side == "yes", variant.yes_edge_add_cents, variant.no_edge_add_cents)
+    if variant.entry_edge_add_over_65_cents > 0:
+        threshold = threshold + np.where(entry > 0.65 + 1e-12, variant.entry_edge_add_over_65_cents, 0.0)
+    if variant.entry_edge_add_over_70_cents > 0:
+        threshold = threshold + np.where(entry > 0.70 + 1e-12, variant.entry_edge_add_over_70_cents, 0.0)
+    strong = np.where(side == "yes", p >= variant.min_yes_p, p <= variant.max_no_p)
 
     signed_dist = np.where(side == "yes", spot - strikes, strikes - spot)
     side_p = np.where(side == "yes", p, 1.0 - p)
@@ -428,10 +676,39 @@ def signals_for_variant(candidates: pd.DataFrame, variant: Variant, emp_cache: d
     passed = (
         strong
         & (net_edge >= threshold)
-        & (q["spread_cents"].to_numpy(dtype=float) <= MAX_SPREAD_CENTS)
+        & (q["spread_cents"].to_numpy(dtype=float) <= variant.max_spread_cents)
         & (entry >= variant.min_entry)
         & (entry <= variant.max_entry)
+        & (q["ttl_min"].to_numpy(dtype=float) >= variant.min_ttl_min)
+        & (q["ttl_min"].to_numpy(dtype=float) <= variant.max_ttl_min)
     )
+    if variant.max_shape_violation_cents < 999:
+        passed &= q["shape_violation_cents"].to_numpy(dtype=float) <= variant.max_shape_violation_cents + 1e-12
+    if variant.min_event_valid_markets > 0:
+        passed &= q["event_valid_markets"].to_numpy(dtype=float) >= float(variant.min_event_valid_markets)
+    if variant.max_event_median_spread_cents < 999:
+        passed &= q["event_median_spread_cents"].to_numpy(dtype=float) <= variant.max_event_median_spread_cents + 1e-12
+    if variant.adjacent_min_gross_edge_cents > -999:
+        order = np.argsort(strikes)
+        adjacent_ok = np.zeros(len(q), dtype=bool)
+        candidate_edge = np.where(side == "yes", edge_yes, edge_no) * 100.0
+        for pos, idx in enumerate(order):
+            left = order[pos - 1] if pos > 0 else None
+            right = order[pos + 1] if pos + 1 < len(order) else None
+            ok = False
+            if left is not None:
+                ok = ok or (side[left] == side[idx] and candidate_edge[left] >= variant.adjacent_min_gross_edge_cents)
+            if right is not None:
+                ok = ok or (side[right] == side[idx] and candidate_edge[right] >= variant.adjacent_min_gross_edge_cents)
+            adjacent_ok[idx] = ok
+        passed &= adjacent_ok
+    if not variant.allow_yes:
+        passed &= side != "yes"
+    if not variant.allow_no:
+        passed &= side != "no"
+    if variant.exclude_utc_hours:
+        hours = q["scan_time"].dt.hour.to_numpy(dtype=int)
+        passed &= ~np.isin(hours, np.asarray(variant.exclude_utc_hours, dtype=int))
     if variant.min_abs_distance_usd > 0:
         passed &= signed_dist >= variant.min_abs_distance_usd
     if variant.min_distance_sigma > 0:
@@ -523,6 +800,7 @@ def run_replay(
     btc: pd.DataFrame,
     train_days: int,
     progress_every_events: int,
+    variants: list[Variant],
     official_cache: dict[str, tuple[str | None, float | None]] | None = None,
 ) -> pd.DataFrame:
     if quotes.empty:
@@ -530,7 +808,7 @@ def run_replay(
     CFG.update(RESEARCH_CFG)
     quotes = quotes.sort_values(["event_ticker", "available_at", "market_ticker"]).reset_index(drop=True)
     states: dict[str, tuple[dict[str, Position], set[str], list[dict[str, Any]]]] = {
-        v.name: ({}, set(), []) for v in VARIANTS
+        v.name: ({}, set(), []) for v in variants
     }
     event_cache: dict[str, dict] = {}
     events = list(quotes.groupby("event_ticker", sort=True))
@@ -551,7 +829,7 @@ def run_replay(
             candidates = base_candidates(scan_quotes, btc, emp_cache, scan_ts)
             if candidates.empty:
                 continue
-            for variant in VARIANTS:
+            for variant in variants:
                 open_positions, open_events, settled = states[variant.name]
                 if event_ticker in open_events:
                     continue
@@ -709,6 +987,14 @@ def load_csv_quotes(
     for col in ("available_at", "ts_end", "open_time", "close_time", "event_open_time"):
         if col in quotes.columns:
             quotes[col] = utc_series(quotes[col])
+    if not quotes.empty:
+        quotes = quotes[
+            (quotes["spread_cents"].astype(float) <= GLOBAL_MAX_SPREAD_CENTS)
+            & (
+                quotes["yes_ask_exe"].astype(float).between(GLOBAL_MIN_ENTRY, GLOBAL_MAX_ENTRY)
+                | quotes["no_ask_exe"].astype(float).between(GLOBAL_MIN_ENTRY, GLOBAL_MAX_ENTRY)
+            )
+        ].copy()
     return quotes, btc, {
         "source": "csv_exports",
         "events": int(len(events)),
@@ -853,11 +1139,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-db", type=Path, default=DEFAULT_CAPTURE_DB)
     parser.add_argument("--btc-cache", type=Path, default=DEFAULT_BTC_CACHE)
     parser.add_argument("--fetch-official-results", action="store_true")
+    parser.add_argument("--variant", action="append", help="Run only this variant name; repeat for multiple variants.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    variants = select_variants(args.variant)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     start = ts_arg(args.start)
     end = ts_arg(args.end)
@@ -869,7 +1157,7 @@ def main() -> int:
         quotes, btc, report = load_duckdb_quotes(args.db, start, end, args.max_events)
         reports.append(report)
         if not quotes.empty:
-            trades = run_replay("historical_duckdb", quotes, btc, args.train_days, args.progress_every_events)
+            trades = run_replay("historical_duckdb", quotes, btc, args.train_days, args.progress_every_events, variants)
             all_trades.append(trades)
 
     if args.include_csv:
@@ -884,7 +1172,7 @@ def main() -> int:
         )
         reports.append(report)
         if not quotes.empty:
-            trades = run_replay("csv_exports", quotes, btc, args.train_days, args.progress_every_events)
+            trades = run_replay("csv_exports", quotes, btc, args.train_days, args.progress_every_events, variants)
             all_trades.append(trades)
 
     if args.include_live_capture:
@@ -892,7 +1180,7 @@ def main() -> int:
         quotes, btc, report, official = load_capture_quotes(args.capture_db, args.btc_cache, args.output_dir, args.fetch_official_results)
         reports.append(report)
         if not quotes.empty:
-            trades = run_replay("live_capture", quotes, btc, args.train_days, args.progress_every_events, official)
+            trades = run_replay("live_capture", quotes, btc, args.train_days, args.progress_every_events, variants, official)
             all_trades.append(trades)
 
     nonempty_trades = [df for df in all_trades if not df.empty]
@@ -904,13 +1192,13 @@ def main() -> int:
     variants_path = args.output_dir / "may8examine_variants.json"
     combined.to_csv(trades_path, index=False)
     summary.to_csv(summary_path, index=False)
-    variants_path.write_text(json.dumps([asdict(v) for v in VARIANTS], indent=2), encoding="utf-8")
+    variants_path.write_text(json.dumps([asdict(v) for v in variants], indent=2), encoding="utf-8")
     final_report = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "start": str(start),
         "end": str(end),
         "train_days": args.train_days,
-        "variants": [asdict(v) for v in VARIANTS],
+        "variants": [asdict(v) for v in variants],
         "data_reports": reports,
         "trades_path": str(trades_path),
         "summary_path": str(summary_path),

@@ -64,7 +64,7 @@ from scripts.risk_adjusted_research import RiskSizingConfig, choose_risk_adjuste
 
 EXECUTOR_NAME = os.getenv("BTC_1HR_EXECUTOR_NAME", "btc_1hr_research_live")
 SIGNAL_STRATEGY = os.getenv("BTC_1HR_SIGNAL_STRATEGY", "research").strip().lower() or "research"
-SUPPORTED_SIGNAL_STRATEGIES = {"research", "js_guarded"}
+SUPPORTED_SIGNAL_STRATEGIES = {"research", "js_guarded", "market_shrink_no_cautious"}
 SIZING_POLICY = os.getenv("BTC_1HR_SIZING_POLICY", "flat_max").strip().lower() or "flat_max"
 SUPPORTED_SIZING_POLICIES = {"flat_max", "risk_adjusted"}
 
@@ -99,6 +99,10 @@ JS_MIN_ENTRY = 0.55
 JS_MAX_ENTRY = 0.80
 JS_GUARDED_MAX_ABS_MONEYNESS_BPS = 60.0
 JS_GUARDED_EXCLUDED_UTC_HOURS = set(range(17, 24))
+MARKET_SHRINK_NO_CAUTIOUS_MARKET_SHRINK = 0.25
+MARKET_SHRINK_NO_CAUTIOUS_MIN_EDGE_CENTS = 8.0
+MARKET_SHRINK_NO_CAUTIOUS_MAX_NO_P = 0.20
+MARKET_SHRINK_NO_CAUTIOUS_NO_EDGE_ADD_CENTS = 3.0
 ORDERBOOK_BATCH_SIZE = 100
 ACTIVE_TRADE_STATUSES = ("paper_filled", "filled", "partial_filled", "submitted")
 FLOAT_EPSILON = 1e-9
@@ -2231,19 +2235,21 @@ def signal_from_book(
         return None
     floor = optional_float(parsed.get("floor"))
     signal_strategy = SIGNAL_STRATEGY
-    if signal_strategy == "js_guarded":
+    if signal_strategy in {"js_guarded", "market_shrink_no_cautious"}:
         if floor is None or spot <= 0:
-            return None
-        now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        if now_utc.hour in JS_GUARDED_EXCLUDED_UTC_HOURS:
-            return None
-        moneyness_bps = 10000.0 * (spot - floor) / max(1.0, spot)
-        if abs(moneyness_bps) > JS_GUARDED_MAX_ABS_MONEYNESS_BPS:
             return None
         if quote.yes_bid is None or quote.yes_ask is None:
             return None
+        if signal_strategy == "js_guarded":
+            now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            if now_utc.hour in JS_GUARDED_EXCLUDED_UTC_HOURS:
+                return None
+            moneyness_bps = 10000.0 * (spot - floor) / max(1.0, spot)
+            if abs(moneyness_bps) > JS_GUARDED_MAX_ABS_MONEYNESS_BPS:
+                return None
         market_mid = 0.5 * (quote.yes_bid + quote.yes_ask)
-        p_yes = (1.0 - JS_MARKET_SHRINK) * p_yes + JS_MARKET_SHRINK * market_mid
+        shrink = JS_MARKET_SHRINK if signal_strategy == "js_guarded" else MARKET_SHRINK_NO_CAUTIOUS_MARKET_SHRINK
+        p_yes = (1.0 - shrink) * p_yes + shrink * market_mid
 
     candidates = []
     if quote.yes_ask is not None and quote.yes_spread_cents is not None:
@@ -2285,6 +2291,16 @@ def signal_from_book(
         max_spread = JS_MAX_SPREAD_CENTS
         min_entry = JS_MIN_ENTRY
         max_entry = JS_MAX_ENTRY
+    elif signal_strategy == "market_shrink_no_cautious":
+        threshold = MARKET_SHRINK_NO_CAUTIOUS_MIN_EDGE_CENTS + edge_uncertainty_cents(p_yes, emp_cache)
+        if side == "no":
+            threshold += MARKET_SHRINK_NO_CAUTIOUS_NO_EDGE_ADD_CENTS
+        strong_prob = (side == "yes" and p_yes >= RESEARCH_MIN_YES_P) or (
+            side == "no" and p_yes <= MARKET_SHRINK_NO_CAUTIOUS_MAX_NO_P
+        )
+        max_spread = max_spread_cents
+        min_entry = RESEARCH_MIN_ENTRY
+        max_entry = RESEARCH_MAX_ENTRY
     else:
         threshold = min_edge_cents + edge_uncertainty_cents(p_yes, emp_cache)
         strong_prob = (side == "yes" and p_yes >= RESEARCH_MIN_YES_P) or (
