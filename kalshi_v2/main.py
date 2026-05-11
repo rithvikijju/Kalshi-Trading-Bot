@@ -11,12 +11,13 @@ from .config import CFG, LIVE_OR_SHADOW
 from .client import KalshiClient
 from .state import BOT_STATE, WS_STATE, LOCK, SPOT, BOOKS, TRACKED
 from .data import (spot_poller, ws_listener, event_tracker, _log,
-                    fetch_historical_minutes, add_rv_features)
+                    fetch_historical_minutes, add_rv_features,
+                    fmt_local, fmt_local_full)
 from .strategy import scan_signals
 from .execution import (manage_open_positions, check_settlements,
                           place_smart_limit)
 from .risk import (risk_preflight, size_for_mode, set_live_balance,
-                    get_live_balance, RISK_BLOCKS)
+                    get_live_balance, effective_risk_limits, RISK_BLOCKS)
 from .robust import build_ambiguity_set, SIZER
 from .paper_db import record_trade
 from .portfolio import paper_portfolio_metrics, live_portfolio_metrics
@@ -89,12 +90,27 @@ def _execute_signals(signals):
         side   = sig["side"]
         entry  = float(sig["entry_price"])
 
-        # Lipschitz-smoothed sizing. Key per-mode so paper / shadow / live
-        # don't share clamp history — paper at $100k bankroll vs live at a
-        # few hundred dollars produces wildly different reference sizes,
-        # and mixing them defeats the smoothness guarantee.
-        raw_size  = size_for_mode(entry)
+        # Win probability for Kelly sizing:
+        #   YES side → win_prob = model_p_yes
+        #   NO  side → win_prob = 1 - model_p_yes  (since NO wins when YES loses)
+        model_p_yes = float(sig["model_p_yes"])
+        win_prob    = model_p_yes if side == "yes" else (1.0 - model_p_yes)
+
+        # Half-Kelly sizing, then Lipschitz-clamp against recent same-mode
+        # entries so adjacent-price signals don't whipsaw size up and down.
+        raw_size  = size_for_mode(entry, win_prob=win_prob)
         contracts = SIZER.size(f"v2_{mode}", raw_size, entry)
+
+        # The Lipschitz clamp can round size UPWARD past the dollar cap
+        # (e.g. previous trade at similar price was 40 contracts, so the
+        # clamp pulls a 39-contract decision to 40 → $0.34 over the
+        # max_per_trade cap → risk_preflight rejects). Re-clamp here so
+        # the smoothness guarantee never breaks the dollar limit.
+        if mode in ("live", "live_shadow"):
+            cap_dollars   = effective_risk_limits()["max_per_trade"]
+            max_contracts = int(cap_dollars / max(0.01, entry))
+            if contracts > max_contracts:
+                contracts = max(1, max_contracts)
 
         allow, reasons = risk_preflight(ticker, side, contracts, entry, "v2")
         if not allow:
@@ -220,7 +236,7 @@ def stop_bot():
 
 def status(last_n_log_lines: int = 12):
     print("=" * 72)
-    print(f"  V2 BOT STATUS @ {datetime.now(timezone.utc).isoformat()}")
+    print(f"  V2 BOT STATUS @ {fmt_local_full()}")
     print("=" * 72)
     print(f"  mode:          {CFG.get('mode')}")
     print(f"  live_enabled:  {CFG.get('live_enabled')}")
@@ -237,7 +253,8 @@ def status(last_n_log_lines: int = 12):
     print(f"    connected:     {WS_STATE.get('connected')}")
     print(f"    subscribed:    {WS_STATE.get('subscribed_event')}")
     print(f"    msgs received: {WS_STATE.get('msg_count')}")
-    print(f"    last msg:      {WS_STATE.get('last_msg_ts')}")
+    last_msg = WS_STATE.get('last_msg_ts')
+    print(f"    last msg:      {fmt_local(last_msg) if last_msg else None}")
     print(f"\n  Tracked event:  {TRACKED.get('event')}")
     print(f"  Books in mem:   {len(BOOKS)}")
     print(f"\n  Empirical bank: {_EMPIRICAL_BANK['n'] if _EMPIRICAL_BANK else 'not built'}")
@@ -328,7 +345,7 @@ def dashboard():
     import pandas as pd
 
     print("=" * 78)
-    print(f"  V2 DASHBOARD @ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  V2 DASHBOARD @ {fmt_local_full()}")
     print("=" * 78)
 
     # ─────── A. Connectivity ───────
@@ -354,7 +371,7 @@ def dashboard():
     print(f"   causal sigma:   {sigma:.4f}" if sigma else "   causal sigma:   (need 15+ ticks)")
     print(f"   event:          {event}")
     if ct:
-        print(f"   closes:         {ct.strftime('%H:%M UTC')}  (ttl {ttl_min:+.1f} min)")
+        print(f"   closes:         {fmt_local(ct)}  (ttl {ttl_min:+.1f} min)")
     print(f"   books in mem:   {len(BOOKS)}")
     if BOOKS:
         sample = sorted(BOOKS.items())[:3]
@@ -452,7 +469,7 @@ def dashboard():
         else:
             for _, r in rd.iterrows():
                 pf = "✓" if r["passed"] else "✗"
-                print(f"   {pf} {r['ts'][11:19]} {r['ticker']:32s} {r['side']:>3s}  "
+                print(f"   {pf} {fmt_local(r['ts'])} {r['ticker']:32s} {r['side']:>3s}  "
                       f"entry=${r['entry_price']:.3f}  pass_rate={r['pass_rate']:.2f}  "
                       f"edge=[{r['min_edge_c']:+.1f}, {r['max_edge_c']:+.1f}]")
     except Exception as e:
@@ -464,7 +481,7 @@ def dashboard():
         print("   none")
     else:
         for rb in RISK_BLOCKS[-10:]:
-            print(f"   {rb['ts'][11:19]} {rb['ticker']:32s} {rb['side']:>3s}  "
+            print(f"   {fmt_local(rb['ts'])} {rb['ticker']:32s} {rb['side']:>3s}  "
                   f"→ {'; '.join(rb['reasons'])}")
 
     # ─────── F. Trades ───────

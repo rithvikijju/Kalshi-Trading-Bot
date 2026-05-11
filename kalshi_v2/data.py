@@ -96,8 +96,48 @@ def add_rv_features(btc_1m: pd.DataFrame) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════════════
 
 
+def fmt_local(ts) -> str:
+    """Format a UTC datetime or ISO-8601 string in the local timezone.
+    Used for display only — stored timestamps stay UTC.
+
+    Accepts:
+      - datetime (tz-aware or naive; naive is treated as UTC)
+      - ISO-8601 string with or without `+00:00` suffix
+      - None → empty string
+    Returns 'HH:MM:SS TZ' (e.g. '21:42:17 CDT').
+    """
+    if ts is None or ts == "":
+        return ""
+    if isinstance(ts, str):
+        try:
+            from dateutil import parser as dtparser
+            dt = dtparser.isoparse(ts)
+        except Exception:
+            return ts
+    else:
+        dt = ts
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().strftime("%H:%M:%S %Z")
+
+
+def fmt_local_full(ts=None) -> str:
+    """Full date+time in local tz, e.g. '2026-05-11 21:42:17 CDT'."""
+    if ts is None:
+        ts = datetime.now(timezone.utc)
+    if isinstance(ts, str):
+        try:
+            from dateutil import parser as dtparser
+            ts = dtparser.isoparse(ts)
+        except Exception:
+            return ts
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 def _log(msg: str):
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    ts = fmt_local(datetime.now(timezone.utc))
     BOT_STATE["log"].append(f"[{ts}] {msg}")
     if len(BOT_STATE["log"]) > 500:
         BOT_STATE["log"] = BOT_STATE["log"][-200:]

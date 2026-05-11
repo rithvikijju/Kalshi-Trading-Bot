@@ -34,21 +34,43 @@ def place_smart_limit(kalshi_live: KalshiClient, kalshi_md: KalshiClient,
                        expiration_sec: int = None) -> dict:
     """Place an aggressive limit order via kalshi_live.
 
-    Workflow:
-      1. Fetch current orderbook via kalshi_md (read-only, cheaper)
-      2. Set price = current_ask + buffer (for buys) / current_bid - buffer (sells)
-      3. Send limit with expiration_ts = now + 30 s
-      4. Raise on 4xx with full Kalshi response body
+    Quote resolution order (fastest → freshest fallback):
+      1. In-memory BOOKS (WS-driven, sub-second). Skipped if stale > 5s.
+      2. kalshi_md.get_market(ticker) parsed via parse_market_fields
+         (handles BOTH legacy 'yes_bid'/'yes_ask' cent ints AND the
+         2026 'yes_bid_dollars'/'yes_ask_dollars' string fields that
+         the single-market endpoint returns).
+      3. Raise with full Kalshi response body on 4xx.
+
+    Then price = current_ask + buffer (for buys) / current_bid - buffer (sells),
+    with expiration_ts = now + 30s.
     """
+    from .client import parse_market_fields
     if kalshi_live is None:
         raise RuntimeError("kalshi_live not initialized")
     expiration_sec = expiration_sec or CFG["order_expiration_sec"]
 
-    m = kalshi_md.get_market(ticker).get("market", {})
-    yb = m.get("yes_bid"); ya = m.get("yes_ask")
+    # 1. Try in-memory WS state (freshest).
+    yb = ya = None
+    with LOCK:
+        b = BOOKS.get(ticker)
+    if b and b.get("ts"):
+        age = (datetime.now(timezone.utc) - b["ts"]).total_seconds()
+        if age < 5 and b.get("yes_bid") is not None and b.get("yes_ask") is not None:
+            yb, ya = float(b["yes_bid"]), float(b["yes_ask"])
+
+    # 2. Fall back to REST single-market lookup, parsed for both field formats.
+    if yb is None or ya is None:
+        try:
+            m  = kalshi_md.get_market(ticker).get("market", {})
+            pf = parse_market_fields(m)
+            yb = pf.get("yes_bid"); ya = pf.get("yes_ask")
+        except Exception as e:
+            raise RuntimeError(f"REST market fetch failed for {ticker}: {e}")
+
     if yb is None or ya is None:
         raise RuntimeError(f"no live quotes on {ticker}")
-    yb, ya = float(yb)/100, float(ya)/100
+    yb, ya = float(yb), float(ya)
 
     buffer = CFG["order_buffer_cents"] / 100
     if action == "buy":
@@ -89,15 +111,17 @@ def _market_quote(kalshi_md: KalshiClient, ticker: str) -> Optional[dict]:
                 "close_time": (dtparser.isoparse(b["close_time"])
                                 if isinstance(b.get("close_time"), str) else b.get("close_time")),
             }
-    # Fallback: REST fetch
+    # Fallback: REST fetch, parsed via parse_market_fields so it handles
+    # both legacy 'yes_bid' int-cents AND 2026 'yes_bid_dollars' strings.
     try:
-        m = kalshi_md.get_market(ticker).get("market", {})
-        yb = m.get("yes_bid"); ya = m.get("yes_ask")
+        from .client import parse_market_fields
+        m  = kalshi_md.get_market(ticker).get("market", {})
+        pf = parse_market_fields(m)
+        yb, ya = pf.get("yes_bid"), pf.get("yes_ask")
         if yb is None or ya is None: return None
-        yb, ya = float(yb)/100, float(ya)/100
-        ct = dtparser.isoparse(m["close_time"]) if m.get("close_time") else None
+        ct = dtparser.isoparse(pf["close_time"]) if pf.get("close_time") else None
         return {"yes_bid": yb, "yes_ask": ya, "mid": (yb+ya)/2,
-                "status": (m.get("status") or "").lower(), "close_time": ct}
+                "status": (pf.get("status") or "").lower(), "close_time": ct}
     except Exception:
         return None
 

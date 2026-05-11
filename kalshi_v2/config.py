@@ -23,6 +23,10 @@ CFG = {
     "max_concurrent_signals": 1,        # top-1 by edge per scan
     "max_per_market":    0.02,          # paper: 2% of bankroll per market
     "arb_max_dollars_per_trade": 1000,
+    "kelly_multiplier":  0.5,           # 0.5 = half-Kelly (recommended).
+                                        # 1.0 = full Kelly (max growth, max
+                                        # variance). 0.25 = quarter-Kelly
+                                        # (safer for noisy edge estimates).
     # ──── Position management ──────────────────────────────────
     "stop_loss_pct":     0.20,
     "take_profit_cents": 5.0,

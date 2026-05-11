@@ -34,12 +34,21 @@ def get_live_balance() -> Optional[float]:
 
 # ── Effective risk limits scaled to live balance
 def effective_risk_limits() -> Dict[str, float]:
+    """Resolve risk caps against live balance.
+
+    Floor logic: RISK_FLOOR values are absolute-dollar safeguards meant for
+    larger accounts. For a tiny balance (e.g. $7), a $5 floor on max_per_trade
+    forces 71% of bankroll into a single position. We cap each floor at 30%
+    of bankroll so it can never exceed a sane fraction of the account.
+    """
     bal = get_live_balance() or CFG.get("bankroll", 100_000.0)
     def clamp(name, has_ceiling=True):
         amt = bal * RISK_PCT[name]
         if has_ceiling:
             amt = min(amt, RISK_CEIL[name])
-        amt = max(amt, RISK_FLOOR[name])
+        # Floor never exceeds 30% of balance (small-account safe)
+        floor = min(RISK_FLOOR[name], bal * 0.30)
+        amt = max(amt, floor)
         return amt
     return {
         "balance":              bal,
@@ -65,15 +74,58 @@ def active_bankroll() -> float:
     return CFG.get("bankroll", 100_000.0)
 
 
-def size_for_mode(entry_price: float, kelly_fraction: Optional[float] = None) -> int:
-    mode = CFG.get("mode", "paper")
+def kelly_fraction(entry_price: float, win_prob: float) -> float:
+    """Full Kelly fraction for a Kalshi binary contract.
+
+    Pay `entry_price` per contract, settle at 1 (win) or 0 (lose).
+    Win amount = 1 - entry_price; loss amount = entry_price.
+
+        f* = (win_prob - entry_price) / (1 - entry_price)
+
+    Returns 0 when there's no edge (win_prob ≤ entry_price).
+    """
+    if win_prob <= entry_price or entry_price >= 1.0:
+        return 0.0
+    return max(0.0, (win_prob - entry_price) / (1.0 - entry_price))
+
+
+def size_for_mode(entry_price: float,
+                    win_prob: Optional[float] = None) -> int:
+    """Compute contracts to buy.
+
+    With `win_prob` provided, sizes via fractional Kelly:
+        contracts = floor( bankroll · k_mult · f_kelly / entry_price )
+    where k_mult = CFG['kelly_multiplier'] (default 0.5 = half-Kelly).
+
+    The result is also clipped by the hard dollar cap from the mode-specific
+    risk limits, so Kelly can recommend small but never exceed
+    `max_per_trade` (live/shadow) or `bankroll · max_per_market` (paper).
+
+    Falls back to the flat dollar cap when `win_prob` is None (legacy).
+    """
+    mode     = CFG.get("mode", "paper")
+    bankroll = active_bankroll()
+
+    # Hard dollar cap (mode-aware)
     if mode in ("live", "live_shadow"):
-        cap = effective_risk_limits()["max_per_trade"]
+        cap_dollars = effective_risk_limits()["max_per_trade"]
     else:
-        cap = CFG.get("bankroll", 100_000.0) * CFG.get("max_per_market", 0.02)
-    if kelly_fraction is not None and kelly_fraction > 0:
-        cap = min(cap, cap * max(kelly_fraction, 0.05))
-    return max(1, int(cap / max(0.01, float(entry_price))))
+        cap_dollars = bankroll * CFG.get("max_per_market", 0.02)
+
+    # Kelly-derived dollar target
+    if win_prob is not None:
+        k_mult     = float(CFG.get("kelly_multiplier", 0.5))
+        f_kelly    = kelly_fraction(entry_price, float(win_prob))
+        f_used     = k_mult * f_kelly
+        kelly_dols = bankroll * f_used
+        dollars    = min(kelly_dols, cap_dollars)
+    else:
+        dollars = cap_dollars
+
+    if dollars <= 0 or entry_price <= 0:
+        return 0
+    contracts = int(dollars / max(0.01, float(entry_price)))
+    return max(1, contracts) if contracts > 0 else 0
 
 
 # ── DB-side counters scoped to live/shadow only
