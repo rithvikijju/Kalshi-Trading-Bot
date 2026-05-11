@@ -106,7 +106,7 @@ def build_ambiguity_set(btc_1m, horizon_min: int, n_bootstrap: int = 16,
 # ════════════════════════════════════════════════════════════════════════
 def robust_filter(signal: dict, ambiguity_set: List[dict],
                     spot: float, fee_per_contract: float,
-                    min_pass_rate: float = .85,
+                    min_pass_rate: float = 1.0,
                     min_mean_edge_c: float = 1.0) -> Tuple[bool, dict]:
     """Test whether a signal has positive expected edge across all P in P.
 
