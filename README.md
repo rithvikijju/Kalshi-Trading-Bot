@@ -1,6 +1,97 @@
 # Kalshi-Trading-Bot
 
-Two strategies sit alongside the original Kalshi notebooks:
+Multiple strategies live in this repo. The active one is `kalshi_v2/`;
+the rest are earlier research iterations (GNN arb, GA-DMLP, Neufeld static
+arb) kept for reference.
+
+## 0. `kalshi_v2/` — BTC fair-value mispricing engine (live)
+
+The current production model. Trades Kalshi BTC binary markets (KXBTC
+hourly buckets, KXBTCD daily cumulatives) by:
+
+1. Computing a fair P(YES) for each strike from a drift-removed,
+   vol-conditioned empirical sample bank built on 90 days of Coinbase
+   BTC minute history.
+2. Comparing P(YES) to the live order book and computing post-fee edge
+   on both YES and NO sides.
+3. Running every candidate signal through a **HRDNN P-robust filter**
+   (`robust.py`) that re-evaluates the edge under 16 bootstrapped
+   probability measures; trades only when ≥85% of measures agree.
+4. Sizing via a **Lipschitz-clamped Kelly** (`robust.LipschitzSizer`) so
+   small price differences don't produce wildly different position sizes.
+5. Sending a 30-second-expiration limit order at `current_ask + 2c`,
+   with an SL/TP/time/age exit policy on every cycle.
+
+### Architecture
+
+| Module | Role |
+|---|---|
+| `state.py` | Single source of truth for shared mutable state (LOCK, SPOT, BOOKS, TRACKED, WS_STATE, BOT_STATE). Edit-free; immune to autoreload identity drift. |
+| `config.py` | All knobs (mode, thresholds, sizing, WS URL, robust-filter params). One CFG dict, no hidden globals. |
+| `client.py` | Bare Kalshi REST + WebSocket auth (RSA-PSS over SHA256). No wrappers. |
+| `data.py` | Coinbase BTC poller, async WS listener (with REST fallback on 401/403), event tracker. Uses gnn-arb-live's WS subscription pattern. |
+| `model.py` | Empirical sample bank (drift-removed, vol+kurt matched) + lognormal closed-form fallback. Single `fair_value()` dispatcher. |
+| `robust.py` | HRDNN P-robust filter (moving-block bootstrap of log returns → 16 fair-value measures → unanimity-style decision rule) + LipschitzSizer. |
+| `sfm.py` | SFM cell (Equations 7–19 of Zhang/Aggarwal/Qi KDD 2017). Implemented but disabled by default — base model has no recurrent encoder; available behind `CFG['sfm_enabled']`. See `RESEARCH_MEMO.md`. |
+| `paper_db.py` | SQLite trades / robust-decisions / spot-tick / book-tick log. Idempotent schema. |
+| `risk.py` | Mode-aware preflight: hard ticker dedup (always), plus balance / exposure / concurrent / daily-loss / entry-band gates in live mode. |
+| `execution.py` | Smart-limit order placement, position-management exit policy, settlement booking from Kalshi's `result` field. |
+| `strategy.py` | The signal scanner. Walks BOOKS, computes edge per strike, runs robust filter, returns sorted DataFrame. |
+| `portfolio.py` | Per-mode (paper / live / shadow) portfolio views with mark-to-market. |
+| `main.py` | Lifecycle: `start_bot`, `stop_bot`, `status`, `dashboard`, `tail_log`, `enable_live`, `disable_live`, `kill_switch`. Spins 4 daemon threads. |
+
+### How to run
+
+`kalshi-bot-v2.ipynb` is the thin notebook driver. Cells:
+
+| § | Purpose |
+|---|---|
+| 1 | Imports + autoreload |
+| 2 | Build `kalshi_md` + `kalshi_live` clients (RSA key from `~/.kalshi/credentials.env`) |
+| 3 | Display CFG |
+| 4 | Fetch 90 d BTC minute bars from Coinbase |
+| 5 | Preview the empirical bank |
+| 6 | Preview the ambiguity set (verifies bootstrap actually varies measures) |
+| 7 | `start_bot()` — spawns spot poller, WS listener, event tracker, decision worker |
+| 8 | `status()` — quick snapshot, run any time |
+| 8b | `dashboard()` — full live diagnostic: connectivity, tracking, per-market edge breakdown with rejection reasons, robust filter outcomes, risk blocks, trades, log |
+| 8c | `tail_log()` — raw log lines |
+| 9 | Manual `scan_signals()` diagnostic |
+| 10–14 | Open positions, robust decisions, portfolio, settled trades, risk blocks |
+| 13b | **Full trade log** (entries + robust decisions + settlements with PnL/win-rate) |
+| 15 | Controls (stop / kill / enable_live / cancel_all) |
+
+Modes are paper / `live_shadow` / `live`. Default is paper. `enable_live()`
+refuses if Kalshi balance is `$0` or unknown.
+
+### Key tunables (`config.py`)
+
+| Knob | Default | What it does |
+|---|---|---|
+| `min_edge_cents` | 2.5 | reject signals with post-fee edge below this |
+| `max_spread_cents` | 3 | reject markets with bid-ask spread above this |
+| `min_entry_price` / `max_entry_price` | 0.20 / 0.80 | reject extreme entries |
+| `robust_min_pass_rate` | 1.0 | fraction of ambiguity-set measures that must show positive edge (0.85 = 14/16) |
+| `robust_n_bootstrap` | 16 | size of the ambiguity set |
+| `stop_loss_pct` | 0.20 | exit if mid drops 20% from entry |
+| `take_profit_cents` | 5.0 | exit when mid moves +5c |
+| `time_exit_min_ttl_m` | 3 | flat the position when ≤3 min to expiry |
+| `max_position_age_min` | 90 | hard close after 90 min held |
+| `lipschitz_position_L` | 200 | max Δsize per cent of entry-price change |
+
+### Research memo
+
+`kalshi_v2/RESEARCH_MEMO.md` documents which components of the SFM
+(Zhang/Aggarwal/Qi KDD 2017) and HRDNN (Yadav/Mohanty arXiv 2025) papers
+were integrated, which were rejected, and why.
+
+### Data leakage review
+
+`DATA_LEAKAGE_REVIEW.md` (on `claude/review-data-leakage-d7aG4`) audits
+the v2 pipeline. Live operation is clean; the only flagged risks were
+backtest-related (since deferred).
+
+---
 
 ## 1. `gnn_arbitrage/` — GNN triangular arbitrage strategy + backtester + paper trader
 
