@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from scripts import btc_1hr_research_live as live_mod
 from scripts.btc_1hr_research_live import (
     BookQuote,
     CoalescedUpdateBuffer,
@@ -182,6 +183,20 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         quote = BookQuote("x", 0.40, 1, 0.42, 1, 0.58, 1, 0.60, 1)
         self.assertIsNone(signal_from_book(event, bucket, quote, None, {}, 100000.0, 1, 12.0, 2.0))
 
+    def test_event_reprice_cooldown_marks_and_expires(self) -> None:
+        with patch.object(live_mod, "REPRICE_EVENT_COOLDOWN_SEC", 300.0):
+            live_mod._REPRICE_EVENT_COOLDOWN_UNTIL.clear()
+            live_mod.mark_event_reprice_cooldown("KXBTCD-26MAY1021", now=100.0)
+            self.assertIn(
+                "remaining=300.0s",
+                live_mod.event_reprice_cooldown_detail("KXBTCD-26MAY1021", now=100.0) or "",
+            )
+            self.assertIn(
+                "remaining=1.0s",
+                live_mod.event_reprice_cooldown_detail("kxbtcd-26may1021", now=399.0) or "",
+            )
+            self.assertIsNone(live_mod.event_reprice_cooldown_detail("KXBTCD-26MAY1021", now=401.0))
+
     def test_orderbook_uses_real_yes_and_no_books(self) -> None:
         q = quote_from_orderbook("T", {"orderbook": {"yes": [[62, 10]], "no": [[35, 7]]}})
         self.assertEqual((round(q.yes_bid, 4), round(q.yes_ask, 4), round(q.no_bid, 4), round(q.no_ask, 4)), (0.62, 0.65, 0.35, 0.38))
@@ -266,6 +281,26 @@ class ResearchLiveSafetyTests(unittest.TestCase):
                     self.assertIsNone(
                         signal_from_book(event, mkt, thin_edge_quote, None, {}, 100000.0, 1, 12.0, 2.0)
                     )
+        finally:
+            set_signal_strategy("research")
+
+    def test_research_no_side_loss_guard_blocks_low_confidence_no(self) -> None:
+        close = datetime(2026, 5, 5, 16, 0, tzinfo=timezone.utc)
+        event = {"event_ticker": "KXBTCD-26MAY0512", "close_time": close, "ttl_hours": 0.25}
+        mkt = market("KXBTCD-26MAY0512", close, "T100000.00")
+        quote = BookQuote(mkt["ticker"], 0.49, 10, 0.51, 10, 0.49, 10, 0.50, 10)
+        try:
+            set_signal_strategy("research")
+            with patch("scripts.btc_1hr_research_live.RESEARCH_MIN_NO_SIDE_PROB", 0.72):
+                with patch("scripts.btc_1hr_research_live.edge_uncertainty_cents", return_value=0.0):
+                    with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.30, 15.0)):
+                        blocked = signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0)
+                    with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.28, 15.0)):
+                        allowed = signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0)
+            self.assertIsNone(blocked)
+            self.assertIsNotNone(allowed)
+            self.assertEqual(allowed.side, "no")
+            self.assertAlmostEqual(1.0 - allowed.model_p_yes, 0.72, places=6)
         finally:
             set_signal_strategy("research")
 

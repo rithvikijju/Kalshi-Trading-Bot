@@ -15,14 +15,20 @@ paper_trades.jsonl
 # Generated research/backtest artifacts
 logs/
 backtest_outputs/
+.codex_work/
+*.duckdb
+*.parquet
 data/*.db
 data/*.parquet
 data/kalshi_history.db
+data/live_capture_gapless/
+data/crypto_research_btc15m_mcts_20260512/
+data/crypto_research_datamart/
+data/**/*.duckdb
+data/**/*.parquet
 
-# Full local datamart is too large for regular GitHub pushes.
-# Keep only the compact replay DB and its report in git.
+# Full local datamarts are too large for regular GitHub pushes.
 data/research_datamart/*
-!data/research_datamart/research_backtest.duckdb
 !data/research_datamart/datamart_report.json
 data/research_datamart_test/
 data/research_datamart_bidask_smoke/

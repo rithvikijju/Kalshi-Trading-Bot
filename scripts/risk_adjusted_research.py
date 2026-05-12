@@ -8,7 +8,7 @@ contracts a passed signal is allowed to buy.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pandas as pd
@@ -27,6 +27,16 @@ class RiskSizingConfig:
     medium_entry_cap: float = 0.55
     high_entry_cap: float = 0.65
     no_side_contract_cap: int = 3
+    scale_min_edge_cents: float | None = None
+    scale_side: str | None = None
+    base_max_contracts: int | None = None
+    base_medium_entry_cap: float | None = None
+    base_high_entry_cap: float | None = None
+    base_no_side_contract_cap: int | None = None
+    no_side_near_distance_usd: float | None = None
+    no_side_near_distance_contract_cap: int | None = None
+    no_side_low_prob_threshold: float | None = None
+    no_side_low_prob_contract_cap: int | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +101,26 @@ def kelly_risk_fraction(p_side: float, cost_per_contract: float) -> float:
     return max(0.0, (p_side - cost_per_contract) / (1.0 - cost_per_contract))
 
 
+def effective_risk_config(config: RiskSizingConfig, side: str, net_edge_cents: float | None = None) -> RiskSizingConfig:
+    """Apply edge/side gating for scale-up configs while preserving current base sizing."""
+    if config.scale_min_edge_cents is None and not config.scale_side:
+        return config
+
+    edge = _finite_float(net_edge_cents, 0.0)
+    passes_edge = config.scale_min_edge_cents is None or edge >= float(config.scale_min_edge_cents)
+    passes_side = not config.scale_side or str(side).lower() == str(config.scale_side).lower()
+    if passes_edge and passes_side:
+        return config
+
+    return replace(
+        config,
+        max_contracts=config.base_max_contracts if config.base_max_contracts is not None else min(config.max_contracts, 3),
+        medium_entry_cap=config.base_medium_entry_cap if config.base_medium_entry_cap is not None else 0.55,
+        high_entry_cap=config.base_high_entry_cap if config.base_high_entry_cap is not None else 0.65,
+        no_side_contract_cap=config.base_no_side_contract_cap if config.base_no_side_contract_cap is not None else 3,
+    )
+
+
 def choose_risk_adjusted_contracts(
     *,
     entry_price: float,
@@ -102,16 +132,37 @@ def choose_risk_adjusted_contracts(
     config: RiskSizingConfig,
     available_qty: float | None = None,
     liquidity: str = "taker",
+    net_edge_cents: float | None = None,
+    side_distance_usd: float | None = None,
 ) -> SizingDecision:
+    config = effective_risk_config(config, side, net_edge_cents)
     entry_price = min(1.0, max(0.0, _finite_float(entry_price, 0.0)))
     bankroll = max(0.0, _finite_float(bankroll, 0.0))
     available_cash = max(0.0, _finite_float(available_cash, 0.0))
     active_exposure = max(0.0, _finite_float(active_exposure, 0.0))
+    side_name = str(side).lower()
+    p_side = side_probability(model_p_yes, side_name)
     max_contracts = max(0, int(config.max_contracts))
     if available_qty is not None and math.isfinite(float(available_qty)):
         max_contracts = min(max_contracts, max(0, int(math.floor(float(available_qty)))))
-    if str(side).lower() == "no":
+    conditional_no_cap_applied = False
+    if side_name == "no":
         max_contracts = min(max_contracts, max(0, int(config.no_side_contract_cap)))
+        if config.no_side_low_prob_threshold is not None and p_side < float(config.no_side_low_prob_threshold):
+            cap = max(0, int(config.no_side_low_prob_contract_cap or 0))
+            if cap < max_contracts:
+                conditional_no_cap_applied = True
+            max_contracts = min(max_contracts, cap)
+        distance = _finite_float(side_distance_usd, float("nan"))
+        if (
+            config.no_side_near_distance_usd is not None
+            and math.isfinite(distance)
+            and distance < float(config.no_side_near_distance_usd)
+        ):
+            cap = max(0, int(config.no_side_near_distance_contract_cap or 0))
+            if cap < max_contracts:
+                conditional_no_cap_applied = True
+            max_contracts = min(max_contracts, cap)
     price_cap = price_band_contract_cap(entry_price, config)
     max_contracts = min(max_contracts, price_cap)
     if max_contracts <= 0:
@@ -119,7 +170,6 @@ def choose_risk_adjusted_contracts(
 
     one_cost, one_fee = cost_for_contracts(entry_price, 1, liquidity=liquidity)
     cost_per_contract = one_cost
-    p_side = side_probability(model_p_yes, side)
     p_conservative = conservative_probability(p_side, cost_per_contract, config.edge_confidence)
     full_kelly = kelly_risk_fraction(p_conservative, cost_per_contract)
     applied_kelly = min(1.0, max(0.0, config.kelly_fraction)) * full_kelly
@@ -150,6 +200,8 @@ def choose_risk_adjusted_contracts(
         reason = "budget"
     elif chosen < max_contracts:
         reason = "risk_budget_cap"
+    elif conditional_no_cap_applied:
+        reason = "conditional_no_cap"
     elif chosen == price_cap and price_cap < config.max_contracts:
         reason = "price_band_cap"
     return SizingDecision(

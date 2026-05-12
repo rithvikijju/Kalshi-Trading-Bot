@@ -102,6 +102,7 @@ class Variant:
 
 VARIANTS: list[Variant] = [
     Variant("baseline_current"),
+    Variant("baseline_late_only", min_ttl_min=5.0, max_ttl_min=20.0),
     Variant("market_shrink_25", market_shrink=0.25),
     Variant("market_shrink_50", market_shrink=0.50),
     Variant("market_shrink_25_edge8", market_shrink=0.25, min_edge_cents=8.0),

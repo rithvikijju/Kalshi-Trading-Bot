@@ -91,6 +91,10 @@ RESEARCH_MIN_ENTRY = 0.25
 RESEARCH_MAX_ENTRY = 0.75
 RESEARCH_MIN_YES_P = 0.65
 RESEARCH_MAX_NO_P = 0.35
+_RESEARCH_MIN_NO_SIDE_PROB_ENV = os.getenv("BTC_1HR_MIN_NO_SIDE_PROB", "").strip()
+RESEARCH_MIN_NO_SIDE_PROB = (
+    float(_RESEARCH_MIN_NO_SIDE_PROB_ENV) if _RESEARCH_MIN_NO_SIDE_PROB_ENV else None
+)
 BRTI_DAMPENING = 0.80
 JS_MARKET_SHRINK = 0.25
 JS_MIN_EDGE_CENTS = 8.0
@@ -140,7 +144,12 @@ RESEARCH_TRAIN_DAYS = 7
 RESEARCH_BOOTSTRAP_BTC_DAYS = RESEARCH_TRAIN_DAYS + 2
 RESEARCH_SIGNAL_CONTRACTS = 1
 RESEARCH_MAX_CONTRACTS_PER_TRADE = int(os.getenv("BTC_1HR_MAX_CONTRACTS_PER_TRADE", "3"))
-RESEARCH_MAX_TTL_MIN = 65.0
+RESEARCH_MIN_TTL_MIN = float(os.getenv("BTC_1HR_MIN_TTL_MIN", str(CFG["min_ttl_min"])))
+RESEARCH_MAX_TTL_MIN = float(os.getenv("BTC_1HR_MAX_TTL_MIN", "65.0"))
+_REPRICE_EVENT_COOLDOWN_ENV = os.getenv("BTC_1HR_REPRICE_EVENT_COOLDOWN_SEC", "").strip()
+REPRICE_EVENT_COOLDOWN_SEC = float(_REPRICE_EVENT_COOLDOWN_ENV) if _REPRICE_EVENT_COOLDOWN_ENV else 0.0
+_REPRICE_EVENT_COOLDOWN_UNTIL: dict[str, float] = {}
+_REPRICE_EVENT_COOLDOWN_LOCK = threading.Lock()
 RESEARCH_EVENT_CLOSE_TOLERANCE_SEC = 120
 RESEARCH_SCAN_INTERVAL_SEC = 60
 RESEARCH_MAX_SIGNALS_PER_CYCLE = 1
@@ -151,6 +160,23 @@ RISK_ADJUSTED_EDGE_CONFIDENCE = float(os.getenv("BTC_1HR_RISK_EDGE_CONFIDENCE", 
 RISK_ADJUSTED_MEDIUM_ENTRY_CAP = float(os.getenv("BTC_1HR_RISK_MEDIUM_ENTRY_CAP", "0.55"))
 RISK_ADJUSTED_HIGH_ENTRY_CAP = float(os.getenv("BTC_1HR_RISK_HIGH_ENTRY_CAP", "0.65"))
 RISK_ADJUSTED_NO_SIDE_CONTRACT_CAP = int(os.getenv("BTC_1HR_RISK_NO_SIDE_CONTRACT_CAP", "3"))
+_RISK_SCALE_MIN_EDGE_ENV = os.getenv("BTC_1HR_RISK_SCALE_MIN_EDGE_CENTS", "").strip()
+RISK_ADJUSTED_SCALE_MIN_EDGE_CENTS = float(_RISK_SCALE_MIN_EDGE_ENV) if _RISK_SCALE_MIN_EDGE_ENV else None
+RISK_ADJUSTED_SCALE_SIDE = os.getenv("BTC_1HR_RISK_SCALE_SIDE", "").strip().lower() or None
+RISK_ADJUSTED_BASE_MAX_CONTRACTS = int(os.getenv("BTC_1HR_RISK_BASE_MAX_CONTRACTS", "3"))
+RISK_ADJUSTED_BASE_MEDIUM_ENTRY_CAP = float(os.getenv("BTC_1HR_RISK_BASE_MEDIUM_ENTRY_CAP", "0.55"))
+RISK_ADJUSTED_BASE_HIGH_ENTRY_CAP = float(os.getenv("BTC_1HR_RISK_BASE_HIGH_ENTRY_CAP", "0.65"))
+RISK_ADJUSTED_BASE_NO_SIDE_CONTRACT_CAP = int(os.getenv("BTC_1HR_RISK_BASE_NO_SIDE_CONTRACT_CAP", "3"))
+_RISK_NO_NEAR_DISTANCE_ENV = os.getenv("BTC_1HR_RISK_NO_NEAR_DISTANCE_USD", "").strip()
+RISK_ADJUSTED_NO_NEAR_DISTANCE_USD = float(_RISK_NO_NEAR_DISTANCE_ENV) if _RISK_NO_NEAR_DISTANCE_ENV else None
+_RISK_NO_NEAR_DISTANCE_CAP_ENV = os.getenv("BTC_1HR_RISK_NO_NEAR_DISTANCE_CONTRACT_CAP", "").strip()
+RISK_ADJUSTED_NO_NEAR_DISTANCE_CONTRACT_CAP = (
+    int(_RISK_NO_NEAR_DISTANCE_CAP_ENV) if _RISK_NO_NEAR_DISTANCE_CAP_ENV else None
+)
+_RISK_NO_LOW_PROB_ENV = os.getenv("BTC_1HR_RISK_NO_LOW_PROB_THRESHOLD", "").strip()
+RISK_ADJUSTED_NO_LOW_PROB_THRESHOLD = float(_RISK_NO_LOW_PROB_ENV) if _RISK_NO_LOW_PROB_ENV else None
+_RISK_NO_LOW_PROB_CAP_ENV = os.getenv("BTC_1HR_RISK_NO_LOW_PROB_CONTRACT_CAP", "").strip()
+RISK_ADJUSTED_NO_LOW_PROB_CONTRACT_CAP = int(_RISK_NO_LOW_PROB_CAP_ENV) if _RISK_NO_LOW_PROB_CAP_ENV else None
 NY_TZ = ZoneInfo("America/New_York")
 EVENT_TICKER_RE = re.compile(r"^KXBTCD-(?P<yy>\d{2})(?P<mon>[A-Z]{3})(?P<day>\d{2})(?P<hour>\d{2})$")
 
@@ -189,6 +215,49 @@ def strategy_uses_market_shrink(strategy: str | None) -> bool:
 
 def strategy_requires_full_chain(strategy: str | None) -> bool:
     return str(strategy or SIGNAL_STRATEGY).strip().lower() in {"market_shrink_no_cautious_shape_adjacent"}
+
+
+def reprice_event_cooldown_seconds() -> float:
+    return max(0.0, float(REPRICE_EVENT_COOLDOWN_SEC or 0.0))
+
+
+def _cooldown_event_key(event_ticker: str | None) -> str:
+    return str(event_ticker or "").strip().upper()
+
+
+def mark_event_reprice_cooldown(event_ticker: str | None, now: float | None = None) -> None:
+    seconds = reprice_event_cooldown_seconds()
+    if seconds <= 0:
+        return
+    key = _cooldown_event_key(event_ticker)
+    if not key:
+        return
+    now = time.monotonic() if now is None else now
+    with _REPRICE_EVENT_COOLDOWN_LOCK:
+        _REPRICE_EVENT_COOLDOWN_UNTIL[key] = max(_REPRICE_EVENT_COOLDOWN_UNTIL.get(key, 0.0), now + seconds)
+
+
+def event_reprice_cooldown_remaining(event_ticker: str | None, now: float | None = None) -> float:
+    if reprice_event_cooldown_seconds() <= 0:
+        return 0.0
+    key = _cooldown_event_key(event_ticker)
+    if not key:
+        return 0.0
+    now = time.monotonic() if now is None else now
+    with _REPRICE_EVENT_COOLDOWN_LOCK:
+        until = _REPRICE_EVENT_COOLDOWN_UNTIL.get(key, 0.0)
+        remaining = until - now
+        if remaining <= 0:
+            _REPRICE_EVENT_COOLDOWN_UNTIL.pop(key, None)
+            return 0.0
+        return remaining
+
+
+def event_reprice_cooldown_detail(event_ticker: str | None, now: float | None = None) -> str | None:
+    remaining = event_reprice_cooldown_remaining(event_ticker, now)
+    if remaining <= 0:
+        return None
+    return f"event_reprice_cooldown_{int(reprice_event_cooldown_seconds())}s remaining={remaining:.1f}s"
 
 
 @dataclass(frozen=True)
@@ -1828,7 +1897,7 @@ def build_research_event(event_ticker: str, markets: list[dict], now: datetime) 
     if not close_times_match(expected_close, actual_close):
         return None
     ttl_min = (actual_close - now).total_seconds() / 60.0
-    if ttl_min <= CFG["min_ttl_min"] or ttl_min > RESEARCH_MAX_TTL_MIN:
+    if ttl_min < RESEARCH_MIN_TTL_MIN or ttl_min > RESEARCH_MAX_TTL_MIN:
         return None
     filtered = [
         market
@@ -2323,6 +2392,8 @@ def signal_from_book(
         strong_prob = (side == "yes" and p_yes >= RESEARCH_MIN_YES_P) or (
             side == "no" and p_yes <= RESEARCH_MAX_NO_P
         )
+        if side == "no" and RESEARCH_MIN_NO_SIDE_PROB is not None:
+            strong_prob = strong_prob and (1.0 - p_yes >= RESEARCH_MIN_NO_SIDE_PROB)
         max_spread = max_spread_cents
         min_entry = RESEARCH_MIN_ENTRY
         max_entry = RESEARCH_MAX_ENTRY
@@ -2824,7 +2895,18 @@ def choose_contracts_for_signal(
             medium_entry_cap=RISK_ADJUSTED_MEDIUM_ENTRY_CAP,
             high_entry_cap=RISK_ADJUSTED_HIGH_ENTRY_CAP,
             no_side_contract_cap=RISK_ADJUSTED_NO_SIDE_CONTRACT_CAP,
+            scale_min_edge_cents=RISK_ADJUSTED_SCALE_MIN_EDGE_CENTS,
+            scale_side=RISK_ADJUSTED_SCALE_SIDE,
+            base_max_contracts=RISK_ADJUSTED_BASE_MAX_CONTRACTS,
+            base_medium_entry_cap=RISK_ADJUSTED_BASE_MEDIUM_ENTRY_CAP,
+            base_high_entry_cap=RISK_ADJUSTED_BASE_HIGH_ENTRY_CAP,
+            base_no_side_contract_cap=RISK_ADJUSTED_BASE_NO_SIDE_CONTRACT_CAP,
+            no_side_near_distance_usd=RISK_ADJUSTED_NO_NEAR_DISTANCE_USD,
+            no_side_near_distance_contract_cap=RISK_ADJUSTED_NO_NEAR_DISTANCE_CONTRACT_CAP,
+            no_side_low_prob_threshold=RISK_ADJUSTED_NO_LOW_PROB_THRESHOLD,
+            no_side_low_prob_contract_cap=RISK_ADJUSTED_NO_LOW_PROB_CONTRACT_CAP,
         )
+        side_distance_usd = signal.btc_spot - signal.strike if signal.side == "yes" else signal.strike - signal.btc_spot
         decision = choose_risk_adjusted_contracts(
             entry_price=signal.entry_price,
             model_p_yes=signal.model_p_yes,
@@ -2834,13 +2916,16 @@ def choose_contracts_for_signal(
             active_exposure=total_exposure,
             config=cfg,
             available_qty=min(signal.available_qty, max_contracts),
+            net_edge_cents=signal.net_edge_cents,
+            side_distance_usd=side_distance_usd,
         )
         log.info(
-            "sizing risk_adjusted %s %s entry=%.4f p_side=%.3f p_cons=%.3f contracts=%d cost=$%.2f "
-            "budget=$%.2f full_kelly=%.2f%% applied_kelly=%.2f%% risk_budget=$%.2f reason=%s",
+            "sizing risk_adjusted %s %s entry=%.4f net_edge=%.2fc p_side=%.3f p_cons=%.3f contracts=%d cost=$%.2f "
+            "budget=$%.2f full_kelly=%.2f%% applied_kelly=%.2f%% risk_budget=$%.2f reason=%s scale_gate=%s/%s no_near_cap=%s/%s no_low_prob_cap=%s/%s side_distance=$%.2f",
             signal.market_ticker,
             signal.side.upper(),
             signal.entry_price,
+            signal.net_edge_cents,
             decision.side_probability,
             decision.conservative_probability,
             decision.contracts,
@@ -2850,6 +2935,13 @@ def choose_contracts_for_signal(
             100.0 * decision.applied_kelly_fraction,
             decision.risk_budget,
             decision.reason,
+            RISK_ADJUSTED_SCALE_MIN_EDGE_CENTS,
+            RISK_ADJUSTED_SCALE_SIDE,
+            RISK_ADJUSTED_NO_NEAR_DISTANCE_USD,
+            RISK_ADJUSTED_NO_NEAR_DISTANCE_CONTRACT_CAP,
+            RISK_ADJUSTED_NO_LOW_PROB_THRESHOLD,
+            RISK_ADJUSTED_NO_LOW_PROB_CONTRACT_CAP,
+            side_distance_usd,
         )
         return decision.contracts
     if portfolio is None:
@@ -3568,6 +3660,11 @@ class WsResearchExecutor:
 
         spent_this_cycle = 0.0
         for original in selected:
+            cooldown_detail = event_reprice_cooldown_detail(original.event_ticker)
+            if cooldown_detail:
+                self._record_decision(original, "skip", cooldown_detail, portfolio, None, None)
+                log.info("skip %s: %s", original.market_ticker, cooldown_detail)
+                continue
             emp_cache = self.cache_by_event.get(original.event_ticker)
             if not emp_cache:
                 self._record_decision(original, "skip", "missing_emp_cache", None, None, None)
@@ -3583,6 +3680,7 @@ class WsResearchExecutor:
                 signal_strategy=SIGNAL_STRATEGY,
             )
             if not fresh:
+                mark_event_reprice_cooldown(original.event_ticker)
                 self._record_decision(original, "skip", "failed_ws_reprice_filter", None, None, None)
                 log.info("skip %s: failed websocket book reprice/filter", original.market_ticker)
                 continue
@@ -3853,6 +3951,10 @@ def run_once(args, data_client: KalshiApi, trade_client: KalshiApi | None, conn:
 
     spent_this_cycle = 0.0
     for original in selected:
+        cooldown_detail = event_reprice_cooldown_detail(original.event_ticker)
+        if cooldown_detail:
+            log.info("skip %s: %s", original.market_ticker, cooldown_detail)
+            continue
         emp_cache = cache_by_event.get(original.event_ticker)
         if not emp_cache:
             log.info("skip %s: missing event-open empirical cache", original.market_ticker)
@@ -3866,6 +3968,7 @@ def run_once(args, data_client: KalshiApi, trade_client: KalshiApi | None, conn:
             emp_cache,
         )
         if not fresh:
+            mark_event_reprice_cooldown(original.event_ticker)
             log.info("skip %s: failed fresh orderbook reprice/filter", original.market_ticker)
             continue
         sized_contracts = choose_contracts_for_signal(fresh, portfolio, local_active_exposure, spent_this_cycle)
@@ -3985,7 +4088,7 @@ def current_event_needs_refresh(events: list[dict]) -> bool:
     if close_time is None:
         return True
     ttl_min = (close_time - datetime.now(timezone.utc)).total_seconds() / 60.0
-    return ttl_min <= CFG["min_ttl_min"] or ttl_min > RESEARCH_MAX_TTL_MIN
+    return ttl_min < RESEARCH_MIN_TTL_MIN or ttl_min > RESEARCH_MAX_TTL_MIN
 
 
 def drain_updates(update_queue: queue.Queue, first: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -4257,7 +4360,7 @@ def main() -> None:
     set_sizing_policy(args.sizing_policy)
     validate_args(args)
     log.info(
-        "starting research executor mode=%s signal_strategy=%s sizing_policy=%s trade_env=%s market_data=%s series=%s train_days=%d contracts=%d interval=%ds shadow_bankroll=$%.2f capture_db=%s log=%s",
+        "starting research executor mode=%s signal_strategy=%s sizing_policy=%s trade_env=%s market_data=%s series=%s train_days=%d contracts=%d ttl=%.1f-%.1fm no_min_side_prob=%s no_near_cap=%s/%s no_low_prob_cap=%s/%s reprice_event_cooldown=%s interval=%ds shadow_bankroll=$%.2f capture_db=%s log=%s",
         args.mode,
         SIGNAL_STRATEGY,
         SIZING_POLICY,
@@ -4266,6 +4369,14 @@ def main() -> None:
         RESEARCH_SERIES,
         RESEARCH_TRAIN_DAYS,
         RESEARCH_MAX_CONTRACTS_PER_TRADE,
+        RESEARCH_MIN_TTL_MIN,
+        RESEARCH_MAX_TTL_MIN,
+        f"{RESEARCH_MIN_NO_SIDE_PROB:.2f}" if RESEARCH_MIN_NO_SIDE_PROB is not None else "off",
+        f"${RISK_ADJUSTED_NO_NEAR_DISTANCE_USD:.0f}" if RISK_ADJUSTED_NO_NEAR_DISTANCE_USD is not None else "off",
+        RISK_ADJUSTED_NO_NEAR_DISTANCE_CONTRACT_CAP if RISK_ADJUSTED_NO_NEAR_DISTANCE_CONTRACT_CAP is not None else "off",
+        f"{RISK_ADJUSTED_NO_LOW_PROB_THRESHOLD:.2f}" if RISK_ADJUSTED_NO_LOW_PROB_THRESHOLD is not None else "off",
+        RISK_ADJUSTED_NO_LOW_PROB_CONTRACT_CAP if RISK_ADJUSTED_NO_LOW_PROB_CONTRACT_CAP is not None else "off",
+        f"{int(reprice_event_cooldown_seconds())}s" if reprice_event_cooldown_seconds() > 0 else "off",
         args.interval_sec,
         args.shadow_bankroll,
         args.capture_db_path,
