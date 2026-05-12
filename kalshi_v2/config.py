@@ -48,6 +48,16 @@ CFG = {
                                         # 1.0 = full Kelly (max growth, max
                                         # variance). 0.25 = quarter-Kelly
                                         # (safer for noisy edge estimates).
+    # NO-side distance-to-strike sizing throttle (sami's May 11 finding):
+    # Kalshi BTC markets settle to the CF Benchmarks RTI 60-second pre-expiry
+    # AVERAGE, not the last spot tick. So if you're buying NO with spot just
+    # below a YES strike, the BRTI can average to a higher number than your
+    # spot showed, flipping the trade against you. Sami's May 10 live loss:
+    # bot bought NO at 81399.99-strike with BTC at 81305 (dist $95); BRTI
+    # settled at 81454.94, crossing the strike → trade lost. Cap size on
+    # close-to-strike NO trades. Set distance_usd to 0 to disable.
+    "no_near_strike_distance_usd":  115,
+    "no_near_strike_max_contracts": 1,
     # ──── Position management ──────────────────────────────────
     "stop_loss_pct":     0.20,
     "take_profit_cents": 5.0,

@@ -112,6 +112,35 @@ def _execute_signals(signals):
             if contracts > max_contracts:
                 contracts = max(1, max_contracts)
 
+        # NO-distance-to-strike sizing throttle (sami's May 11 risk control).
+        # When buying NO with spot close to the strike, the BRTI 60-second
+        # pre-expiry average can cross even though our spot tick didn't,
+        # flipping the trade against us. Cap size on close-to-strike NO
+        # trades. YES trades are unaffected.
+        near_thresh_usd = float(CFG.get("no_near_strike_distance_usd", 0))
+        if side == "no" and near_thresh_usd > 0 and spot is not None:
+            floor_f = sig.get("floor")
+            cap_f   = sig.get("cap")
+            try:
+                floor_f = float(floor_f) if floor_f is not None else None
+                cap_f   = float(cap_f)   if cap_f   is not None else None
+            except (ValueError, TypeError):
+                floor_f, cap_f = None, None
+            # For cumulative (-T) markets: distance to the one strike (floor).
+            # For bucket (-B) markets: distance to the nearer of the two edges.
+            dist_usd = None
+            if floor_f is not None:
+                dist_usd = abs(spot - floor_f)
+                if cap_f is not None and cap_f > floor_f:
+                    dist_usd = min(dist_usd, abs(spot - cap_f))
+            if dist_usd is not None and dist_usd < near_thresh_usd:
+                cap_no = int(CFG.get("no_near_strike_max_contracts", 1))
+                if contracts > cap_no:
+                    print(f"  NO-near-strike throttle {ticker}: "
+                          f"dist=${dist_usd:.0f} < ${near_thresh_usd:.0f}, "
+                          f"capping {contracts} → {cap_no}")
+                    contracts = max(1, cap_no)
+
         allow, reasons = risk_preflight(ticker, side, contracts, entry, "v2")
         if not allow:
             print(f"  RISK BLOCK {ticker} {side}: {'; '.join(reasons)}")
