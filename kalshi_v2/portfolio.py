@@ -155,26 +155,107 @@ def paper_portfolio_metrics(kalshi_md=None):
                             "CFG['bankroll']", kalshi_md)
 
 
+def _kalshi_open_positions(kalshi_live, kalshi_md=None) -> list:
+    """Pull live open positions from Kalshi (source of truth), not from
+    the bot's DB. Marks each to current bid/ask mid via _mark_to_market.
+
+    Returns list of dicts:
+      { ticker, side (yes/no), contracts, avg_entry, current_mark, value }
+    where value = contracts * current_mark.
+    """
+    if kalshi_live is None:
+        return []
+    try:
+        resp = kalshi_live.get_positions()
+    except Exception as e:
+        print(f"  positions fetch failed: {e}")
+        return []
+    rows = []
+    for p in resp.get("market_positions", []) or resp.get("positions", []) or []:
+        ticker = p.get("ticker") or p.get("market_ticker")
+        # Kalshi reports a single signed `position` count and an average price
+        pos = int(p.get("position", 0))
+        if pos == 0:
+            continue
+        side = "yes" if pos > 0 else "no"
+        contracts = abs(pos)
+        # Average entry — Kalshi exposes either market_exposure (in cents) or
+        # average_price_cents; fall back to 0 if neither present.
+        avg_entry = None
+        for k in ("average_yes_price", "average_price", "market_exposure"):
+            if p.get(k) is not None:
+                v = float(p[k])
+                # cents-int vs dollar-float heuristic
+                avg_entry = v / 100.0 if v > 1.0 else v
+                break
+        if avg_entry is None:
+            avg_entry = 0.5
+        mark = _mark_to_market(ticker, side, kalshi_md=kalshi_md)
+        if mark is None:
+            mark = avg_entry
+        rows.append({
+            "ticker":       ticker,
+            "side":         side,
+            "contracts":    contracts,
+            "avg_entry":    avg_entry,
+            "current_mark": mark,
+            "value":        contracts * mark,
+            "unrealized":   (mark - avg_entry) * contracts,
+        })
+    return rows
+
+
 def live_portfolio_metrics(kalshi_md=None, kalshi_live=None):
-    from .risk import get_live_balance
-    bal = get_live_balance()
-    if bal is None or bal <= 0:
-        if kalshi_live is not None:
-            try:
-                b = kalshi_live.get_balance()
-                bal = float(b.get("balance", 0)) / 100.0
-                from .risk import set_live_balance
-                set_live_balance(bal)
-            except Exception:
-                bal = None
-    if bal is None or bal <= 0:
+    """Live portfolio view sourced from Kalshi directly:
+      - cash      = /portfolio/balance  (the spendable cash field)
+      - positions = /portfolio/positions, marked to current mid
+      - equity    = cash + Σ(position contracts × current_mark)
+    Ignores the bot's DB for open positions (DB can drift from Kalshi
+    truth if the user closes manually or the bot misses a fill).
+    """
+    if kalshi_live is None:
         print("=" * 72)
-        print("  LIVE / SHADOW PORTFOLIO — balance unavailable, skipping")
+        print("  LIVE PORTFOLIO — no auth client, skipping")
         print("=" * 72)
         return {}
-    return _portfolio_view("LIVE / SHADOW PORTFOLIO", LIVE_OR_SHADOW,
-                            bal, "Kalshi cash balance", kalshi_md,
-                            kalshi_live=kalshi_live)
+
+    # Cash from API
+    try:
+        b   = kalshi_live.get_balance()
+        cash = float(b.get("balance", 0)) / 100.0
+        payout = float(b.get("payout", 0)) / 100.0 if b.get("payout") else 0.0
+    except Exception as e:
+        print(f"  balance fetch failed: {e}")
+        return {}
+
+    positions = _kalshi_open_positions(kalshi_live, kalshi_md=kalshi_md)
+    open_cost = sum(p["contracts"] * p["avg_entry"] for p in positions)
+    open_mark = sum(p["value"] for p in positions)
+    unreal    = sum(p["unrealized"] for p in positions)
+    equity    = cash + open_mark + payout
+
+    print("=" * 72)
+    print(f"  LIVE PORTFOLIO  (source: Kalshi API)")
+    print(f"  time:     {datetime.now(timezone.utc).isoformat()}")
+    print("=" * 72)
+    print(f"\n  Cash (spendable):      ${cash:>14,.2f}")
+    if payout > 0:
+        print(f"  Pending payout:        ${payout:>14,.2f}")
+    print(f"  Open positions @ mark: ${open_mark:>14,.2f}  "
+          f"(cost ${open_cost:,.2f} + unreal ${unreal:+,.2f})")
+    print(f"  TOTAL EQUITY:          ${equity:>14,.2f}")
+
+    if positions:
+        print(f"\n  Open positions on Kalshi: {len(positions)}")
+        for p in positions:
+            pnl_pct = (p["current_mark"] / p["avg_entry"] - 1) * 100 if p["avg_entry"] > 0 else 0
+            print(f"    {p['ticker']:35s} {p['side']:>3s}  x{p['contracts']:>4d}  "
+                  f"avg ${p['avg_entry']:.3f}  mark ${p['current_mark']:.3f}  "
+                  f"unreal ${p['unrealized']:+.2f} ({pnl_pct:+.1f}%)")
+    print()
+    return {"cash": cash, "payout": payout, "open_mark": open_mark,
+             "unrealized": unreal, "equity": equity,
+             "n_open": len(positions)}
 
 
 def portfolio_metrics(kalshi_md=None, kalshi_live=None):
