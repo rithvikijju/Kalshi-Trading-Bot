@@ -16,8 +16,16 @@ from .state import BOOKS, LOCK
 
 
 def _portfolio_view(label: str, tags, bankroll: float, account_label: str,
-                     kalshi_md=None) -> dict:
+                     kalshi_md=None, kalshi_live=None) -> dict:
     """Print + return a single-portfolio view.
+
+    For LIVE / SHADOW (kalshi_live provided): bankroll = Kalshi's
+    `/portfolio/balance` cash, which is already net of position costs and
+    settled PnL. So:
+        equity = bankroll + position_market_value
+                = bankroll + Σ(entry × contracts) + unrealized
+    For PAPER (kalshi_live = None): bankroll = CFG['bankroll'] fixed
+    starting balance, so cash and equity are derived from realized PnL.
 
     Returns dict with: equity, cash, realized, unrealized, n_open, n_settled.
     """
@@ -33,13 +41,27 @@ def _portfolio_view(label: str, tags, bankroll: float, account_label: str,
         conn, params=real)
     conn.close()
 
+    is_live_view = kalshi_live is not None
+
+    # Refresh live balance if possible — the cached value may be stale.
+    if is_live_view:
+        try:
+            b = kalshi_live.get_balance()
+            fresh = float(b.get("balance", 0)) / 100.0
+            if fresh > 0:
+                bankroll = fresh
+        except Exception:
+            pass
+
     print("=" * 72)
     print(f"  {label}")
-    print(f"  bankroll: ${bankroll:>14,.2f}  ({account_label})")
+    print(f"  cash:     ${bankroll:>14,.2f}  ({account_label})")
     print(f"  time:     {datetime.now(timezone.utc).isoformat()}")
     print("=" * 72)
     if len(df) == 0:
-        print("  no trades.\n"); return {"equity": bankroll, "n_open": 0, "n_settled": 0}
+        print("  no trades.\n")
+        return {"equity": bankroll, "cash": bankroll,
+                "n_open": 0, "n_settled": 0}
 
     settled = df[df["settled"] == 1].copy()
     open_   = df[df["settled"] == 0].copy()
@@ -55,17 +77,27 @@ def _portfolio_view(label: str, tags, bankroll: float, account_label: str,
             open_.at[idx, "unrealized"] = (mark - float(t["entry_price"])) * int(t["contracts"])
             open_.at[idx, "pnl_pct"]    = (mark / float(t["entry_price"]) - 1) * 100
 
-    realized = float(settled["pnl_dollars"].sum()) if len(settled) else 0.0
+    realized  = float(settled["pnl_dollars"].sum()) if len(settled) else 0.0
     open_cost = float((open_["entry_price"] * open_["contracts"]).sum()) if len(open_) else 0.0
-    unreal = float(open_["unrealized"].sum(skipna=True)) if len(open_) else 0.0
-    cash = bankroll + realized - open_cost
-    equity = cash + open_cost + unreal
+    unreal    = float(open_["unrealized"].sum(skipna=True)) if len(open_) else 0.0
+    open_mark = open_cost + unreal       # current market value of open positions
 
-    print(f"\n  Equity:           ${equity:>14,.2f}  ({(equity/bankroll-1)*100:+.2f}%)")
-    print(f"  Cash:             ${cash:>14,.2f}")
-    print(f"  Open cost:        ${open_cost:>14,.2f}")
-    print(f"  Realized:         ${realized:>+14,.2f}")
-    print(f"  Unrealized:       ${unreal:>+14,.2f}")
+    if is_live_view:
+        # Kalshi balance IS cash. Don't double-count realized / open_cost.
+        cash   = bankroll
+        equity = cash + open_mark
+    else:
+        # Paper: bankroll is the fixed starting balance.
+        cash   = bankroll + realized - open_cost
+        equity = cash + open_mark
+
+    print(f"\n  Cash:                ${cash:>14,.2f}")
+    print(f"  Open positions @ mark: ${open_mark:>14,.2f}  "
+          f"(cost ${open_cost:,.2f} + unreal ${unreal:+,.2f})")
+    print(f"  Realized PnL:        ${realized:>+14,.2f}")
+    print(f"  TOTAL EQUITY:        ${equity:>14,.2f}")
+    if not is_live_view:
+        print(f"    vs starting:       {(equity/bankroll-1)*100:+.2f}%")
 
     if len(settled):
         wins = (settled["pnl_dollars"] > 0).sum()
@@ -99,18 +131,19 @@ def _mark_to_market(ticker: str, side: str, kalshi_md=None) -> Optional[float]:
     if b and b.get("yes_bid") is not None and b.get("yes_ask") is not None:
         mid = (b["yes_bid"] + b["yes_ask"]) / 2
         return mid if side == "yes" else 1.0 - mid
-    # REST fallback
+    # REST fallback — use parse_market_fields so 2026 *_dollars fields work.
     if kalshi_md is not None:
         try:
-            m = kalshi_md.get_market(ticker).get("market", {})
-            yb, ya = m.get("yes_bid"), m.get("yes_ask")
+            from .client import parse_market_fields
+            m  = kalshi_md.get_market(ticker).get("market", {})
+            pf = parse_market_fields(m)
+            yb, ya = pf.get("yes_bid"), pf.get("yes_ask")
             if yb is not None and ya is not None:
-                mid = (float(yb) + float(ya)) / 200
+                mid = (float(yb) + float(ya)) / 2
                 return mid if side == "yes" else 1.0 - mid
-            last = m.get("last_price")
+            last = pf.get("last_price")
             if last is not None:
-                yes_last = float(last) / 100
-                return yes_last if side == "yes" else 1.0 - yes_last
+                return float(last) if side == "yes" else 1.0 - float(last)
         except Exception:
             return None
     return None
@@ -140,7 +173,8 @@ def live_portfolio_metrics(kalshi_md=None, kalshi_live=None):
         print("=" * 72)
         return {}
     return _portfolio_view("LIVE / SHADOW PORTFOLIO", LIVE_OR_SHADOW,
-                            bal, "live Kalshi balance", kalshi_md)
+                            bal, "Kalshi cash balance", kalshi_md,
+                            kalshi_live=kalshi_live)
 
 
 def portfolio_metrics(kalshi_md=None, kalshi_live=None):
