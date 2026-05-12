@@ -39,7 +39,8 @@ from typing import Dict, List, Optional, Tuple
 
 from .model import (build_empirical_bank, empirical_p_above,
                      empirical_p_in_bucket, lognormal_p_above,
-                     lognormal_p_in_bucket, detect_market_type)
+                     lognormal_p_in_bucket, detect_market_type,
+                     fair_value)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -141,15 +142,25 @@ def robust_filter(signal: dict, ambiguity_set: List[dict],
 
     if floor is None: return True, {"reason": "no_floor"}
 
+    # CRITICAL: each measure in the ambiguity set MUST use the same
+    # estimation pipeline that the scanner uses, otherwise the filter
+    # is testing apples vs oranges. fair_value() applies BRTI dampening
+    # and the empirical/lognormal blend automatically via CFG.
+    from .config import CFG
+    market_yes_mid = signal.get("market_yes_mid")
+    shrink = float(CFG.get("market_shrink", 0.0))
+
     edges = []
-    mtype = detect_market_type(ticker)
     for P in ambiguity_set:
-        if mtype == "bucket":
-            cap_v = float(cap) if (cap and cap > floor) else (floor + 100.0)
-            p_yes = empirical_p_in_bucket(spot, floor, cap_v, ttl_min, P, vol, kurt)
-        else:
-            p_yes = empirical_p_above(spot, floor, ttl_min, P, vol, kurt)
+        p_yes = fair_value(ticker, spot, floor, cap, ttl_min, vol,
+                              kurt=kurt, empirical_bank=P)
         if p_yes is None: continue
+
+        # Apply the same market-mid shrinkage the scanner used so the
+        # robust filter sees the same "effective" probability the scanner
+        # used to declare an edge.
+        if shrink > 0 and market_yes_mid is not None:
+            p_yes = (1.0 - shrink) * p_yes + shrink * float(market_yes_mid)
 
         if side == "yes":
             edge_c = (p_yes - entry) * 100 - fee_per_contract * 100
