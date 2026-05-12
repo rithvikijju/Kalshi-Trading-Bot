@@ -83,10 +83,18 @@ def scan_signals(empirical_bank: Optional[dict] = None,
                             kurt=0.0, empirical_bank=empirical_bank)
         if p_yes is None: continue
 
-        fee = kalshi_fee(0.5)    # midpoint-fee approximation; recomputed below
+        # Sami-style market-mid shrinkage: pull model probability toward
+        # the market mid. Reduces overconfidence — the empirical bank thinks
+        # extreme strikes are more mispriced than reality bears out.
+        # Effective p = (1 - shrink) * model_p + shrink * market_mid.
+        market_mid = (yb + ya) / 2
+        shrink = float(CFG.get("market_shrink", 0.0))
+        if shrink > 0:
+            p_yes = (1.0 - shrink) * p_yes + shrink * market_mid
+
         # YES-side: buy YES at ya, win if p_yes > ya + fee
         edge_yes = (p_yes - ya) * 100 - kalshi_fee(ya) * 100
-        # NO-side: buy NO at (1-yb), win if (1-p_yes) > (1-yb) + fee  →  yb - p_yes
+        # NO-side: buy NO at (1-yb), win if (1-p_yes) > (1-yb) + fee
         edge_no  = (yb - p_yes) * 100 - kalshi_fee(1 - yb) * 100
 
         if edge_yes >= edge_no:
@@ -94,7 +102,21 @@ def scan_signals(empirical_bank: Optional[dict] = None,
         else:
             side, edge_c, entry = "no",  edge_no,  1 - yb
 
-        if edge_c < CFG["min_edge_cents"]: continue
+        # Sami's NO-side surcharge: NO trades have a documented asymmetric
+        # loss in live trading, require extra edge to compensate.
+        min_edge = float(CFG["min_edge_cents"])
+        if side == "no":
+            min_edge += float(CFG.get("no_side_edge_surcharge_cents", 0.0))
+        if edge_c < min_edge: continue
+
+        # Strong-probability filter: model must be confidently away from 50/50
+        # in the direction of the trade. Filters out marginal signals where
+        # any small calibration error flips the EV.
+        min_yes_p = float(CFG.get("min_yes_p", 0.0))
+        max_no_p  = float(CFG.get("max_no_p",  1.0))
+        if side == "yes" and p_yes < min_yes_p: continue
+        if side == "no"  and p_yes > max_no_p:  continue
+
         if entry < CFG["min_entry_price"]: continue
         if entry > CFG["max_entry_price"]: continue
 
