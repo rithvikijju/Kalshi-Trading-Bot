@@ -83,13 +83,22 @@ def build_empirical_bank(btc_1m, horizon_min: int, max_idx: Optional[int] = None
 
 def empirical_p_above(spot: float, strike: float, horizon_min: float,
                        bank: dict, vol: float, kurt: float = 0.0,
-                       keep_frac: float = 0.30) -> float:
-    """P(BTC_T > strike) from the empirical bank, vol+kurt matched."""
+                       keep_frac: float = 0.30,
+                       brti_dampening: float = 1.0) -> float:
+    """P(BTC_T > strike) from the empirical bank, vol+kurt matched.
+
+    brti_dampening scales empirical log-return samples before computing P.
+    Use < 1.0 to correct for Kalshi's settlement basis: CF Benchmarks BRTI
+    is the 60-second pre-expiry average, smoother than minute-close spot,
+    so raw empirical samples overstate the chance of extreme strikes.
+    Sami's research uses 0.80.
+    """
     R = bank["log_returns"]
     V = bank["starting_vols"]
     K = bank["starting_kurts"]
     h = bank["horizon_min"]
     if len(R) == 0: return 0.5
+    R = R * float(brti_dampening)
     if horizon_min != h and h > 0:
         R = R * np.sqrt(horizon_min / h)
     vz = (V - bank["v_mean"]) / bank["v_std"]
@@ -105,9 +114,12 @@ def empirical_p_above(spot: float, strike: float, horizon_min: float,
 
 def empirical_p_in_bucket(spot: float, floor_k: float, cap_k: float,
                             horizon_min: float, bank: dict,
-                            vol: float, kurt: float = 0.0) -> float:
-    p_above_floor = empirical_p_above(spot, floor_k, horizon_min, bank, vol, kurt)
-    p_above_cap   = empirical_p_above(spot, cap_k,   horizon_min, bank, vol, kurt)
+                            vol: float, kurt: float = 0.0,
+                            brti_dampening: float = 1.0) -> float:
+    p_above_floor = empirical_p_above(spot, floor_k, horizon_min, bank, vol, kurt,
+                                         brti_dampening=brti_dampening)
+    p_above_cap   = empirical_p_above(spot, cap_k,   horizon_min, bank, vol, kurt,
+                                         brti_dampening=brti_dampening)
     return max(0.0, p_above_floor - p_above_cap)
 
 
@@ -143,23 +155,49 @@ def detect_market_type(ticker: str) -> str:
 def fair_value(ticker: str, spot: float, floor: float, cap: Optional[float],
                 ttl_min: float, sigma: float, kurt: float = 0.0,
                 empirical_bank: Optional[dict] = None,
-                mu: float = 0.0) -> Optional[float]:
-    """Single source of truth for fair P(YES). Returns None if unable to price."""
+                mu: float = 0.0,
+                brti_dampening: Optional[float] = None,
+                empirical_blend: Optional[float] = None) -> Optional[float]:
+    """Single source of truth for fair P(YES). Returns None if unable to price.
+
+    Awareness layers (defaults from CFG, no change in interface for callers):
+      - brti_dampening scales empirical log-returns to correct for Kalshi's
+        CF Benchmarks RTI 60-sec settlement (default 0.80).
+      - empirical_blend mixes empirical and lognormal closed-form:
+            P = blend * empirical + (1 - blend) * lognormal
+        Defaults to 0.70 (sami's research finding). Both estimates are
+        always computed; blending smooths model variance.
+    """
+    from .config import CFG
+    if brti_dampening is None:
+        brti_dampening = float(CFG.get("brti_dampening", 1.0))
+    if empirical_blend is None:
+        empirical_blend = float(CFG.get("empirical_blend", 1.0))
+
     mtype = detect_market_type(ticker)
     if floor is None or floor <= 0 or spot <= 0:
         return None
+    T_years = ttl_min / (60 * 24 * 365)
 
     # Bucket: P(floor ≤ S < cap)
     if mtype == "bucket":
         cap_v = float(cap) if (cap is not None and cap > floor) else (floor + 100.0)
+        p_emp = None
         if empirical_bank is not None and empirical_bank["n"] > 100:
-            return empirical_p_in_bucket(spot, floor, cap_v, ttl_min,
-                                            empirical_bank, sigma, kurt)
-        T_years = ttl_min / (60 * 24 * 365)
-        return lognormal_p_in_bucket(spot, floor, cap_v, T_years, sigma, mu)
+            p_emp = empirical_p_in_bucket(spot, floor, cap_v, ttl_min,
+                                              empirical_bank, sigma, kurt,
+                                              brti_dampening=brti_dampening)
+        p_log = lognormal_p_in_bucket(spot, floor, cap_v, T_years, sigma, mu)
+        if p_emp is not None and p_log is not None:
+            return empirical_blend * p_emp + (1.0 - empirical_blend) * p_log
+        return p_emp if p_emp is not None else p_log
 
     # Cumulative: P(S > K)
+    p_emp = None
     if empirical_bank is not None and empirical_bank["n"] > 100:
-        return empirical_p_above(spot, floor, ttl_min, empirical_bank, sigma, kurt)
-    T_years = ttl_min / (60 * 24 * 365)
-    return lognormal_p_above(spot, floor, T_years, sigma, mu)
+        p_emp = empirical_p_above(spot, floor, ttl_min, empirical_bank,
+                                      sigma, kurt, brti_dampening=brti_dampening)
+    p_log = lognormal_p_above(spot, floor, T_years, sigma, mu)
+    if p_emp is not None and p_log is not None:
+        return empirical_blend * p_emp + (1.0 - empirical_blend) * p_log
+    return p_emp if p_emp is not None else p_log

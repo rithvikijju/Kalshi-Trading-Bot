@@ -83,10 +83,18 @@ def scan_signals(empirical_bank: Optional[dict] = None,
                             kurt=0.0, empirical_bank=empirical_bank)
         if p_yes is None: continue
 
-        fee = kalshi_fee(0.5)    # midpoint-fee approximation; recomputed below
+        # Awareness layer #1: gentle market-mid shrinkage.
+        # Pull model_p toward the market mid by CFG['market_shrink'] fraction.
+        # Default 0.10 (we use a gentler value than sami's 0.25 to preserve
+        # trade frequency — only the most overconfident edges get trimmed).
+        market_mid = (yb + ya) / 2
+        shrink = float(CFG.get("market_shrink", 0.0))
+        if shrink > 0:
+            p_yes = (1.0 - shrink) * p_yes + shrink * market_mid
+
         # YES-side: buy YES at ya, win if p_yes > ya + fee
         edge_yes = (p_yes - ya) * 100 - kalshi_fee(ya) * 100
-        # NO-side: buy NO at (1-yb), win if (1-p_yes) > (1-yb) + fee  →  yb - p_yes
+        # NO-side: buy NO at (1-yb), win if (1-p_yes) > (1-yb) + fee
         edge_no  = (yb - p_yes) * 100 - kalshi_fee(1 - yb) * 100
 
         if edge_yes >= edge_no:
@@ -94,7 +102,15 @@ def scan_signals(empirical_bank: Optional[dict] = None,
         else:
             side, edge_c, entry = "no",  edge_no,  1 - yb
 
-        if edge_c < CFG["min_edge_cents"]: continue
+        # Awareness layer #2: NO-side surcharge.
+        # Sami's audit showed NO trades are the asymmetric loss source
+        # (-18.94% return on premium vs +20.62% for YES). Require a few
+        # extra cents of edge on NO trades only. Default surcharge = 3.0c.
+        # YES trades unaffected → no trade-count drop on the profitable side.
+        min_edge = float(CFG["min_edge_cents"])
+        if side == "no":
+            min_edge += float(CFG.get("no_side_edge_surcharge_cents", 0.0))
+        if edge_c < min_edge: continue
         if entry < CFG["min_entry_price"]: continue
         if entry > CFG["max_entry_price"]: continue
 

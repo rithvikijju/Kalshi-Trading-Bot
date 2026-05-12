@@ -13,12 +13,29 @@ CFG = {
     "event_series":      ("KXBTC", "KXBTCD"),
     "scan_min_ttl_min":  5,
     "scan_max_ttl_hours": 4.0,
-    "min_edge_cents":    2.5,
-    "max_spread_cents":  3,
-    "min_entry_price":   0.20,
-    "max_entry_price":   0.80,
+    "min_edge_cents":    2.5,           # KEPT — preserves trade frequency
+    "max_spread_cents":  3,             # KEPT — preserves trade frequency
+    "min_entry_price":   0.20,          # KEPT
+    "max_entry_price":   0.80,          # KEPT
     "min_liquidity":     0,             # KXBTC buckets often expose no OI
     "min_model_confidence": 0.0,
+    # ──── Awareness-layer corrections (do NOT cut trade count) ────────────
+    "brti_dampening":    0.80,          # scale empirical log-returns. < 1.0
+                                         # corrects for CF Benchmarks RTI
+                                         # 60-sec settlement (smoother than
+                                         # minute-close spot). 1.0 disables.
+    "empirical_blend":   0.70,          # weight on empirical estimate;
+                                         # remainder is lognormal closed-form.
+                                         # 1.0 = empirical only (old behavior).
+    "market_shrink":     0.10,          # mild pull of model_p toward market
+                                         # mid by this fraction. Sami uses
+                                         # 0.25; we use 0.10 to keep trade
+                                         # frequency closer to v2's prior.
+                                         # 0.0 disables entirely.
+    "no_side_edge_surcharge_cents": 3.0, # extra cents of edge required on
+                                         # NO trades only (sami's audit
+                                         # showed NO is the asymmetric
+                                         # loss source). 0.0 disables.
     # ──── Position sizing + concurrency ────────────────────────
     "max_concurrent_signals": 1,        # top-1 by edge per scan
     "max_per_market":    0.02,          # paper: 2% of bankroll per market
