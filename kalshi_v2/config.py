@@ -13,27 +13,33 @@ CFG = {
     "event_series":      ("KXBTC", "KXBTCD"),
     "scan_min_ttl_min":  5,
     "scan_max_ttl_hours": 4.0,
-    "min_edge_cents":    8.0,           # sami's market_shrink_no_cautious uses 8c
-    "max_spread_cents":  2,             # tightened from 3c (sami's value)
-    "min_entry_price":   0.25,          # tightened from 0.20 (sami's value)
-    "max_entry_price":   0.75,          # tightened from 0.80 (sami's value)
+    "min_edge_cents":    2.5,           # KEPT loose — preserves trade frequency
+    "max_spread_cents":  3,             # KEPT loose — preserves trade frequency
+    "min_entry_price":   0.20,          # KEPT
+    "max_entry_price":   0.80,          # KEPT
     "min_liquidity":     0,             # KXBTC buckets often expose no OI
     "min_model_confidence": 0.0,
-    # ──── Sami-style signal gates (BRTI dampening, market-shrink, side-aware) ──
-    "brti_dampening":    0.80,          # multiply empirical log-returns by this
-                                         # before computing P(YES); corrects for
-                                         # Kalshi's CF Benchmarks RTI settlement
-                                         # (60-second pre-expiry average is
-                                         # smoother than minute close).
-    "empirical_blend":   0.70,          # weight on empirical estimate; the
-                                         # remainder is lognormal closed-form.
-    "market_shrink":     0.25,          # pull model_p toward market mid by
-                                         # this fraction. 0 = trust model fully.
-    "min_yes_p":         0.65,          # only buy YES if model_p_yes >= this
-    "max_no_p":          0.20,          # only buy NO if model_p_yes <= this
-                                         # (i.e. very confident YES won't happen)
-    "no_side_edge_surcharge_cents": 3.0, # extra edge required on NO trades
-                                         # (sami's audit showed NO is the loser)
+    # ──── Awareness-layer corrections (do NOT cut trade count) ────────────
+    # These improve per-trade quality WITHOUT acting as filters that trim
+    # volume. Sami's tighter gates (strong-prob, 8c min edge, 0.25-0.75
+    # band) were intentionally NOT ported — they exist in her stack because
+    # her execution can't scale past ~5 contracts; v2's half-Kelly +
+    # Lipschitz + 30s aggressive-limit handles scale fine.
+    "brti_dampening":    0.80,          # scale empirical log-returns.
+                                         # Corrects for CF Benchmarks RTI
+                                         # 60-sec pre-expiry settlement
+                                         # (smoother than minute-close spot).
+                                         # 1.0 disables.
+    "empirical_blend":   0.70,          # weight on empirical vs lognormal.
+                                         # 1.0 = empirical only (prior v2).
+    "market_shrink":     0.10,          # GENTLE pull of model_p toward
+                                         # market mid (sami uses 0.25; we
+                                         # use 0.10 to keep trade frequency).
+                                         # 0.0 disables.
+    "no_side_edge_surcharge_cents": 3.0, # extra cents required on NO trades
+                                         # ONLY (sami's audit: NO is the
+                                         # asymmetric loss source). 0.0
+                                         # disables. YES trades unaffected.
     # ──── Position sizing + concurrency ────────────────────────
     "max_concurrent_signals": 1,        # top-1 by edge per scan
     "max_per_market":    0.02,          # paper: 2% of bankroll per market

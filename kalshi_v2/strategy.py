@@ -102,20 +102,17 @@ def scan_signals(empirical_bank: Optional[dict] = None,
         else:
             side, edge_c, entry = "no",  edge_no,  1 - yb
 
-        # Sami's NO-side surcharge: NO trades have a documented asymmetric
-        # loss in live trading, require extra edge to compensate.
+        # Awareness layer: NO-side surcharge only.
+        # Sami's live audit showed NO trades have asymmetric loss
+        # (-18.94% return on premium vs +20.62% for YES). Require a few
+        # extra cents of edge on NO trades to compensate. YES trades pass
+        # through with no extra requirement → no trade-count drop on the
+        # profitable side. No strong-prob filter — HRDNN robust filter
+        # does that work without crashing trade count.
         min_edge = float(CFG["min_edge_cents"])
         if side == "no":
             min_edge += float(CFG.get("no_side_edge_surcharge_cents", 0.0))
         if edge_c < min_edge: continue
-
-        # Strong-probability filter: model must be confidently away from 50/50
-        # in the direction of the trade. Filters out marginal signals where
-        # any small calibration error flips the EV.
-        min_yes_p = float(CFG.get("min_yes_p", 0.0))
-        max_no_p  = float(CFG.get("max_no_p",  1.0))
-        if side == "yes" and p_yes < min_yes_p: continue
-        if side == "no"  and p_yes > max_no_p:  continue
 
         if entry < CFG["min_entry_price"]: continue
         if entry > CFG["max_entry_price"]: continue
