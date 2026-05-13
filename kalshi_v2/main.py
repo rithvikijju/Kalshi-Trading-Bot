@@ -154,11 +154,20 @@ def _execute_signals(signals):
                 else tag_shadow if mode == "live_shadow" else tag_paper)
 
         # Live: actually place order
+        recorded_entry = entry      # default: pre-buffer ask (paper/shadow)
         if mode == "live":
             try:
                 resp = place_smart_limit(_KALSHI_LIVE, _KALSHI_MD,
                                             ticker, side, "buy", contracts)
                 order_id = resp.get("order", {}).get("order_id")
+                # Use the actual buy limit price we set as the recorded
+                # entry — it's the worst-case fill (Kalshi can only fill
+                # at this or better) and is far more accurate than the
+                # pre-buffer ask. The pre-buffer ask was systematically
+                # ~2c more favorable than actual fills, inflating PnL.
+                actual_buy = resp.get("_v2_limit_price")
+                if actual_buy is not None:
+                    recorded_entry = float(actual_buy)
             except Exception as e:
                 print(f"  v2 LIVE FAILED {ticker}: {e}")
                 continue
@@ -172,7 +181,7 @@ def _execute_signals(signals):
             "event_ticker":      TRACKED.get("event") or "?",
             "market_ticker":     ticker,
             "side":              side,
-            "entry_price":       entry,
+            "entry_price":       recorded_entry,
             "contracts":         contracts,
             "entry_edge_cents":  float(sig["edge_c"]),
             "model_p_yes":       float(sig["model_p_yes"]),

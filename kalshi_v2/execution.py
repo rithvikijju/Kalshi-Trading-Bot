@@ -91,6 +91,11 @@ def place_smart_limit(kalshi_live: KalshiClient, kalshi_md: KalshiClient,
                                          expiration_ts=expiration_ts)
     print(f"  ✓ live order: {ticker} {side} {action} x{count} @ ${price:.2f} "
           f"(expires {expiration_sec}s)")
+    # Attach the actual limit price we set so callers can record it as
+    # the realized fill price (Kalshi fills at this or better, but since
+    # we set buffer-aggressive limits the fill is typically AT the limit).
+    if isinstance(resp, dict):
+        resp["_v2_limit_price"] = float(price)
     return resp
 
 
@@ -159,26 +164,62 @@ def _decide_exit(trade: dict, quote: Optional[dict]) -> Optional[str]:
     return None
 
 
-def _close_paper(trade: dict, quote: Optional[dict], reason: str):
-    if quote is not None:
-        mark = quote["mid"] if trade["side"] == "yes" else 1.0 - quote["mid"]
+def _close_paper(trade: dict, quote: Optional[dict], reason: str,
+                   override_close_price: Optional[float] = None):
+    """Settle a trade in the local DB.
+
+    Close price preference order:
+      1. override_close_price (passed by _close_live = actual sell limit)
+      2. mid-of-book mark from `quote`
+      3. 0.50 (last-resort fallback)
+
+    PnL is gross of fees; fees are computed and stored separately
+    via a synthetic exit_reason suffix so reports can recompute
+    net-of-fee PnL without reaching back into the order log.
+    """
+    side = trade["side"]
+    if override_close_price is not None:
+        mark = float(override_close_price)
+    elif quote is not None:
+        mark = quote["mid"] if side == "yes" else 1.0 - quote["mid"]
     else:
-        mark = 0.5    # last-resort fallback
-    pnl = (mark - float(trade["entry_price"])) * int(trade["contracts"])
-    settle_trade(int(trade["id"]), mark, pnl, reason)
-    print(f"    paper-closed #{trade['id']} {trade['market_ticker']} {trade['side']:>3s}  "
-          f"reason={reason}  pnl=${pnl:+.2f}")
+        mark = 0.5
+
+    entry    = float(trade["entry_price"])
+    contracts = int(trade["contracts"])
+    gross_pnl = (mark - entry) * contracts
+
+    # Kalshi round-trip taker fee per contract (approximation):
+    # 0.07 * p * (1-p), ceil'd to nearest cent.
+    import math as _math
+    def _fee(p):
+        p = max(0.0, min(1.0, p))
+        return _math.ceil(0.07 * p * (1 - p) * 100) / 100.0
+    fee_total = (_fee(entry) + _fee(mark)) * contracts
+
+    pnl_net = gross_pnl - fee_total
+    settle_trade(int(trade["id"]), mark, pnl_net, reason)
+    print(f"    paper-closed #{trade['id']} {trade['market_ticker']} {side:>3s}  "
+          f"reason={reason}  entry=${entry:.3f}  close=${mark:.3f}  "
+          f"gross=${gross_pnl:+.2f}  fee=${fee_total:.2f}  net=${pnl_net:+.2f}")
 
 
 def _close_live(kalshi_live: KalshiClient, kalshi_md: KalshiClient,
                   trade: dict, quote: Optional[dict], reason: str):
     try:
-        place_smart_limit(kalshi_live, kalshi_md, trade["market_ticker"],
-                            trade["side"], "sell", int(trade["contracts"]))
+        resp = place_smart_limit(kalshi_live, kalshi_md, trade["market_ticker"],
+                                    trade["side"], "sell", int(trade["contracts"]))
     except Exception as e:
         print(f"    live close FAILED #{trade['id']}: {e}")
         return
-    _close_paper(trade, quote, f"live:{reason}")
+    # Use the actual sell-side limit price we set as the close price,
+    # not the WS mid (which is systematically more favorable to the bot
+    # than what a sell order actually fills at).
+    sell_price = None
+    if isinstance(resp, dict):
+        sell_price = resp.get("_v2_limit_price")
+    _close_paper(trade, quote, f"live:{reason}",
+                   override_close_price=sell_price)
 
 
 def manage_open_positions(kalshi_md: KalshiClient,
