@@ -168,6 +168,11 @@ def fair_value(ticker: str, spot: float, floor: float, cap: Optional[float],
         (default reads CFG['empirical_blend'], 0.70). Final P =
             blend × empirical + (1-blend) × lognormal,
         unless the lognormal is non-finite (in which case empirical-only).
+
+    After the blend, if a Platt calibrator is loaded AND
+    CFG['platt_enabled'] is True, the probability is passed through the
+    sigmoid before being returned. This corrects the ~6c systematic
+    overconfidence we measured in live trade audits.
     """
     from .config import CFG
     if brti_dampening is None:
@@ -180,6 +185,15 @@ def fair_value(ticker: str, spot: float, floor: float, cap: Optional[float],
         return None
     T_years = ttl_min / (60 * 24 * 365)
 
+    def _finalize(p: Optional[float]) -> Optional[float]:
+        """Apply Platt calibration if enabled + loaded, else passthrough."""
+        if p is None:
+            return None
+        if bool(CFG.get("platt_enabled", True)):
+            from .calibration import apply as _platt_apply
+            return _platt_apply(float(p))
+        return float(p)
+
     # Bucket: P(floor ≤ S < cap)
     if mtype == "bucket":
         cap_v = float(cap) if (cap is not None and cap > floor) else (floor + 100.0)
@@ -190,8 +204,8 @@ def fair_value(ticker: str, spot: float, floor: float, cap: Optional[float],
                                               brti_dampening=brti_dampening)
         p_log = lognormal_p_in_bucket(spot, floor, cap_v, T_years, sigma, mu)
         if p_emp is not None and p_log is not None:
-            return empirical_blend * p_emp + (1.0 - empirical_blend) * p_log
-        return p_emp if p_emp is not None else p_log
+            return _finalize(empirical_blend * p_emp + (1.0 - empirical_blend) * p_log)
+        return _finalize(p_emp if p_emp is not None else p_log)
 
     # Cumulative: P(S > K)
     p_emp = None
@@ -200,5 +214,5 @@ def fair_value(ticker: str, spot: float, floor: float, cap: Optional[float],
                                       sigma, kurt, brti_dampening=brti_dampening)
     p_log = lognormal_p_above(spot, floor, T_years, sigma, mu)
     if p_emp is not None and p_log is not None:
-        return empirical_blend * p_emp + (1.0 - empirical_blend) * p_log
-    return p_emp if p_emp is not None else p_log
+        return _finalize(empirical_blend * p_emp + (1.0 - empirical_blend) * p_log)
+    return _finalize(p_emp if p_emp is not None else p_log)

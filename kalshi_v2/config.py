@@ -75,6 +75,13 @@ CFG = {
     # ──── Order placement ──────────────────────────────────────
     "order_buffer_cents": 2,
     "order_expiration_sec": 30,
+    # ──── Platt calibration ───────────────────────────────────
+    # When enabled, fair_value() passes the blended empirical/lognormal
+    # P(YES) through a fitted Platt sigmoid before returning. The Platt
+    # coefficients live in ~/.btc_kalshi_bot/v2_calibrator.json and are
+    # fit by calibration.fit_calibrator() against settled trade outcomes.
+    # If no calibrator file exists, this is a no-op.
+    "platt_enabled":          True,
     # ──── Robust filter (HRDNN-inspired) ───────────────────────
     "robust_enabled":         True,
     "robust_n_bootstrap":     16,        # |P| in the ambiguity set
