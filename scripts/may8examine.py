@@ -642,11 +642,20 @@ def signals_for_variant(candidates: pd.DataFrame, variant: Variant, emp_cache: d
 
     yes_ask = q["yes_ask_exe"].to_numpy(dtype=float)
     no_ask = q["no_ask_exe"].to_numpy(dtype=float)
+    if "yes_ask_qty" in q.columns:
+        yes_qty = pd.to_numeric(q["yes_ask_qty"], errors="coerce").to_numpy(dtype=float)
+    else:
+        yes_qty = np.ones(len(q), dtype=float)
+    if "no_ask_qty" in q.columns:
+        no_qty = pd.to_numeric(q["no_ask_qty"], errors="coerce").to_numpy(dtype=float)
+    else:
+        no_qty = np.ones(len(q), dtype=float)
     edge_yes = p - yes_ask
     edge_no = (1.0 - p) - no_ask
     choose_yes = edge_yes > edge_no
     side = np.where(choose_yes, "yes", "no")
     entry = np.where(choose_yes, yes_ask, no_ask)
+    visible_qty = np.where(choose_yes, yes_qty, no_qty)
     gross_edge = np.where(choose_yes, edge_yes, edge_no) * 100.0
     fees = np.asarray([kalshi_fee_dollars(float(price), contracts=1, liquidity="taker") for price in entry])
     net_edge = gross_edge - fees * 100.0
@@ -680,6 +689,8 @@ def signals_for_variant(candidates: pd.DataFrame, variant: Variant, emp_cache: d
         & (q["spread_cents"].to_numpy(dtype=float) <= variant.max_spread_cents)
         & (entry >= variant.min_entry)
         & (entry <= variant.max_entry)
+        & np.isfinite(visible_qty)
+        & (visible_qty >= 1.0)
         & (q["ttl_min"].to_numpy(dtype=float) >= variant.min_ttl_min)
         & (q["ttl_min"].to_numpy(dtype=float) <= variant.max_ttl_min)
     )
@@ -742,6 +753,7 @@ def signals_for_variant(candidates: pd.DataFrame, variant: Variant, emp_cache: d
     out["side"] = side[idxs]
     out["entry_price"] = entry[idxs]
     out["entry_fee"] = fees[idxs]
+    out["visible_qty"] = visible_qty[idxs]
     out["net_edge_cents"] = net_edge[idxs]
     out["edge_threshold_cents"] = threshold[idxs]
     out["side_probability"] = side_p[idxs]

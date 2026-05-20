@@ -827,3 +827,9751 @@ Next research steps:
 3. Evaluate only on future websocket capture; do not re-tune thresholds until at least 100 additional settled live decisions.
 4. Test whether Candidate A still wins after excluding all trades with entry price >70c.
 5. Test sizing, not entry, only after Candidate A survives future holdout.
+
+### 2026-05-13 - Execution Latency / Order Speed Note
+
+Question:
+
+- Can orders be faster without degrading signal quality?
+
+Current view:
+
+- The best low-risk path is not to loosen model filters. It is to reduce
+  software latency between a qualifying websocket state and FOK submit.
+- Useful engineering changes for the next execution iteration:
+  - Keep websocket state hot and avoid REST polling in the decision path.
+  - Maintain pre-filtered per-event candidate lists so each tick evaluates only
+    affected strikes.
+  - Separate capture writes from order submission with nonblocking queues.
+  - Reuse authenticated Kalshi sessions and avoid unnecessary account calls
+    before a FOK order when cached bankroll/exposure checks are fresh.
+  - Track timing metrics for each stage: websocket receive, state update,
+    model evaluation, book reprice, order submit, and Kalshi response.
+
+Constraint:
+
+- Speed changes must preserve the same executable-price and top-of-book
+  fillability checks. If a faster path changes what price/side/market the bot
+  trades, it is a new strategy and must be separately replay-tested.
+
+### 2026-05-13 - BTC15M LowDD Latency Patch
+
+Implemented in `scripts/btc15m_lowdd_live.py`:
+
+- Final hot-book reprice immediately before sizing/order submit.
+- Skip if executable entry worsens by more than 2c versus the signal snapshot
+  (`BTC15M_MAX_REPRICE_WORSE_CENTS`, default `2.0`).
+- Downsize against current visible top-of-book quantity instead of assuming the
+  earlier displayed size is still fillable.
+- Add a 60s event chase cooldown after FOK no-fill or failed hot-book reprice
+  (`BTC15M_ORDER_CHASE_COOLDOWN_SEC`, default `60.0`).
+- Keep a warm portfolio cache outside the hot websocket decision path
+  (`BTC15M_PORTFOLIO_CACHE_TTL_SEC=30`, warm refresh every 15s by default), so
+  account REST is usually not between signal and FOK.
+- Move normal websocket-update scans before periodic REST event refreshes; only
+  lifecycle-triggered refreshes scan after refresh.
+- Remove pre-submit decision capture/logging from the hot path; submit first,
+  then record the response/no-fill decision with `ready_ms` and `submit_ms`.
+
+Validation:
+
+- `python -m py_compile scripts\btc15m_lowdd_live.py`
+- `python scripts\btc15m_lowdd_live.py --mode dry-run --duration-sec 8 --health-sec 5`
+
+Capture note:
+
+- The live trader still writes the same DuckDB capture/decision tables through
+  the nonblocking writer. If we need to remove market capture from the trading
+  process entirely, `scripts\btc15m_live_capture.py` can run as a separate
+  capture-only process while the trader keeps only trade/order telemetry.
+
+### 2026-05-13 - Order Entry and Capture Storage Roadmap
+
+Kalshi order-entry facts:
+
+- Documented Kalshi WebSockets are for market/order/fill updates, not for
+  submitting new orders.
+- Live order placement remains REST via `POST /portfolio/events/orders` unless
+  we get Kalshi FIX access.
+- Kalshi FIX is the lower-latency order-entry path. It supports New Order
+  Single, cancel/replace, cancel, and execution reports, but likely requires
+  separate approval/credentials.
+
+Fastest practical stack without sacrificing signal quality:
+
+1. Keep Kalshi orderbook and Kraken BTC spot on WebSockets.
+2. Keep final decision based on in-memory websocket state.
+3. Keep final 1-2c hot-book reprice and visible top-quantity check.
+4. Use REST FOK order submit until FIX access exists.
+5. Use WebSocket `user_orders` / fills for confirmation and reconciliation,
+   avoiding extra hot-path REST polling.
+6. Warm/cache portfolio and risk state outside the signal-to-submit path.
+7. Preload/subscribe the next event before rollover and reduce `/markets` REST
+   refreshes to avoid 429s.
+8. Keep capture writes asynchronous; do not let storage decide whether a trade
+   gets submitted.
+
+Storage/capture plan:
+
+- Hot path:
+  - Trader keeps only in-memory websocket state plus minimal local safety state.
+  - Capture rows are put onto a nonblocking/in-process queue.
+  - If the queue backs up, low-priority raw rows should drop before trade logic
+    is slowed.
+- Warm store:
+  - Current DuckDB capture is acceptable for one/few markets because queue depth
+    is low and `capture_dropped=0`.
+  - DuckDB can briefly reject readers on Windows while the writer is flushing;
+    this is a live-inspection inconvenience, not a trading bottleneck.
+- Cold store:
+  - At day end, snapshot the live DuckDB and export completed partitions to
+    Parquet with ZSTD compression.
+  - Partition by `market_type/date/table`, for example
+    `data/cold_capture/btc15m/date=2026-05-13/ws_orderbook_top.parquet`.
+  - Keep the current day in DuckDB for simple appends/health checks; keep older
+    days in compressed Parquet for research scans.
+  - Never archive/delete a live DB segment until row counts, min/max timestamps,
+    and capture-health rows have been verified.
+- Scaling threshold:
+  - No external message queue is needed for one BTC15M market with small queue
+    depth.
+  - If we run many Kalshi markets and multiple real-time consumers, add a
+    durable bus such as Redis Streams or NATS, or move storage to ClickHouse.
+  - ClickHouse is a better long-running analytics sink than DuckDB when we need
+    continuous concurrent reads and writes across many markets.
+
+### 2026-05-13 - Pause Take-Profit Exit Rules Until More Data
+
+Decision:
+
+- Put BTC15M take-profit/early-exit deployment on hold until we have more live
+  websocket capture and more settled examples.
+- The current TP replay is too sensitive to one bad trade/path dependency, so
+  treat the 95c/97c/99c and fixed-profit exit results as exploratory only.
+- Do not deploy TP exits from the current sample without re-running on a larger
+  websocket holdout.
+
+Next-session reminder:
+
+- Revisit this after another overnight/day session of BTC15M websocket capture.
+- Re-run executable exit replay with bid-side exits, visible quantity checks,
+  entry and exit fees, and settlement audit.
+- Compare against the currently deployed hold-to-settlement RR-gated strategy,
+  not only against the no-RR baseline.
+
+### 2026-05-14 - BTC15M Apr 1-7 Predexon Deep Dive
+
+Scope:
+
+- Fixed KXBTC15M slice only: events closing from 2026-04-01 00:00 UTC through
+  2026-04-08 00:00 UTC.
+- Study split: Apr 1-4 close times. Holdout split: Apr 5-7 close times.
+- No expansion beyond the requested first seven April days.
+
+Artifacts:
+
+- Pre-registration: `docs/2026-05-14_btc15m_apr1_7_preregistration.md`.
+- Script: `scripts/research_btc15m_apr1_7_deepdive.py`.
+- Output folder:
+  `backtest_outputs/btc15m_apr1_7_deepdive_20260514_185319/`.
+- PDF report:
+  `backtest_outputs/btc15m_apr1_7_deepdive_20260514_185319/btc15m_apr1_7_deepdive_report.pdf`.
+
+Data audit:
+
+- Raw prepared Predexon rows: 613,606.
+- Deduped feature rows: 181,348 across 641 events/markets.
+- Study events: 362. Holdout events: 279.
+- Deduped 281 duplicate event/market/timestamp snapshots by keeping latest
+  sequence.
+- Quality-ok feature rows: 179,941.
+- Integrity checks passed after dedupe: zero duplicate feature timestamps per
+  event/market, zero duplicate strategy/event trades, zero trades at/after
+  close, zero PnL formula mismatches, zero bad entry prices, zero low-quality
+  trade rows.
+
+Validation result:
+
+- 32 pre-registered strategies/model variants were tested, including the
+  currently running BTC15M low-drawdown logic, a 1h-style fair-value transfer,
+  orderbook/micropressure rules, BTC-alignment rules, timing filters, liquidity
+  filters, stale-quote/spread filters, the not-applicable cross-sectional graph
+  hypothesis, and sklearn HGB/logistic/MLP models.
+- No strategy passed the full numerical gates. Every candidate failed
+  multiple-comparison significance after the permutation/Bonferroni gate.
+- Current BTC15M lowdd rule: study -$7.71 over 24 trades, holdout +$1.35 over
+  9 trades, all -$6.36 over 33 trades.
+- 1h-style fair-value transfer: study +$2.34 over 105 trades, holdout +$2.55
+  over 63 trades, all +$4.89 over 168 trades, but holdout Sharpe was below the
+  pre-registered threshold and Bonferroni-adjusted p-value was 1.0.
+- Best holdout-only exploratory candidates were `h22_tail_no_lottery`
+  (+$5.21/85 trades), `h06_tail_btc5_align` (+$4.88/56 trades),
+  `h03_liquid_cheap_tail` (+$4.08/129 trades), and `h19_ttl_6_8_tail`
+  (+$3.88/95 trades). These are not deployable from this slice because study
+  behavior was poor and statistical gates rejected them.
+
+Conclusion:
+
+- This run did not find production-ready BTC15M alpha on the requested Apr 1-7
+  slice.
+- The useful research direction is not a new live deployment; it is to
+  investigate why cheap tail/liquidity/BTC-aligned candidates flip from weak
+  study to positive holdout, then validate only on live websocket capture or on
+  a separately pre-registered Predexon period.
+
+Deployment note:
+
+- On user instruction, `scripts/btc15m_lowdd_live.py` now supports
+  `--strategy h02` / `--strategy h02_fair_value_transfer`.
+- H02 uses the same Kalshi/Kraken websocket execution engine as the prior
+  BTC15M lowdd bot, but swaps the signal to the pre-registered h02 lognormal
+  fair-value transfer: TTL 2-8m, spread <=2c, causal Kraken spot, 60m
+  close-to-close annualized vol, one-contract sizing, and a 10c post-fee edge
+  threshold. Final hot-book reprice recomputes h02 edge before submit.
+- This is a forward test, not a promoted production alpha, because the Apr 1-7
+  validation gates still had 0/32 passing strategies.
+
+### 2026-05-14 - BTC15M Apr 1-4 Alpha Loop, Fixed Apr 5-7 Validation
+
+Scope:
+
+- User explicitly rejected the first broad pass as insufficient. The follow-up
+  research loop used only the Apr 1-4 `study` rows from:
+  `backtest_outputs/btc15m_apr1_7_deepdive_20260514_185319/side_candidates.parquet`.
+- No Apr 5-7 rows were used until candidate rules had been fixed from Apr 1-4
+  study-only analysis.
+- Fixed validation then used Apr 5-7 `holdout` rows from the same prepared
+  slice. No thresholds were tuned on holdout.
+- New artifacts:
+  - `scripts/research_btc15m_apr1_4_alpha_loop.py`
+  - `scripts/research_btc15m_apr1_4_walkforward.py`
+  - `scripts/validate_btc15m_apr5_7_candidates.py`
+  - `backtest_outputs/btc15m_apr1_4_alpha_loop_latest/`
+  - `backtest_outputs/btc15m_apr1_4_walkforward_latest/`
+  - `backtest_outputs/btc15m_apr1_4_walkforward_loop3/`
+  - `backtest_outputs/btc15m_apr5_7_fixed_validation_latest/`
+
+Background data:
+
+- KXBTCD 1-hour Predexon March-April backfill was started as requested.
+- Process PID at launch/check: `21196`.
+- Command series: `scripts\download_predexon_kalshi_orderbooks.py --series KXBTCD --start 2026-03-01T00:00:00Z --end 2026-05-01T00:00:00Z --status closed --window late --late-minutes 25 --max-markets-per-event 24 --rps 1 --workers 1 --limit 200`.
+- Output root: `data\predexon_kalshi_orderbooks\series=KXBTCD`.
+- Log: `logs\predexon_kxbtcd_mar_apr_20260514_192703.out.log`.
+
+Study-only findings that failed holdout:
+
+- Early BTC5 continuation looked very strong in Apr 1-4 study:
+  - `spread<=2`, `entry .05-.80`, `visible_qty>=1`, `8<=ttl<=15`,
+    `side_btc_5m_bps>=5`, `side_mid_chg_1m>=-0.05`.
+  - Study: 103 trades, +$14.19, win 84.47%, Sharpe 3.94.
+  - Apr 1-4 leave-one-day-out selected variants were positive on every
+    internal fold.
+  - Fixed Apr 5-7 holdout failed: 58 trades, -$4.74, win 58.62%,
+    max DD -$6.25.
+- Late reversal also looked strong in Apr 1-4 study:
+  - `spread<=2`, `entry .05-.80`, `0<=ttl<=6`,
+    `side_mid_chg_3m<=-0.05`, `side_btc_1m_bps<=-2`.
+  - Study: 88 trades, +$12.45, ROP 43.61%, Sharpe 3.15.
+  - Fixed Apr 5-7 holdout failed: 48 trades, -$3.30, win 25.00%.
+- High-entry 2m pullback from loop 3 looked modestly robust inside study:
+  - `entry>=.75`, `side_mid_chg_2m<=-.01`, `3<=ttl<=10`.
+  - Study: 80 trades, +$3.62, win 90.00%.
+  - Fixed Apr 5-7 holdout failed: 38 trades, -$5.74, win 71.05%.
+- Bounded calibration/distance/RV guard failed:
+  - `spread<=2`, `entry .08-.80`, `side_fair_p .60-.95`,
+    side-distance 5-40 bps, `rv_15m/rv_60m<=1`, `fair_edge_cents -10..10`.
+  - Study with 2c adverse fill: 106 trades, +$4.05.
+  - Holdout with 2c adverse fill: 79 trades, -$5.17.
+
+Study-only findings that survived fixed Apr 5-7 holdout:
+
+- Best current candidate is fee-aware fair probability:
+  - `side_fair_p >= 0.60`
+  - `side_fair_p - entry_price - entry_fee >= 0.10`
+  - first qualifying row per event, fee-included, one contract.
+  - Study: 102 trades, +$17.08; with 2c adverse entry stress +$15.04.
+  - Holdout: 45 trades, +$5.85; with 2c adverse entry stress +$4.95.
+  - Holdout by day under 2c stress:
+    - Apr 5: 16 trades, +$1.37
+    - Apr 6: 16 trades, +$2.36
+    - Apr 7: 13 trades, +$1.22
+  - This is the first Apr 1-4-derived candidate that produced a clean fixed
+    Apr 5-7 result in the target range for a $100 one-contract bankroll.
+- Conservative high-fair-probability sibling:
+  - `side_fair_p >= 0.90`
+  - `side_fair_p - entry_price - entry_fee >= 0.05`
+  - Study with 2c stress: 41 trades, +$13.97.
+  - Holdout with 2c stress: 20 trades, +$2.09.
+  - Smaller and less smooth than the `.60/.10` gate, but it supports the same
+    calibration story.
+- Narrow high-entry/depth micropressure pocket:
+  - `side_micropressure>=.007`, `side_depth_imbalance>=.75`,
+    `entry .60-.95`, `spread<=2`, `quote_speed<=2`,
+    `visible_qty>=25`, and recent quote gap <=2s on either side.
+  - Study with 2c stress: 27 trades, +$1.69.
+  - Holdout with 2c stress: 11 trades, +$0.71.
+  - This is too small to deploy, but it may be useful as a confirmation feature.
+
+Interpretation:
+
+- Raw fair edge is not the signal. `fair_edge_cents >= 5` was strongly negative
+  in study and should not be used as a standalone rule.
+- RR-only, entry-only, distance-only, raw BTC5 continuation, and same-contract
+  pullback rules were not stable enough.
+- The most defensible structure found in this loop is calibration quality:
+  trade only when the model's side probability clears the actual executable
+  entry plus Kalshi fee by a large margin.
+- This is promising research alpha, not production-ready alpha. It still needs
+  a larger untouched Predexon period and live-websocket replay validation before
+  replacing a live bot.
+
+### 2026-05-14 - Apr 1-4 Restart, Exact Fair-Edge Result
+
+This is the corrected continuation of the Apr1-4-only restart. The first
+fixed validation above used a fee-edge formulation. A fair-value subagent then
+identified a stronger raw-cushion formulation that had not been saved as the
+canonical validation artifact yet.
+
+New reproducible artifacts:
+
+- Study-only search:
+  `scripts/research_btc15m_apr1_4_deep_structure.py`
+- Fixed Apr5-7 exact-candidate validation:
+  `scripts/validate_btc15m_apr5_7_deep_candidates.py`
+- Output:
+  `backtest_outputs/btc15m_apr1_4_deep_structure_latest/`
+- Output:
+  `backtest_outputs/btc15m_apr5_7_deep_candidates_latest/`
+
+Key data limitation discovered by the cross-surface agent:
+
+- This prepared BTC15M side-candidate parquet has exactly one market per event
+  in the Apr1-7 slice. It cannot support adjacent-strike surface, graph, or
+  cross-strike monotonicity research. Those ideas need a different event-state
+  dataset with all active strikes per timestamp.
+
+Exact Apr1-4-derived fair-edge candidates:
+
+- `F2_exact_fair_p60_edge12`:
+  `side_fair_p >= 0.60` and `fair_edge_cents >= 12`.
+- `F4_exact_no_fair_p65_edge8`:
+  `side == "no"`, `side_fair_p >= 0.65`, and `fair_edge_cents >= 8`.
+- First qualifying row per event, sorted by event, timestamp, then
+  descending `fair_edge_cents`.
+- One contract, hold to settlement, Kalshi taker entry fee included.
+
+Fixed Apr5-7 validation, with +2c adverse-entry stress:
+
+| Rule | Study trades | Study PnL | Holdout trades | Holdout PnL | Holdout win | Holdout max DD | Holdout Sharpe |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `F2_exact_fair_p60_edge12` | 94 | +16.13 | 33 | +5.71 | 66.7% | -1.54 | 1.76 |
+| `F4_exact_no_fair_p65_edge8` | 83 | +12.35 | 27 | +5.68 | 77.8% | -1.09 | 2.00 |
+| `F3_exact_fair_p90_edge5` | 41 | +13.97 | 20 | +2.09 | 80.0% | -1.50 | 0.78 |
+| `F5_filtered_fair_p60_edge12_spread2` | 79 | +5.22 | 28 | +1.43 | 60.7% | -1.42 | 0.53 |
+| `M3_A_or_B_composite` | 90 | +14.68 | 26 | -0.80 | 69.2% | -3.39 | -0.35 |
+| `M4_broad_micropressure` | 116 | +10.39 | 62 | +0.06 | 79.0% | -2.23 | 0.02 |
+
+Apr5-7 day breakdown for `F2_exact_fair_p60_edge12`, +2c stress:
+
+- Apr 5: 9 trades, +3.15
+- Apr 6: 13 trades, +2.38
+- Apr 7: 11 trades, +0.18
+
+Apr5-7 day breakdown for `F4_exact_no_fair_p65_edge8`, +2c stress:
+
+- Apr 5: 11 trades, +2.20
+- Apr 6: 9 trades, +2.06
+- Apr 7: 7 trades, +1.42
+
+FOK/reprice realism, Apr5-7, next quote within 2s and no worse than +2c:
+
+| Rule | Signals | Filled | Fill rate | Next-quote PnL |
+|---|---:|---:|---:|---:|
+| `F2_exact_fair_p60_edge12` | 33 | 19 | 57.6% | +2.68 |
+| `F4_exact_no_fair_p65_edge8` | 27 | 16 | 59.3% | +0.21 |
+| `F5_filtered_fair_p60_edge12_spread2` | 28 | 23 | 82.1% | +1.83 |
+| `M4_broad_micropressure` | 62 | 52 | 83.9% | +1.84 |
+| `M3_A_or_B_composite` | 26 | 18 | 69.2% | +1.30 |
+
+Statistical sanity checks for the exact fair-edge candidates:
+
+- `F2_exact_fair_p60_edge12`, Apr5-7 +2c stress:
+  selected side +5.71, same-timestamp opposite side -3.95,
+  edge versus opposite +9.66.
+- Day-matched random event-side bootstrap for `F2`, Apr5-7:
+  null mean -1.61, null 95th percentile +2.70,
+  null 99th percentile +4.20, empirical `p_ge = 0.0020`.
+- `F4_exact_no_fair_p65_edge8`, Apr5-7 +2c stress:
+  selected side +5.68, same-timestamp opposite side -3.40,
+  bootstrap `p_ge = 0.0015`.
+
+Interpretation:
+
+- The best currently found BTC15M structure from this constrained process is
+  not path momentum and not standalone micropressure. It is a calibrated
+  fair-value edge: the fair probability must clear the quoted entry by a large
+  raw cushion.
+- The exact rule includes wide-spread quotes. This is not automatically
+  non-executable because the simulated fill pays the visible ask, but it is a
+  red flag for live realism. The spread-filtered version is still positive but
+  materially weaker.
+- Do not tune this rule on Apr5-7. The next valid action is to freeze the exact
+  rule and evaluate on a separate, untouched live-websocket or later Predexon
+  period.
+
+### 2026-05-14 - F2 Exact Rule on Live Websocket Holdout
+
+User asked to test the only meaningful Apr1-4 candidate, F2, on the live
+websocket holdout through "right now".
+
+Artifact:
+
+- Script: `scripts/backtest_btc15m_f2_live_ws_holdout.py`
+- Output: `backtest_outputs/btc15m_f2_live_ws_20260514_223601/`
+
+Frozen rule:
+
+- `F2_exact_fair_p60_edge12`
+- `side_fair_p >= 0.60`
+- `fair_edge_cents >= 12`
+- First qualifying trade per event.
+- One contract, hold to settlement, Kalshi taker entry fee included.
+
+Data:
+
+- Source: local live websocket capture
+  `C:\Users\ahmed\.btc_kalshi_bot\btc15m_live_capture.duckdb`.
+- Capture rows: 5,169,827 BTC15M top-of-book rows and 73,311 Coinbase ticker
+  rows.
+- Window: 2026-05-12 10:42:45 UTC through 2026-05-15 04:36:00 UTC.
+- Metadata markets: 249.
+- Official determined results captured for only 53 markets, so the broad
+  replay uses Coinbase-at-close proxy results; official subset is reported
+  separately.
+- Proxy-vs-official check on F2 trades with both labels:
+  23/24 matches, 1 mismatch, 95.83% match rate.
+
+Results:
+
+| Result mode | Trades | PnL | Win | Max DD | Sharpe |
+|---|---:|---:|---:|---:|---:|
+| Coinbase proxy, no slip | 128 | -9.07 | 51.6% | -11.11 | -1.61 |
+| Coinbase proxy, +2c stress | 128 | -11.63 | 51.6% | -13.47 | -2.07 |
+| Official subset, no slip | 24 | -0.53 | 58.3% | -2.96 | -0.22 |
+| Official subset, +2c stress | 24 | -1.01 | 58.3% | -3.08 | -0.42 |
+| Same-timestamp opposite side, proxy +2c | 128 | -0.68 | n/a | -5.52 | -0.12 |
+
+Daily proxy +2c:
+
+| Day | Trades | PnL | Win | Max DD |
+|---|---:|---:|---:|---:|
+| 2026-05-12 | 29 | -6.03 | 41.4% | -7.32 |
+| 2026-05-13 | 47 | -2.32 | 57.4% | -3.70 |
+| 2026-05-14 | 44 | -3.53 | 50.0% | -4.42 |
+| 2026-05-15 | 8 | +0.25 | 62.5% | -1.10 |
+
+Diagnostics:
+
+- Removing near-strike proxy outcomes (`abs(close_spot - strike) <= $10`) did
+  not fix it: 113 trades, -10.58 under +2c.
+- Restricting the already-selected F2 trades to spread <=2c did not fix it:
+  97 trades, -10.27 under +2c.
+- YES trades: 42 trades, -5.64 under +2c.
+- NO trades: 86 trades, -5.99 under +2c.
+- Main loss bucket was 1-2c spread trades, not the very wide quotes.
+
+Interpretation:
+
+- F2 was promising on Apr1-7 Predexon but failed the later live websocket
+  holdout. Treat F2 as a rejected standalone deployment candidate unless a
+  new, pre-registered explanation is found and validated on future untouched
+  websocket data.
+- This is an important negative result because the live websocket replay is the
+  most faithful dataset we have.
+### 2026-05-15 - Resume, Older Predexon Backfill, and Live-Risk Diagnostics
+
+Context:
+
+- Machine had restarted; BTC1H and BTC15M live scripts were resumed before this
+  entry.
+- Active live processes at this checkpoint:
+  - BTC1H: `.codex_work\run_btc_1hr_late_only_loss_guard_live.py`, PID 14396.
+  - BTC15M: `.codex_work\run_btc15m_lowdd_live.py`, PID 23572.
+- Both processes had established websocket/TLS connections and active capture
+  writes under `C:\Users\ahmed\.btc_kalshi_bot`.
+
+Data backfill:
+
+- Stopped a duplicate KXBTCD Predexon March/April resume job because March and
+  April already had useful Predexon KXBTCD coverage and it was mostly
+  `skipped_exists`.
+- Added `scripts/fetch_kalshi_market_manifest.py` for Kalshi market manifest
+  pulls. This was useful for discovery, but direct paginated historical-series
+  crawl caused temporary Kalshi 429s, so the high-rate crawl was stopped.
+- Added `.codex_work\predexon_backfill_queue_20260515.py`:
+  - Uses existing BTC15M Predexon market metadata covering Jan-Mar.
+  - Builds missing KXBTCD Jan 7-Feb 28 event manifests by direct
+    `/historical/markets?event_ticker=...` calls.
+  - Then sequentially runs Predexon at 1 request/sec so the single free API slot
+    is not contended.
+- Predexon historical orderbooks start around 2026-01-07, so Dec 2025 is not a
+  viable Predexon orderbook target.
+- Queue log at launch:
+  `logs\predexon_old_queue_event_20260515_051401.out.log`.
+
+Subagent findings:
+
+- BTC1H researcher:
+  - Current 1h live wrapper still uses the original `research` fair-value model
+    with risk guards.
+  - Existing evidence suggests side-specific error: YES-only looked stronger
+    than NO-only on prior Predexon 1h tests, while the live ledger is mostly NO.
+  - Proposed tests: NO-side calibration, volatility prior changes, market
+    shrink, BRTI dampening, TTL-bucket calibration, and event freshness gates.
+- BTC15M researcher:
+  - Live BTC15M is not simply low win-rate. The failure is payoff geometry:
+    target-win sizing buys too many contracts at high entries.
+  - Ledger sample: high-entry `70-90c` bucket had high win rate but strongly
+    negative PnL because one miss erased several capped wins.
+  - Also flagged same-event FOK chase behavior and late lower-TTL losses.
+- Data engineer:
+  - Predexon market discovery has no date filter; use Kalshi official market
+    metadata for ticker discovery, then Predexon only for orderbook snapshots.
+  - `--no-write-levels` saves disk/serialization but does not reduce request
+    count. Keeping levels is useful for future depth research when storage is
+    acceptable.
+- ML researcher:
+  - Added `scripts/prototype_btc_ml_candidates.py`.
+  - Added `docs/2026-05-15_ml_researcher_d_btc_ml_candidates.md`.
+  - Recommended queue: tabular GBDT, regularized logistic calibrator, then tiny
+    MLP only if the first two survive clean validation. Sequence models wait
+    until causally ordered state sequences are built.
+
+Focused BTC15M risk replay:
+
+- Script:
+  `.codex_work\risk_control_20260513\backtest_btc15m_safety_overlays.py`
+- Output:
+  `backtest_outputs\btc15m_safety_latest_20260515_051727\`
+- Data:
+  Snapshot of current `btc15m_live_capture.duckdb`, settled events only, real
+  fees, one event-level candidate stream, policies fixed before this run.
+- Important rows:
+  - Current target-win, entry<=80c, no stop: 87 trades, 52 wins, 35 losses,
+    `-$12.54`, max DD `-$59.39`, avg 8.97 contracts, worst trade `-$12.98`.
+  - `RR>=0.33`, entry<=60c, target-win: 55 trades, `+$39.99`, max DD
+    `-$11.44`, but still large contract counts.
+  - Loss-cap safer candidates:
+    - `safe_loss2_entry65_rr33_daily5_2loss`: 24 trades, `+$20.68`, max DD
+      `-$4.16`, worst trade `-$2.00`.
+    - `safe_loss1_entry65_rr33_daily5_2loss`: 24 trades, `+$7.60`, max DD
+      `-$2.27`, worst trade `-$0.89`.
+- Interpretation:
+  - The most robust immediate BTC15M improvement is not a new alpha signal; it
+    is replacing target-win sizing with max-loss sizing plus entry/RR gates.
+  - Do not deploy target-win sizing at higher bankroll. It is exactly the
+    failure mode that created recent live drawdown.
+
+Focused BTC1H core-model research:
+
+- Script:
+  `scripts\core_model_research.py`
+- Output:
+  `backtest_outputs\core_model_focus_20260515_051558\`
+- Split:
+  - Train before 2026-04-01 UTC.
+  - Validation Apr 1-20.
+  - Test Apr 21 onward.
+  - Websocket capture was not used to rank variants.
+- Best focused historical variants:
+  - `brti_065`: 106 trades, all `+$8.08`, test `+$5.78`, validation `+$1.75`,
+    all win rate 76.4%, max DD `-$2.68`.
+  - `ewma60_logn_blend`: 21 trades, all `+$4.10`, test `+$2.82`, all win rate
+    85.7%, max DD `-$0.84`.
+  - Baseline current model: 38 trades, all `+$3.33`, test `+$2.24`, all win
+    rate 76.3%, max DD `-$1.39`.
+- Interpretation:
+  - `brti_065` is a promising 1h fair-value candidate because it increases
+    trade count and test PnL versus baseline, but it is still historical-candle
+    evidence and must get a websocket counterfactual replay before deployment.
+  - `ewma60_logn_blend` is lower-capacity but cleaner drawdown. It is worth
+    replaying on future websocket data.
+
+Current next steps:
+
+1. Let the Jan-Feb KXBTCD and Jan-Mar BTC15M Predexon queue continue.
+2. Once older data is available, rerun BTC1H `brti_065` and BTC15M loss-cap
+   policies on the larger Predexon set.
+3. Before changing the live 1h fair-value model, build a websocket
+   counterfactual replay for `brti_065` and `ewma60_logn_blend`.
+4. For BTC15M, the deployment candidate to test next is max-loss sizing
+   (`$1-$2` risk cap), `entry<=0.60-0.65`, `RR>=0.33`, no target-win sizing.
+
+### 2026-05-15 - BTC15M Rejection, Capture-Only Pause, and 1H Candidate Gate
+
+State change:
+
+- BTC1H live remained running:
+  `.codex_work\run_btc_1hr_late_only_loss_guard_live.py`, PID 14396.
+- BTC15M live trader was stopped after the target-win strategy failed broad
+  validation. It was replaced with capture-only:
+  `python -u scripts\btc15m_live_capture.py --refresh-sec 10 --health-sec 30`,
+  PID 3768 at this checkpoint.
+- This preserves the BTC15M websocket dataset without submitting more orders
+  from the rejected lowdd target-win strategy.
+- Predexon old-data queue remained running and was scoped correctly:
+  KXBTCD Jan 7-Feb 28 only; KXBTC15M Jan 7-Mar 31.
+- KXBTCD Jan-Feb manifest completed with 88,139 market rows across 1,188
+  events:
+  `data\predexon_kalshi_orderbooks\market_manifests\kxbtcd_20260107_20260301.parquet`.
+- Patched `scripts\download_predexon_kalshi_orderbooks.py` so local manifests
+  that already include `market_ticker` do not collide with raw Kalshi `ticker`
+  during normalization.
+- Restarted top-only old-data queue:
+  `logs\predexon_old_queue_toponly_20260515_055016.out.log`.
+  It is running at 1 request/sec with `--no-write-levels`.
+
+BTC15M target-win postmortem:
+
+- Latest settled websocket replay:
+  `backtest_outputs\btc15m_safety_latest_20260515_051727\candidate_stream_settled.csv`
+  had 42,192 settled candidate rows across 87 settled events, with capture
+  health showing 5,689,160 top-book rows, 78,822 BTC ticks, and
+  `capture_dropped=0`.
+- Current target-win baseline:
+  87 trades, 52 wins, 35 losses, `-$12.54`, max DD `-$59.39`.
+- The high-entry tail is fatal:
+  `70-80c` entries went roughly 22/33 wins in live replay but lost about
+  `-$64` under target-win sizing because a single miss loses around `$12`
+  while winners are capped near `$3`.
+- Broad April Predexon check rejected the same structure:
+  current-like target-win rules were materially negative across April, even when
+  RR and entry caps improved the recent live slice.
+- Conclusion:
+  the lowdd BTC15M signal is not approved for live trading. Loss-cap sizing can
+  make recent websocket replay look survivable, but that is risk control, not
+  proven alpha. Keep collecting BTC15M data and do not redeploy target-win.
+
+BTC15M Apr1-4 research candidates:
+
+- Apr1-4 study-only candidates produced apparently strong patterns:
+  `A_early_btc5_momentum_confirmed`, `B_mid_ttl_micropressure_depth`,
+  `C_late_reversal_after_contract_drop`, and combined `ABC_priority`.
+- Apr5-7 frozen validation narrowed the only still-interesting family to
+  fair-value edge:
+  - `F2_exact_fair_p60_edge12`: holdout 33 trades, `+$6.37`, 2c-stressed
+    `+$5.71`, win 66.7%, max DD 2c `-$1.54`.
+  - `F4_exact_no_fair_p65_edge8`: holdout 27 trades, `+$6.21`,
+    2c-stressed `+$5.68`, win 77.8%, max DD 2c `-$1.09`.
+- But F2 failed local websocket replay:
+  `backtest_outputs\btc15m_f2_live_ws_20260514_223601\f2_live_ws_summary.csv`
+  showed official subset 24 trades, `-$0.53` raw / `-$1.01` with 2c stress,
+  and proxy full replay 128 trades, `-$9.07` raw / `-$11.63` with 2c stress.
+- Conclusion:
+  F2/F4 remain research-only; they are not deployable until a new variant
+  survives live websocket replay.
+
+BTC15M ML candidates:
+
+- `backtest_outputs\btc15m_april_top_models_20260514_clean\` trained on the
+  requested chronological April 75/12.5/12.5 split.
+- XGBoost and LightGBM were positive but tiny on the final test:
+  - LightGBM: test 6 trades, `+$0.92`, 2c-stressed `+$0.80`, win 83.3%.
+  - XGBoost: test 8 trades, `+$1.14`, 2c-stressed `+$0.98`, win 87.5%.
+- MLP failed final test:
+  26 trades, `-$5.29`, 2c-stressed `-$5.81`, win 42.3%.
+- Conclusion:
+  XGBoost/LightGBM are eligible only for paper shadow/live websocket holdout.
+  MLP is rejected.
+- Added `scripts\backtest_btc15m_ml_live_ws_holdout.py` to score the frozen
+  April XGBoost/LightGBM models on causal BTC15M websocket capture.
+- Bounded May 15 live replay:
+  `python -u scripts\backtest_btc15m_ml_live_ws_holdout.py --start 2026-05-15T00:00:00Z --end 2026-05-15T11:45:00Z --out backtest_outputs\btc15m_ml_live_ws_may15_smoke_20260515_0605`
+  - XGBoost: 8 trades, raw `+$0.20`, 2c-stressed `+$0.04`, win 75%,
+    max DD 2c `-$1.23`.
+  - LightGBM: 0 trades under its frozen April validation gate.
+- Interpretation:
+  XGBoost is not rejected by this small live slice, but the edge is effectively
+  flat after execution stress. It remains a paper-shadow candidate only.
+
+BTC1H observed-decision gate:
+
+- Ran:
+  `python -u scripts\core_model_observed_decision_gate.py --scorecard backtest_outputs\core_model_focus_20260515_051558\core_model_scorecard.csv --output-dir backtest_outputs\core_model_observed_gate_20260515_0600`
+- This is not a full counterfactual replay. It recomputes finalist model gates
+  on observed captured/ledger decisions.
+- Results weakened the historical `brti_065` story:
+  `brti_065` had 24 capture-passed trades for `+$1.66`, but live-only passed
+  was only 15 trades for `+$0.25`, and recent ledger-passed actual was
+  `-$2.91`.
+- Cleaner observed gates:
+  - `ewma60_logn_blend`: capture-passed 12 trades, `+$2.70`; live-only passed
+    7 trades, `+$0.92`; zero recent ledger-passed trades.
+  - `blend_85_15_rv60`: capture-passed 14 trades, `+$3.23`; live-only passed
+    8 trades, `+$1.21`; recent ledger-passed `-$0.12`.
+  - `rv_down60_blend`: capture-passed 14 trades, `+$3.18`; live-only passed
+    7 trades, `+$0.75`; recent ledger-passed `+$0.31` on one trade.
+- Conclusion:
+  do not deploy `brti_065` from historical results alone. The next 1h work item
+  is a true websocket counterfactual replay for `ewma60_logn_blend`,
+  `blend_85_15_rv60`, `rv_down60_blend`, and baseline.
+- Added `scripts\replay_btc1h_core_ws_counterfactual.py` for a true KXBTCD
+  websocket counterfactual replay. It streams top rows by `received_at_ns`,
+  uses causal BTC as-of data, reconstructs close/strike from tickers, and
+  evaluates baseline plus core model variants.
+- Smoke compile and tiny replay passed, but a multi-day dense run over
+  `live_capture_gapless_20260512_paused.duckdb` was too slow and hit the
+  foreground timeout before output. Before relying on this routinely, optimize
+  by event/window pruning and vectorizing the variant scan.
+
+Data-fidelity notes:
+
+- Existing Predexon/live BTC15M overlap:
+  `backtest_outputs\btc15m_predexon_ws_overlap_20260514_181535`.
+- Overlap window was 2026-05-12 10:42:45 UTC to 22:29:02 UTC, 11 common
+  events/markets.
+- Predexon quote alignment to local websocket was close at snapshot times
+  (median age about 0.055s, p95 about 2.956s), but dense local websocket data
+  had many more intervening states. Use Predexon for broad research, not final
+  promotion.
+
+2026-05-15 BTC15M April multisplit fair-value rejection:
+
+- Added `scripts\research_btc15m_april_multisplit_search.py`.
+- Data:
+  `backtest_outputs\predexon_btc15m_april_execution_20260514_182852\features_snapshot_level.parquet`
+  plus `data\btc15m_historical_datamart\spot_1m.parquet`.
+- Pre-registered 1,237 causal rules before scoring:
+  fair-value grids, microstructure pressure grids, path/BTC regimes, and
+  fair+book-pressure combinations.
+- Splits:
+  Apr 1-4 study, Apr 5-7 validation 1, Apr 8-14 validation 2,
+  Apr 15-30 final April holdout. All PnL below includes taker fees and 2c
+  adverse-entry stress, first signal per event.
+- Output:
+  `backtest_outputs\btc15m_april_multisplit_search_20260515`.
+- Top April-selected candidate:
+  `fair_fp60_edge12_ttl5-12_sp2_e2-60`
+  (`side_fair_p >= 0.60`, fee-adjusted fair edge `>= 12c`, TTL 5-12m,
+  spread `<= 2c`, entry `2c-60c`).
+  It passed April selection windows:
+  48 trades `+$2.39` on Apr 1-4, 15 trades `+$2.61` on Apr 5-7,
+  33 trades `+$4.48` on Apr 8-14, and remained only mildly positive on
+  Apr 15-30 with 183 trades `+$2.54`.
+- Parameterized `scripts\backtest_btc15m_f2_live_ws_holdout.py` so frozen
+  fair-value rules can be replayed on websocket capture without duplicating
+  replay logic.
+- Live websocket promotion gate rejected the top candidate:
+  `backtest_outputs\btc15m_fair_ttl5_12_live_ws_20260515`.
+  On local websocket capture 2026-05-12 10:42:45 UTC to
+  2026-05-15 22:28:25 UTC, it produced 86 proxy-settled trades for
+  `-$9.27` at 2c stress, win rate 46.5%, max DD `-$11.24`.
+  Official-result subset was 24 trades for `-$3.75`, win rate 41.7%.
+- Replayed all 107 April-selected fair-value variants on the same websocket
+  holdout:
+  `backtest_outputs\btc15m_april_selected_fair_live_ws_20260515`.
+  The best proxy variant was only `+$0.37` and was `-$3.44` on official
+  subset; most variants were negative.
+- Conclusion:
+  the Predexon fair-value family is useful for generating hypotheses, but the
+  live websocket holdout rejects it as deployable BTC15M alpha. Do not deploy
+  `fair_fp60_edge12_ttl5-12_sp2_e2-60`, broad F2, or neighboring fair-value
+  variants without a new causal explanation that also survives websocket
+  capture.
+
+2026-05-15 BTC15M F2 robust-sizing and transfer audit:
+
+- Rechecked the April-selected F2/fair-value candidate
+  `fair_fp60_edge12_ttl5-12_sp2_e2-60` on Apr 1-14 with robust sizing:
+  `backtest_outputs\btc15m_f2_robust_apr1_14_20260515\summary.csv`.
+  One contract was 96 trades, 62.5% win, `+$11.40`, max DD `-$2.54`.
+  Loss-cap `$1` was `+$15.18`, max DD `-$4.00`. Loss-cap `$2` was
+  `+$37.91`, max DD `-$9.62`. Daily-stop variants reduced drawdown but
+  cut trade count roughly in half.
+- Rechecked the current BTC15M lowdd/target-win signal stream on Apr 1-14
+  with the same robust sizing:
+  `backtest_outputs\btc15m_robust_sizing_apr1_14_20260515\summary.csv`.
+  Baseline current one-contract was 54 trades, 29.6% win, `-$11.62`,
+  max DD `-$11.62`. Baseline current target-win sizing was `-$88.04`,
+  max DD `-$85.29`. The best robust filtered one-contract variant
+  (`entry_le65_side_move_18_30c_btc_lt8`) was still slightly negative:
+  14 trades, 42.9% win, `-$0.61`, max DD `-$1.96`.
+- Independent audit conclusion:
+  the F2 predicate is equivalent between April Predexon and live websocket
+  replay. Same fair probability, fair-edge, TTL, spread, and entry gates; no
+  direct signal lookahead found; fee, side mapping, visible top-ask entry, and
+  first-signal-per-event behavior match for inspected artifacts.
+- Important caveats:
+  `scripts\research_btc15m_april_multisplit_search.py` ranked candidates with
+  a score that includes a holdout penalty, so `top30_rules.csv` is not a pure
+  pre-holdout ranking artifact. `passes_selection` itself still uses study +
+  validation splits. Live F2 replay is mostly proxy-settled: only 24/86 trades
+  had official result messages, and proxy-vs-official matched 22/24.
+- Diagnostic summary:
+  `backtest_outputs\btc15m_f2_diagnostics_20260515\`.
+  Apr1-14 F2: 96 trades, 62.5% win, `+$9.48` with 2c stress.
+  Apr15-30 F2: 183 trades, 55.2% win, `+$2.54` with 2c stress.
+  May live-WS F2: 86 trades, 46.5% win, `-$9.27` with 2c stress.
+  May live-WS selected trades were more marginal: average entry about 53.3c,
+  lower visible top quantity, and average fair-edge margin about 13.6c versus
+  about 18.4c on Apr1-14.
+- Decision:
+  F2 is not deployable. The current lowdd signal is also not rescued by simple
+  robust sizing on Apr1-14. The next viable path is not more raw fair-value
+  threshold grids; it is either a calibrated tabular model/regime detector that
+  treats fair value as one feature, or a genuinely live-validated
+  execution-quality filter collected after rules are frozen.
+- Follow-up strict-gate test:
+  a post-filter diagnostic suggested `fair_p>=65%`, `edge>=12c`,
+  `entry<=55c`, `visible_qty>=50` might remove bad F2 rows, but exact replay
+  rejected it.
+  - Exact live websocket replay:
+    `backtest_outputs\btc15m_fair_fp65_edge12_entry55_q50_live_ws_20260515`.
+
+2026-05-15/16 BTC15M F2 refreshed robust transfer check:
+
+- Reran the exact April-selected F2 rule on Apr 1-14 using the robust execution
+  rules requested:
+  `backtest_outputs\btc15m_f2_robust_apr1_14_20260515_204801`.
+  Rule: `side_fair_p>=0.60`, `fair_edge_cents>=12`, TTL `5-12m`,
+  spread `<=2c`, entry `2c-60c`, first signal per event, top-ask taker fill,
+  visible top-quantity cap, Kalshi taker fee, official settlement labels.
+  One-contract was 96 trades, `+$11.40`, 62.5% win, max DD `-$2.54`,
+  Sharpe `2.43`; with `+2c` adverse-entry stress it was `+$9.48`, max DD
+  `-$2.70`, Sharpe `2.02`.
+- Refreshed exact F2 on live BTC15M websocket capture through
+  `2026-05-16 02:51:55 UTC`:
+  `backtest_outputs\btc15m_f2_exact_live_ws_refresh_20260515_205154`.
+  The exact F2 still fails on live replay: 101 proxy-settled trades,
+  `-$9.46` with `+2c` stress, 47.5% win, max DD `-$11.36`; official subset
+  was 25 trades, `-$3.33`, 44.0% win, max DD `-$4.12`.
+- Added reusable transfer diagnostic:
+  `scripts\analyze_btc15m_f2_transfer.py`.
+  Output: `backtest_outputs\btc15m_f2_transfer_diagnostics_20260515_205531`.
+  It compares Apr1-14, Apr15-30, and refreshed WS holdout without tuning on
+  WS. Base F2 deteriorates across samples:
+  Apr1-14 `+$9.48`, Apr15-30 `+$2.54`, WS `-$9.46`.
+- The most interesting fixed subset is
+  `ttl_10_12_entry_le55_q50`: TTL `10-12m`, entry `<=55c`, visible top qty
+  `>=50`. Results with `+2c` stress:
+  Apr1-14: 16 trades, `+$6.02`, 87.5% win, max DD `-$0.53`.
+  Apr15-30: 25 trades, `+$3.24`, 64.0% win, max DD `-$2.10`.
+  Refreshed WS proxy: 16 trades, `+$3.65`, 75.0% win, max DD `-$0.59`.
+  Refreshed WS official subset: 3 trades, `+$1.38`, 100% win.
+- Streak analysis was not robust enough to use as a live rule:
+  Apr1-14 improved after 2+ losses, Apr15-30 worsened after 2+ losses, and
+  WS also worsened after 2+ losses. Loss/win streak itself is therefore a weak
+  state variable. The real repeatable clue is time-to-close/execution quality:
+  the 8-10m TTL bucket failed across Apr15-30 and WS, while 10-12m held up.
+- Current decision:
+  do not deploy broad F2. Freeze `ttl_10_12_entry_le55_q50` as a candidate for
+  future websocket-forward validation only. It is promising because it survived
+  Apr1-14, Apr15-30, and refreshed WS, but sample size is still too small for a
+  production swap.
+
+2026-05-15 operational note:
+
+- Restarted the BTC1H `high_conf_80` paper shadow after the empty-event refresh
+  patch so future forward-validation capture uses current code.
+  Process: `scripts\btc_1hr_high_conf80_shadow.py`, PID `19736`.
+  Log: `logs\btc_1hr_high_conf80_shadow_20260515_205645.out.log`.
+  It started in paper mode, `signal_strategy=high_conf_80`, `contracts=1`,
+  `shadow_bankroll=$100`, separate capture DB
+  `C:\Users\ahmed\.btc_kalshi_bot\btc_1hr_high_conf80_shadow_capture.duckdb`.
+
+2026-05-15 BTC15M forward-validation setup:
+
+- Patched `scripts\btc15m_lowdd_live.py` so the H02/fair-value path supports
+  exact frozen-candidate gates:
+  `BTC15M_H02_MIN_SIDE_PROB` and `BTC15M_H02_MIN_VISIBLE_QTY`.
+- Added `scripts\btc15m_f2_ttl10_12_shadow.py`, a dry-run-only wrapper for
+  the frozen candidate:
+  `side_fair_p>=0.60`, fair edge after fee `>=12c`, TTL `10-12m`,
+  spread `<=2c`, entry `2c-55c`, visible top qty `>=50`, one max contract.
+  It uses isolated DBs:
+  `C:\Users\ahmed\.btc_kalshi_bot\btc15m_f2_ttl10_12_shadow_capture.duckdb`
+  and
+  `C:\Users\ahmed\.btc_kalshi_bot\btc15m_f2_ttl10_12_shadow_trades.db`.
+- Started the BTC15M F2 TTL 10-12 shadow as PID `4196`.
+  Log: `logs\btc15m_f2_ttl10_12_shadow_20260515_210157.out.log`.
+  It is `mode=dry-run`; it cannot submit orders.
+- Added `scripts\test_btc15m_shadow_config.py`; validation:
+  `python -m pytest scripts\test_btc15m_shadow_config.py -q --basetemp .pytest-codex-tmp`
+  passed `3 passed`. The test checks exact env gates, dry-run wrapper text,
+  and that the live H02 signal builder rejects visible top quantity below 50.
+- Patched `.codex_work\predexon_backfill_queue_20260515.py` so the future
+  KXBTC15M Jan-Mar Predexon step uses `--write-levels`, because the candidate
+  needs level-0 visible quantity. Restarted the Predexon queue as PID `15964`
+  with child PID `24040`. It is still working through/resuming KXBTCD first.
+    59 proxy-settled trades, `-$5.76` with 2c stress, 47.5% win, max DD
+    `-$6.61`; official subset 14 trades, `-$3.03`.
+  - Exact April replay:
+    `backtest_outputs\btc15m_fair_fp65_edge12_entry55_q50_april_exact_20260515`.
+    Apr1-4 `+$2.98`, Apr5-7 `+$2.21`, Apr8-14 `+$0.88`, but Apr15-30
+    `-$1.14`.
+  - Reason for rejection:
+    filtering already-selected F2 first hits was a selection artifact. The
+    actual stricter rule chooses different first qualifying states and fails
+    both April holdout and live websocket.
+
+2026-05-15 BTC15M live-compatible ML candidate audit:
+
+- Replayed the existing April-trained models on daily websocket slices rather
+  than one giant dense run, to avoid memory issues:
+  `backtest_outputs\btc15m_ml_comparison_ws_agg_20260515\aggregate_summary.csv`.
+- Original April XGBoost (`backtest_outputs\btc15m_april_top_models_20260514_clean`):
+  - April validation/test evidence was small but positive: validation 21
+    trades `+$2.01` under 2c stress, test 8 trades `+$0.98`.
+  - May 12-15 websocket diagnostic: 31 trades, 80.6% win, `+$2.06` under
+    2c stress; 3/4 days positive, worst day `-$0.20`.
+  - Feature audit:
+    `backtest_outputs\btc15m_ml_feature_audit_20260515\summary.csv`.
+    Only 4/67 features were missing from live reconstruction; XGBoost placed
+    about 2.6% of split importance on those missing features. This is much
+    cleaner than LightGBM.
+- Original April LightGBM:
+  - May 12-15 websocket diagnostic: 10 trades, `+$1.39` under 2c stress.
+  - Rejected as less trustworthy because it placed about 18% of split
+    importance on live-missing features (`rv_15m`, `rv_ratio_15_60`, and full
+    depth fields).
+- Added live-compatible training mode to `scripts\train_btc15m_april_top_models.py`:
+  - `--live-compatible-only` drops features not reconstructed in live websocket
+    replay.
+  - Added `logistic_calibrator` as a regularized baseline.
+- Live-compatible model artifact:
+  `backtest_outputs\btc15m_live_compatible_models_20260515`.
+  - Live-compatible XGBoost validation: 12 trades, `+$2.71` under 2c stress.
+  - Live-compatible XGBoost April final test: only 1 trade, `+$0.20` under
+    2c stress. This is too low-capacity for promotion.
+  - Logistic calibrator failed April test: 30 trades, `-$2.25` under 2c stress.
+- Live-compatible May websocket diagnostic:
+  `backtest_outputs\btc15m_ml_comparison_ws_agg_20260515\aggregate_summary.csv`.
+  - XGBoost: 26 trades, 76.9% win, `+$0.80` under 2c stress, positive on all
+    four May days.
+  - Logistic: 192 trades, 56.3% win, `-$14.38` under 2c stress. Rejected.
+- Decision:
+  the only BTC15M candidate that did not immediately fail live websocket replay
+  is the live-compatible XGBoost, but it is not deployable because April final
+  test capacity was only one trade and the May websocket data has already been
+  inspected. It is eligible for paper-shadow or a frozen future websocket
+  holdout only. Do not tune thresholds on May 12-15.
+- Holdout freeze:
+  created `docs\2026-05-15_btc15m_future_holdout_freeze.md` at
+  2026-05-15T23:36:03Z. From that timestamp forward, newly collected BTC15M
+  websocket data may be used as a clean future holdout for the frozen
+  live-compatible XGBoost candidate. Do not change model/gate/features/sizing
+  before that evaluation.
+
+2026-05-15 BTC1H core-model websocket counterfactual replay:
+
+- Patched `scripts\replay_btc1h_core_ws_counterfactual.py` to make the replay
+  usable on the dense live capture:
+  - It now prunes each event to the causal decision window
+    `close-20m <= receive_time <= close-5m` instead of scanning every KXBTCD row.
+  - It seeds the event book from rows at or before the decision window start,
+    bounded to the current hourly event, so the orderbook state remains causal.
+  - It still applies every top-of-book update to state, but evaluates the model
+    at an explicit `--scan-stride-sec` cadence. This avoids pretending we can
+    recompute 188-strike fair values tens of thousands of times per event.
+- Data:
+  `data\live_capture_gapless\live_capture_gapless_20260512_paused.duckdb`,
+  table `ws_orderbook_top_dedup`, KXBTCD events from
+  2026-05-06T01:40:00Z through 2026-05-12T23:55:00Z.
+  One missing captured settlement,
+  `KXBTCD-26MAY0800-T79599.99`, was patched from public Kalshi as `NO`.
+- Outputs:
+  - 1s stride:
+    `backtest_outputs\btc1h_core_ws_counterfactual_fast_20260515`.
+  - 5s stride:
+    `backtest_outputs\btc1h_core_ws_counterfactual_fast_stride5_20260515`.
+  - 10s stride:
+    `backtest_outputs\btc1h_core_ws_counterfactual_fast_stride10_20260515`.
+  - 15s stride:
+    `backtest_outputs\btc1h_core_ws_counterfactual_fast_stride15_20260515`.
+  - 20s stride:
+    `backtest_outputs\btc1h_core_ws_counterfactual_fast_stride20_20260515`.
+  - 30s stride:
+    `backtest_outputs\btc1h_core_ws_counterfactual_fast_stride30_20260515`.
+  - Consolidated table:
+    `backtest_outputs\btc1h_core_ws_counterfactual_stride_sweep_20260515.csv`.
+- Public-patched results, one contract, all fees included:
+
+```
+stride  variant                  trades  pnl    win%   maxDD  sharpe
+1s      baseline_emp70_logn_rv60 65      -1.08  58.5%  -4.50  -0.28
+1s      ewma60_logn_blend        64      -3.44  54.7%  -5.90  -0.89
+1s      blend_85_15_rv60         69      -3.35  58.0%  -6.09  -0.84
+1s      rv_down60_blend          69      -2.74  56.5%  -5.88  -0.69
+1s      brti_065                 81      -3.49  58.0%  -7.44  -0.83
+
+5s      best was blend_85_15     59      -0.48  61.0%  -4.15  -0.13
+10s     best was ewma60          38      -0.86  57.9%  -3.30  -0.30
+15s     ewma60_logn_blend        39      +3.68  69.2%  -1.53  +1.37
+15s     rv_down60_blend          41      +2.14  65.9%  -1.90  +0.74
+20s     blend_85_15_rv60         38      +1.60  65.8%  -1.51  +0.56
+30s     baseline_emp70_logn_rv60 24      +2.79  75.0%  -1.46  +1.28
+30s     rv_down60_blend          26      +2.10  69.2%  -1.37  +0.92
+```
+
+- Interpretation:
+  the original fast websocket-style core variants are rejected on this live
+  capture. Slower scan cadence appears to act as a loss-avoidance/quote-stability
+  filter, but it is not yet deployable alpha because the sign flips sharply
+  between 10s and 15s and the capture window is only about one week. Treat
+  `scan_stride_sec` as a pre-registered hypothesis for the next validation pass,
+  not as a parameter to tune on this already-inspected data.
+- Outside check on Predexon BTC1H Apr1-14:
+  `scripts\backtest_predexon_orderbooks.py --series KXBTCD --start
+  2026-04-01T00:00:00Z --end 2026-04-15T00:00:00Z --scan-stride-sec 30`
+  wrote `backtest_outputs\predexon_btc1h_apr1_14_stride30_20260515`.
+  This is not the exact core-model replay above, but it tests the current 1H
+  variant family on an outside snapshot source with the same slower-cadence
+  idea.
+  - `current_1h_late_loss_guard`: 7 trades, `+$1.56`, 85.7% win, max DD
+    `-$0.62`.
+  - `high_conf_80`: 4 trades, `+$1.34`, 100% win.
+  - `research_original_late`: 9 trades, `+$0.60`, 66.7% win.
+  - `market_shrink_shape_adjacent`: 4 trades, `+$0.52`, 75.0% win.
+  A matching 1-second Apr1-14 Predexon run was attempted but did not complete
+  within 15 minutes and was stopped after only writing `data_report.json`; do
+  not count it as evidence. The April 30-second result is directionally
+  supportive of a quote-stability/cadence gate, but sample size is too small
+  for deployment.
+
+2026-05-15 BTC1H high-confidence core candidate:
+
+- Added `high_conf_80` to `scripts\replay_btc1h_core_ws_counterfactual.py`:
+  same current/core BTC1H fair value, but require side probability at least
+  80% (`min_yes_p=0.80`, `max_no_p=0.20`). No sizing change; one contract.
+- Rationale:
+  prior losses were not primarily a sizing issue after robust caps. The model
+  was taking too many marginal 65-70% side-probability trades whose edge was
+  not reliable live. A stricter probability gate should reduce trades while
+  preserving only large model/market disagreements.
+- Predexon outside validation, 30-second scan cadence:
+  - Apr1-14:
+    `backtest_outputs\predexon_btc1h_apr1_14_stride30_20260515`.
+    `high_conf_80`: 4 trades, `+$1.34`, 100.0% win, max DD `$0.00`.
+  - Apr15-30:
+    `backtest_outputs\predexon_btc1h_apr15_30_stride30_20260515`.
+    `high_conf_80`: 18 trades, `+$1.33`, 72.2% win, max DD `-$1.51`.
+  - Apr1-30 combined:
+    `backtest_outputs\predexon_btc1h_apr1_30_stride30_combined_20260515.csv`.
+    `high_conf_80`: 22 trades, `+$2.67`, 77.3% win, max DD `-$1.51`.
+- May live websocket counterfactual:
+  tested the same `high_conf_80` on
+  `data\live_capture_gapless\live_capture_gapless_20260512_paused.duckdb`
+  across scan cadences without changing the predicate:
+
+```
+stride  trades  pnl    win%   maxDD  sharpe
+1s      39      +3.07  76.9%  -2.11  +1.15
+5s      29      +1.95  75.9%  -1.72  +0.83
+10s     26      +2.82  80.8%  -0.96  +1.36
+15s     24      +3.25  83.3%  -1.00  +1.74
+20s     18      +2.34  83.3%  -1.00  +1.44
+30s     18      +2.59  83.3%  -1.00  +1.59
+```
+
+- May WS daily notes:
+  at 1s stride, 5 of 6 days were positive, but 2026-05-07 was bad:
+  4 trades, `-$1.80`, 25% win. At 15s/30s stride, 2026-05-07 remained
+  slightly negative (`-$0.41`) and the rest of the days were positive.
+- Decision:
+  `high_conf_80` is the best BTC1H candidate found in this loop. It passes
+  Predexon Apr1-14, Predexon Apr15-30, and May WS cadence sensitivity. It is
+  still not final deployment-approved because May WS has now been inspected and
+  Predexon is snapshot-provider data, not exact receive-time websocket replay.
+  Promote it to paper-shadow or a frozen future websocket holdout. Do not tune
+  the 80% threshold or scan stride on May 6-12.
+- Holdout freeze:
+  created `docs\2026-05-16_btc1h_high_conf80_holdout_freeze.md` at
+  2026-05-16T01:37:07Z. Future BTC1H websocket data after that timestamp is the
+  clean validation set for this exact rule.
+
+2026-05-15/16 BTC1H older Predexon validation and no-chase variants:
+
+- Added `--one-hour-variant-regex` to
+  `scripts\backtest_predexon_orderbooks.py` so older Predexon validation can
+  focus on frozen BTC1H candidates without recomputing every unrelated variant.
+- Older Predexon outside validation:
+  `backtest_outputs\predexon_btc1h_feb10_mar31_stride30_highconf_20260515`.
+  This used downloaded KXBTCD Predexon snapshots from 2026-02-10 through
+  2026-03-31 at 30s scan cadence.
+  - `current_1h_late_loss_guard`: 14 trades, `+$3.36`, 85.7% win, max DD
+    `-$0.56`.
+  - `research_original_late`: 15 trades, `+$2.89`, 80.0% win, max DD `-$0.61`.
+  - `high_conf_80`: 8 trades, `+$0.76`, 75.0% win, max DD `-$0.83`.
+  - `high_conf_80_no_chase`: 8 trades, `+$1.57`, 87.5% win, max DD `-$0.43`.
+  - `high_conf_80_entry70_no_chase`: 5 trades, `+$0.84`, 80.0% win, max DD
+    `-$0.43`.
+- Predexon Feb10-Apr30 combined at 30s:
+  `backtest_outputs\predexon_btc1h_feb10_apr30_stride30_combined_20260515.csv`.
+
+```
+model                         trades  pnl    win%   maxDD
+current_1h_late_loss_guard    46      +5.03  71.7%  -1.85
+research_original_late        50      +4.07  68.0%  -1.85
+high_conf_80_no_chase         26      +3.88  80.8%  -1.25
+high_conf_80                  30      +3.43  76.7%  -1.51
+high_conf_80_entry70_no_chase 21      +2.63  76.2%  -1.25
+```
+
+- Ported the pre-existing 10m no-chase guard into
+  `scripts\replay_btc1h_core_ws_counterfactual.py`:
+  - YES is blocked if BTC rose at least `$150` over the prior 10 minutes.
+  - NO is blocked if BTC fell at least `$150` over the prior 10 minutes.
+  - Also added `high_conf_80_entry70_no_chase`, which caps entry at 70c.
+- May WS no-chase validation:
+  `backtest_outputs\btc1h_high_conf80_no_chase_ws_stride_sweep_20260515.csv`.
+
+```
+variant                         stride  trades  pnl    win%   maxDD
+high_conf_80_no_chase           5s      25      +0.73  72.0%  -1.77
+high_conf_80_no_chase           15s     21      +3.35  85.7%  -0.74
+high_conf_80_no_chase           30s     17      +2.40  82.4%  -0.92
+high_conf_80_entry70_no_chase   5s      22      +2.12  77.3%  -1.00
+high_conf_80_entry70_no_chase   15s     19      +4.15  89.5%  -0.71
+high_conf_80_entry70_no_chase   30s     13      +1.37  76.9%  -0.92
+```
+
+- Decision:
+  no-chase is useful but not strictly superior. It improves some May WS
+  cadences and older Predexon drawdown, but plain `high_conf_80` remains the
+  cleaner primary frozen candidate because it is simpler, positive at 1s through
+  30s on May WS, and has stronger Predexon Apr1-30 total PnL than entry-capped
+  no-chase. Keep no-chase as a secondary candidate for future holdout, not a
+  replacement unless future WS data confirms it.
+
+2026-05-15/16 BTC1H high-confidence paper-shadow implementation:
+
+- Added high-confidence strategy support to `scripts\btc_1hr_research_live.py`:
+  - `high_conf_80`: current/core BTC1H research signal, but requires side
+    probability at least 80%.
+  - `high_conf_80_no_chase`: same, plus blocks YES after BTC is up at least
+    `$150` over the prior 10 minutes and blocks NO after BTC is down at least
+    `$150` over the prior 10 minutes.
+  - `high_conf_80_entry70_no_chase`: same no-chase guard, but caps entry at
+    70c.
+- Added paper-shadow wrappers:
+  - `scripts\btc_1hr_high_conf80_shadow.py`
+  - `scripts\btc_1hr_high_conf80_no_chase_shadow.py`
+- The wrappers default to paper mode, one-contract flat sizing, `$100`
+  shadow bankroll, 5-20 minute TTL, and separate local DB files under
+  `~\.btc_kalshi_bot\` so they do not lock or write into the live bot's
+  `research_live_capture.duckdb`.
+- Validation:
+  - `python -m py_compile scripts\btc_1hr_research_live.py
+    scripts\btc_1hr_high_conf80_shadow.py
+    scripts\btc_1hr_high_conf80_no_chase_shadow.py
+    scripts\replay_btc1h_core_ws_counterfactual.py
+    scripts\backtest_predexon_orderbooks.py`
+  - `python -m pytest scripts\test_research_live_safety.py -q --basetemp
+    .pytest-codex-tmp`
+  - Result: 42 passed, 1 benign pandas rolling warning.
+- Operational note:
+  the current live 1H capture DB cannot be copied or opened read-only while the
+  live writer owns it on Windows. Future post-freeze replay either needs a
+  paused/copyable DB, a separately running paper-shadow DB, or a future capture
+  export mechanism in the live process. The new paper-shadow wrappers avoid
+  this by writing their own trade/capture databases from startup.
+- Started the primary paper shadow:
+  - PID at start/check: `3504`.
+  - Command: `python -u scripts\btc_1hr_high_conf80_shadow.py`.
+  - stdout: `logs\btc_1hr_high_conf80_shadow_20260515_203952.out.log`.
+  - stderr: `logs\btc_1hr_high_conf80_shadow_20260515_203952.err.log`.
+  - trade DB: `~\.btc_kalshi_bot\btc_1hr_high_conf80_shadow.db`.
+  - capture DB: `~\.btc_kalshi_bot\btc_1hr_high_conf80_shadow_capture.duckdb`.
+  - Startup log confirmed `mode=paper`, `signal_strategy=high_conf_80`,
+    `contracts=1`, `ttl=5.0-20.0m`, and separate capture DB. It initially saw
+    no eligible event because the active hour was just outside the 20-minute
+    TTL window.
+
+2026-05-15/16 BTC15M F2 robust replay and implementation correction:
+
+- User-requested Apr1-14 robust replay:
+  `backtest_outputs\btc15m_f2_robust_apr1_14_20260515_204801`.
+  Rule: `fair_fp60_edge12_ttl5-12_sp2_e2-60`, causal Predexon snapshots,
+  first qualifying signal per event, top-ask taker fill, visible top quantity
+  cap, official settlement labels, Kalshi fees, and +2c adverse-entry stress.
+  - 1 contract: 96 trades, `+$11.40`, 62.5% win, max DD `-$2.54`, Sharpe 2.43.
+  - 1 contract +2c stress: 96 trades, `+$9.48`, 62.5% win, max DD `-$2.70`,
+    Sharpe 2.02.
+  - $1 loss-cap +2c stress: 96 signals, `+$12.33`, max DD `-$4.21`.
+  - $2 loss-cap +2c stress: 96 signals, `+$31.73`, max DD `-$10.09`.
+  - Daily-stop variants reduced drawdown/trades but did not dominate the
+    one-contract baseline.
+- Significance/overfit diagnostic:
+  `scripts\validate_btc15m_f2_significance.py`, output
+  `backtest_outputs\btc15m_f2_significance_20260515_2120`.
+  Null model: for each trade, `P(win) = stressed_entry + stressed_fee`, so the
+  taker buyer has zero expected PnL after fees under an efficient-entry null.
+  With 50k Monte Carlo paths:
+  - `base_f2` Apr1-14: 96 trades, `+$9.48`, p=0.0312, but Bonferroni over the
+    1,237-rule April search is 1.0.
+  - `base_f2` Apr15-30: 183 trades, `+$2.54`, p=0.3343.
+  - `base_f2` Apr1-30: 279 trades, `+$12.02`, p=0.0795.
+  - Exact live-style stricter subset `ttl10_12_entry55_q50` Apr1-30: 77
+    trades, `+$8.51`, 63.6% win, max DD `-$2.23`, p=0.0308; still not
+    multiple-comparison significant.
+- Important implementation correction:
+  Earlier transfer diagnostics post-filtered the already selected broad F2
+  first signal per event. The live shadow instead selects the first signal that
+  satisfies the stricter predicate. Those are not the same. The correct
+  live-style rule is "filter first, then first-per-event."
+- Correct live-style websocket replay for the stricter subset:
+  `backtest_outputs\btc15m_f2_ttl10_12_entry55_q50_live_ws_exactfirst_20260515_2122`.
+  Settings: fair probability >=60%, edge >=12c, TTL 10-12m, spread <=2c,
+  entry 2-55c, visible top qty >=50, one-contract replay.
+  - Websocket capture coverage: 2026-05-12 10:42:45Z through
+    2026-05-16 03:17:41Z.
+  - Proxy +2c: 34 trades, `+$2.57`, 61.8% win, premium `$17.75`, ROP 14.5%,
+    max DD `-$1.73`, Sharpe 0.89.
+  - Official-result subset +2c: 6 trades, `+$1.73`, 83.3% win, max DD
+    `-$0.59`; official/proxy match 6/6.
+  - Daily proxy +2c was positive on May 12, 13, and 15, negative on May 14
+    and May 16 so far. This is a forward-test candidate, not production alpha.
+- Operational/data note:
+  patched `.codex_work\predexon_backfill_queue_20260515.py` so BTC15M Jan-Mar
+  Predexon backfill pulls `--window late --late-minutes 12 --write-levels`
+  instead of full 15-minute books. This keeps the F2 decision window and should
+  materially reduce requests/storage. Restarted only the Predexon queue; live
+  1H, BTC15M capture, and BTC15M F2 dry-run shadow were left running.
+
+2026-05-15/16 BTC15M older-data validation infrastructure:
+
+- Added `scripts\fetch_btc_spot_1m.py`.
+  Purpose: safely fetch/repair BTC-USD Coinbase 1-minute spot cache for BTC15M
+  Predexon validation. It normalizes mixed raw/feature caches, dedupes by
+  `bucket_start`, sets causal `available_at = bucket_start + 1 minute`, and
+  recomputes RV features before replacing the parquet.
+- Repaired and extended:
+  `data\btc15m_historical_datamart\spot_1m.parquet`.
+  Current clean coverage after repair: 187,149 rows from
+  2026-01-06 00:01:00Z through 2026-05-16 00:01:00Z, with zero missing
+  `available_at` rows.
+- Added `scripts\backtest_btc15m_f2_predexon_range.py`.
+  Purpose: fixed-rule BTC15M F2 validation on arbitrary Predexon ranges. This
+  is not a parameter search. It uses provider snapshot time as available time,
+  first qualifying signal per event, top-ask taker fill, visible top qty, local
+  metadata official results, causal BTC minute close/RV, Kalshi fees, and +2c
+  adverse-entry stress.
+- Validator cross-check:
+  `backtest_outputs\btc15m_f2_predexon_apr1_14_crosscheck_20260515_2135`.
+  It reproduces the known Apr1-14 robust base F2 result exactly:
+  96 trades, `+$9.48` under +2c stress, 62.5% win, max DD `-$2.70`, Sharpe
+  2.02. This confirms the range validator is aligned with the robust Apr
+  replay after fixing metadata loading.
+- Bug fixed in the new validator:
+  the first version selected only one market metadata parquet from the metadata
+  directory, which missed April rows and falsely produced zero trades. It now
+  merges all metadata files overlapping the requested date range and dedupes by
+  market/event/series.
+- First outside-time smoke:
+  `backtest_outputs\btc15m_f2_predexon_jan08_available_20260515_2138`.
+  Available Jan 8 02:45Z-13:15Z Predexon late-window data had 141,296 top
+  rows, 141,285 level-0 size rows, 42 events, and zero F2/strict-F2 signals.
+  This is too small to validate or reject F2; it only proves the older-data
+  path runs and that early Jan 8 did not offer qualifying F2 entries.
+- Follow-up after the backfill advanced:
+  `backtest_outputs\btc15m_f2_predexon_jan08_latest_20260515_2132`.
+  Jan 8 02:45Z-16:45Z had 182,805 top rows, 182,794 level-0 size rows, 56
+  events, and still zero `base_f2`, `ttl10_12_entry55_q50`, or `ttl6_12`
+  signals. Keep collecting before making any inference about January.
+- Correction to the Jan smoke:
+  the zero-signal result was caused by missing historical BTC15M price-to-beat
+  metadata (`Price to beat: TBD`), which made `floor_strike`,
+  `side_fair_p`, and `fair_edge_cents` NaN. This was a data issue, not a real
+  absence of signals.
+- Patched `scripts\backtest_btc15m_f2_predexon_range.py` so older BTC15M rows
+  with missing target are filled with a clearly flagged
+  `coinbase_open_minute_proxy`: Coinbase event-open minute close, available at
+  event open + 1 minute. Rows before that proxy is available remain unusable.
+  This is research-grade, not final-promotion-grade, because the exact Kalshi
+  price-to-beat may differ by a few dollars.
+- Jan 8 proxy-target rerun:
+  `backtest_outputs\btc15m_f2_predexon_jan08_proxy_target_20260515_2140`.
+  Window 2026-01-08 02:45Z-16:45Z:
+  - `base_f2`: 9 trades, `-$2.82` under +2c stress, 22.2% win, max DD
+    `-$3.23`.
+  - `ttl10_12_entry55_q50`: 2 trades, `-$1.07`, 0% win.
+  - `ttl6_12`: 8 trades, `-$3.24`, 12.5% win.
+  Interpretation: this is an early outside-time rejection warning for F2, not
+  something to tune against. Keep Jan/Feb as validation evidence; do not adjust
+  F2 thresholds to rescue Jan 8.
+
+2026-05-15/16 BTC15M F2 validation expansion:
+
+- Reran Apr1-14 through the fixed range validator with the same robust rules:
+  `backtest_outputs\btc15m_f2_predexon_apr1_14_rerun_20260515_214054`.
+  It again matched the known robust result:
+  - `base_f2`: 96 trades, `+$9.48`, 62.5% win, max DD `-$2.70`, Sharpe 2.02.
+  - `ttl10_12_entry55_q50`: 29 trades, `+$4.96`, 69.0% win, max DD
+    `-$1.66`, Sharpe 1.88.
+  - `ttl6_12`: 89 trades, `+$8.83`, 62.9% win, max DD `-$2.41`, Sharpe
+    1.93.
+- Ran the same frozen robust rules on Apr15-30:
+  `backtest_outputs\btc15m_f2_predexon_apr15_30_rerun_20260515_214252`.
+  This is weaker validation, especially late April:
+  - `base_f2`: 184 trades, `+$3.11`, 55.4% win, max DD `-$7.34`, Sharpe
+    0.46. First half `+$3.58`; second half `-$0.47`.
+  - `ttl10_12_entry55_q50`: 49 trades, `+$4.12`, 61.2% win, max DD
+    `-$2.23`, Sharpe 1.18. First half `+$1.73`; second half `+$2.39`.
+  - `ttl6_12`: 154 trades, `+$3.30`, 56.5% win, max DD `-$6.56`,
+    Sharpe 0.53.
+- Reran the currently available Jan8 older-data slice after the backfill reached
+  21:30Z:
+  `backtest_outputs\btc15m_f2_predexon_jan08_available_rerun_20260515_214252`.
+  This uses the proxy target with near-proxy-strike rows dropped because old
+  BTC15M metadata still has `Price to beat: TBD`:
+  - `base_f2`: 11 trades, `-$0.68`, 45.5% win, max DD `-$1.65`, Sharpe
+    -0.41.
+  - `ttl10_12_entry55_q50`: 3 trades, `-$0.54`, 33.3% win, max DD `-$0.59`,
+    Sharpe -0.50.
+  - `ttl6_12`: 10 trades, `-$1.10`, 40.0% win, max DD `-$2.07`, Sharpe
+    -0.69.
+- Updated conclusion: F2 is a useful research candidate and strict
+  `ttl10_12_entry55_q50` is the best current F2 variant, but it is not proven
+  deployable alpha. It passes Apr1-14, remains positive but weaker on Apr15-30,
+  and has an early negative older-data warning on proxy-target Jan8. Do not tune
+  thresholds on Jan8; wait for more Jan/Feb Predexon data and treat those slices
+  as outside-time validation.
+
+2026-05-15/16 BTC15M F2 streak/pattern diagnostic:
+
+- Added `scripts\analyze_btc15m_f2_streak_patterns.py`; output
+  `backtest_outputs\btc15m_f2_streak_patterns_20260515_214659`.
+  Design: Apr1-14 is diagnostic/training, Apr15-30 is validation, Jan8 is an
+  external proxy-target check. This is diagnostic only, not a production rule.
+- Streak result: no strong evidence that raw win/loss streaks are exploitable.
+  - `base_f2` Apr1-14: max loss streak 4, permutation p=0.73; P(win after win)
+    60.0%, P(win after loss) 65.7%, Fisher p=0.66.
+  - `base_f2` Apr15-30: max loss streak 6, permutation p=0.55; P(win after win)
+    55.9%, P(win after loss) 54.3%, Fisher p=0.88.
+  - Strict `ttl10_12_entry55_q50` Apr15-30: P(win after win) 56.7%,
+    P(win after loss) 66.7%, Fisher p=0.55.
+  Conclusion: do not add a "pause after loss streak" rule from current evidence.
+- Train-selected median gates found one plausible state variable:
+  higher recent realized BTC volatility (`rv_60m`).
+  - `base_f2`, threshold learned from Apr1-14 median `rv_60m >= 0.3198`:
+    Apr15-30 improves from 184 trades `+$3.11`, 55.4% win, max DD `-$7.34`
+    to 55 trades `+$8.62`, 69.1% win, max DD `-$2.67`.
+  - `ttl6_12`, threshold learned from Apr1-14 median `rv_60m >= 0.3126`:
+    Apr15-30 improves from 154 trades `+$3.30`, 56.5% win, max DD `-$6.56`
+    to 50 trades `+$9.25`, 72.0% win, max DD `-$2.18`.
+  - Strict `ttl10_12_entry55_q50`, `rv_60m >= 0.2749`: Apr15-30 improves
+    from 49 trades `+$4.12`, 61.2% win, max DD `-$2.23` to 20 trades
+    `+$3.36`, 70.0% win, max DD `-$1.14`.
+  - Combined Apr1-30 after the same train-selected RV gates:
+    `base_f2` 103 trades `+$14.43`, 67.0% win, max DD `-$2.67`;
+    `ttl6_12` 95 trades `+$14.46`, 68.4% win, max DD `-$2.18`;
+    strict 35 trades `+$7.48`, 74.3% win, max DD `-$1.14`.
+- External checks are mixed and prevent promotion:
+  - Jan8 proxy-target with near-strike dropped:
+    `base_f2 rv_60m>=0.3198` 10 trades `-$0.04`, 50.0% win;
+    `ttl6_12 rv_60m>=0.3126` 9 trades `-$0.46`, 44.4% win;
+    strict `rv_60m>=0.2749` 3 trades `-$0.54`, 33.3% win.
+  - Live websocket broad/base-like TTL5-12 entry<=60: all 101 trades
+    `-$9.46`; with `rv_60m>=0.3198` still 10 trades `-$1.74`.
+  - Live websocket strict TTL10-12 entry<=55 qty>=50: all 34 trades `+$2.57`;
+    `rv_60m>=0.2749` leaves only 2 trades `+$0.91`, too few to trust.
+  Conclusion: high RV is a good hypothesis for the next research loop, but it
+  is not yet a deployable filter because it does not rescue broad live replay
+  and the strict live sample is too small.
+- Live-compatible simple logistic diagnostic:
+  `backtest_outputs\btc15m_f2_streak_patterns_20260515_214659\live_common_feature_logistic_checks.csv`.
+  This model used only features also present or computable in websocket replay:
+  entry, fair probability, fair edge, TTL, spread, visible qty, `rv_60m`,
+  BTC spot age, distance to strike, and side. It was trained only on Apr1-14
+  `base_f2`; threshold was the train median predicted probability.
+  - Train Apr1-14: all 96 trades `+$9.48`; selected 48 trades `+$9.18`,
+    75.0% win, max DD `-$1.17`.
+  - Validation Apr15-30: all 184 trades `+$3.11`; selected 77 trades `+$3.75`,
+    61.0% win, max DD `-$2.20`.
+  - External Jan8 proxy-target: all 11 trades `-$0.68`; selected 4 trades
+    `-$0.35`.
+  - Live websocket base-like TTL5-12 entry<=60: all 101 trades `-$9.46`;
+    selected 14 trades `+$0.64`, 64.3% win, max DD `-$0.92`.
+  Coefficient directions: higher visible qty, higher `rv_60m`, higher entry
+  price, and longer TTL were positive; wider spread and higher claimed fair
+  edge were negative. This may be detecting "liquid, volatile, not-too-cute"
+  conditions where the fair-value model is less stale. It is still too weak and
+  too small-sample for deployment.
+- Independent subagent checks:
+  - High-RV check: structurally plausible but not externally validated. Apr15-30
+    high-vs-low split is meaningful (`base_f2` Fisher p=0.0159, `ttl6_12`
+    Fisher p=0.0091), but train split did not itself strongly separate high vs
+    low RV, Jan checks were negative/flat, and broad live websocket replay still
+    lost under high-RV-only gates.
+  - Streak/lag check: do not deploy any win/loss streak, loss-streak,
+    win-streak, or recent-outcome filter. Recent-outcome-only ML had validation
+    AUC below or near random and selected subsets that failed to improve
+    validation/live performance consistently. Streak-looking artifacts flip
+    between Apr1-14, Apr15-30, Jan proxy, and live websocket.
+
+2026-05-15/16 BTC15M May Predexon validation:
+
+- Ran frozen robust F2 on May1-12 Predexon snapshots:
+  `backtest_outputs\btc15m_f2_predexon_may1_12_rerun_20260515_215440`.
+  This is outside the April study period and overlaps recent live behavior.
+  - `base_f2`: 94 trades, `-$4.69`, 48.9% win, max DD `-$5.56`, Sharpe
+    -0.94.
+  - `ttl10_12_entry55_q50`: 17 trades, `-$0.93`, 47.1% win, max DD `-$3.15`,
+    Sharpe -0.42.
+  - `ttl6_12`: 79 trades, `-$3.63`, 50.6% win, max DD `-$4.68`, Sharpe
+    -0.78.
+  Conclusion: fixed F2 as currently defined does not transfer cleanly to May.
+- May high-RV gates, using thresholds learned only from Apr1-14:
+  - `base_f2 rv_60m>=0.3198`: 12 trades, `+$0.66`, 58.3% win, max DD
+    `-$0.65`.
+  - `ttl6_12 rv_60m>=0.3126`: 9 trades, `+$1.22`, 66.7% win, max DD
+    `-$0.65`.
+  - strict `rv_60m>=0.2749`: 1 trade, `+$0.45`.
+  This supports "low-RV broad F2 is dangerous" more than it proves high-RV
+  alpha.
+- May common-feature logistic check, trained only on Apr1-14 `base_f2`, failed:
+  all May `base_f2` was 94 trades `-$4.69`; selected 23 trades `-$5.03`,
+  34.8% win, max DD `-$4.50`. Treat the logistic as unstable; do not promote.
+
+2026-05-15/16 BTC15M fixed regime-rule family:
+
+- Added `scripts\research_btc15m_regime_rule_family.py`; output
+  `backtest_outputs\btc15m_regime_rule_family_20260515_215931`.
+  This uses `side_candidates.parquet` from Predexon robust replays and applies
+  a predeclared fixed family of fair-value, high-RV, liquidity, TTL,
+  spot-momentum, side-price-history, and stability gates. It takes the first
+  qualifying row per event and charges Kalshi taker fees plus +2c adverse entry.
+  Train is Apr1-14 only; validation is Apr15-30 and May1-12; Jan8 is external.
+- A coherent high-RV cluster passed Apr train and both Apr15/May validation:
+  - `edge12_to_28_highrv32`: Apr1-14 44 trades `+$4.21`; Apr15-30 57
+    trades `+$9.14`; May1-12 12 trades `+$0.66`.
+  - `highrv320_q1_base`: Apr1-14 48 trades `+$5.81`; Apr15-30 58 trades
+    `+$8.84`; May1-12 12 trades `+$0.66`.
+  - `highrv320_q100_base`: Apr1-14 44 trades `+$3.71`; Apr15-30 54 trades
+    `+$8.18`; May1-12 11 trades `+$1.22`.
+  - `liquid_highrv32_not_against`: Apr1-14 28 trades `+$4.95`; Apr15-30
+    41 trades `+$4.67`; May1-12 7 trades `+$1.25`.
+- Jan8 external proxy-target still did not confirm the cluster:
+  - `edge12_to_28_highrv32`: 11 trades `-$0.83`.
+  - `highrv320_q1_base`: 12 trades `-$1.20`.
+  - `highrv320_q100_base`: 8 trades `-$1.00`.
+  - `liquid_highrv32_not_against`: 6 trades `-$0.12`, the least-bad Jan
+    external result but still not positive.
+- Added live websocket replay for selected regime rules:
+  `scripts\backtest_btc15m_regime_live_ws_holdout.py`; output
+  `backtest_outputs\btc15m_regime_live_ws_20260515_220909`.
+  It uses only local websocket capture and materializes only rows passing each
+  fixed predicate to avoid huge side-candidate memory blowups.
+  - `base_f2`: 106 proxy trades `-$9.45`; official subset 25 trades `-$3.33`.
+  - `edge12_to_28_highrv32`: 10 proxy trades `-$1.74`; official subset 1
+    trade `-$0.52`.
+  - `highrv320_q100_base`: 10 proxy trades `-$1.74`; official subset 1 trade
+    `-$0.52`.
+  - `liquid_highrv32_not_against`: 5 proxy trades `+$0.03`, 60% win, max DD
+    `-$0.79`; zero official-settled trades.
+  - `strict_plus_highrv20`: 10 proxy trades `-$0.53`; official subset 2
+    trades `-$0.09`.
+  Conclusion: the high-RV regime cluster is not promoted. The live websocket
+  promotion gate is too weak/negative. The only nonnegative live rule has five
+  proxy trades and no official subset, which is not evidence of deployable
+  alpha.
+
+2026-05-15/16 BTC15M latest live lowdd replay:
+
+- Ran `scripts\backtest_btc15m_live_holdout.py` on the current local BTC15M
+  websocket capture; output
+  `backtest_outputs\btc15m_live_holdout_refresh_20260515_221228`.
+  Window: 2026-05-15 20:12:30Z through 2026-05-16 04:12:30Z, 639,403 top
+  rows, 6,682 BTC ticks, 33 events, 32 finalized settlement rows.
+  - `current_lowdd_no_rv`: 14 trades, `-$1.19`, 64.3% win, max DD `-$1.89`,
+    Sharpe -0.62.
+  - `cheap_yes_rr_first`: 26 trades, `-$0.23`.
+  - `cheap_no_rr_first`: 25 trades, `-$2.599`.
+  - `cheap_tail_best_side_first`: 32 trades, `-$0.699`.
+  - `cheap_tail_position_aware`: 32 events, `-$2.759`.
+  - `cheap_pair_lock_rr`: 18 completed pairs, `+$0.72`, 100% win, but this is
+    still not deployable by itself because it only scores completed pairs and
+    ignores first-leg events that never lock. The position-aware deployable
+    version is negative.
+  Conclusion: the current lowdd/momentum path remains rejected by live replay.
+
+2026-05-15/16 BTC15M larger Jan external update:
+
+- Predexon late-window backfill reached Jan9 14:30Z. Ran robust F2 range on
+  Jan8 02:45Z through Jan9 14:30Z:
+  `backtest_outputs\btc15m_f2_predexon_jan08_09_partial_20260515_221357`.
+  This is still proxy-target because old BTC15M metadata has `Price to beat:
+  TBD`; near-proxy-strike rows are dropped.
+  - `base_f2`: 28 trades, `-$0.54`, 50.0% win, max DD `-$2.92`.
+  - `ttl10_12_entry55_q50`: 6 trades, `-$0.17`, 50.0% win, max DD `-$0.59`.
+  - `ttl6_12`: 26 trades, `-$0.47`, 50.0% win, max DD `-$2.43`.
+- Reran the regime-rule family with this larger Jan external:
+  `backtest_outputs\btc15m_regime_rule_family_jan0809ext_20260515_221454`.
+  The high-RV cluster remains positive on Apr/May validation but fails Jan
+  external:
+  - `edge12_to_28_highrv32`: Jan external 13 trades `-$1.00`.
+  - `highrv320_q100_base`: Jan external 11 trades `-$1.20`.
+  - `liquid_highrv32_edge_capped`: Jan external 8 trades `-$0.27`.
+  - `liquid_highrv32_not_against`: Jan external 9 trades `-$0.32`.
+  Conclusion: outside-time Jan proxy evidence still blocks promotion of the
+  high-RV fair-value family.
+
+2026-05-15/16 BTC15M simultaneous pair-lock structural test:
+
+- Added `scripts\research_btc15m_simultaneous_pair_locks.py`; output
+  `backtest_outputs\btc15m_pair_locks_20260515_221655`.
+  This tests same-timestamp YES+NO ask locks: buy one YES and one NO only when
+  both top asks are visible at the same book timestamp and all-in cost after
+  Kalshi fees, per-leg adverse stress, and a required profit cushion is below
+  `$1`.
+- Result:
+  - With no adverse stress and zero required profit, Predexon April/May has
+    many zero-profit equality cases (`YES ask + NO ask + fees == $1`), but live
+    and Jan have none in the tested windows.
+  - With even 1c adverse stress per leg and 1c required lock profit, there are
+    zero qualifying pairs across Apr1-14, Apr15-30, May1-12, Jan8-9, and the
+    live websocket holdout.
+  - With 2c stress, also zero.
+- Conclusion: true simultaneous, executable pair-lock arbitrage is not present
+  in the data under realistic fill/slippage assumptions. The previously
+  positive `cheap_pair_lock_rr` remains invalid as a standalone strategy because
+  it waited for a later second leg and ignored first-leg failures.
+
+2026-05-15/16 BTC15M F2 Apr1-14 robust replay refresh:
+
+- User asked to backtest the current F2 candidate with the robust rules on
+  Apr1-14. Reran:
+  `scripts\backtest_btc15m_f2_predexon_range.py --start
+  2026-04-01T00:00:00Z --end 2026-04-15T00:00:00Z --stress-cents 2
+  --drop-proxy-near-strike-usd 20`.
+- Fresh output:
+  `backtest_outputs\btc15m_f2_robust_apr1_14_rerun_20260515_222233`.
+- Data/replay assumptions: 1,218,851 Predexon top snapshots, 303,181 feature
+  rows, 546,736 side candidates, 1,283 events, official Kalshi metadata targets,
+  causal provider timestamp as `available_at`, Coinbase BTC 1m backward as-of,
+  first qualifying signal per event, separate YES/NO executable top asks,
+  visible top size gate, one-contract replay, Kalshi taker fees, and +2c adverse
+  entry stress.
+- Results:
+  - `base_f2`: 96 trades, `+$9.48`, 62.5% win, max DD `-$2.70`, Sharpe 2.02.
+  - `ttl10_12_entry55_q50`: 29 trades, `+$4.96`, 68.97% win, max DD `-$1.66`,
+    Sharpe 1.88.
+  - `ttl6_12`: 89 trades, `+$8.83`, 62.92% win, max DD `-$2.41`, Sharpe 1.93.
+- This reproduces the earlier Apr1-14 robust F2 result. It is a strong in-sample
+  April slice, not promotion evidence by itself because later Apr/May/live checks
+  weakened or rejected broad F2.
+
+2026-05-15/16 BTC1H May Predexon high-confidence validation refresh:
+
+- Reran the frozen BTC1H high-confidence family on the available May Predexon
+  KXBTCD snapshots:
+  `scripts\backtest_predexon_orderbooks.py --series KXBTCD --start
+  2026-05-01T00:00:00Z --end 2026-05-06T00:00:00Z --scan-stride-sec 30
+  --one-hour-variant-regex "high_conf_80|current_1h_late_loss_guard|research_original_late"`.
+  Fresh output:
+  `backtest_outputs\predexon_btc1h_may1_06_stride30_highconf_20260515_222544`.
+- Coverage caveat: local Predexon KXBTCD May data is effectively May3-May5
+  only, with sparse May1/May6 files. This is still useful as an outside-time
+  check after the April candidate work.
+- May3-May5 result at 30s scan cadence:
+  - `high_conf_80`: 19 trades, `-$0.78`, 57.9% win, max DD `-$3.46`.
+  - `high_conf_80_no_chase`: 15 trades, `+$1.82`, 80.0% win, max DD `-$1.73`.
+  - `high_conf_80_entry70_no_chase`: 12 trades, `+$2.09`, 83.3% win,
+    max DD `-$1.37`.
+  - `current_1h_late_loss_guard`: 23 trades, `+$1.00`, 65.2% win,
+    max DD `-$3.66`.
+  - `research_original_late`: 24 trades, `+$1.52`, 66.7% win, max DD `-$3.14`.
+- Trade-level Feb10-May5 combined split comparison written to
+  `backtest_outputs\btc1h_highconf_predexon_tradelevel_feb10_may5_20260515_222544.csv`.
+  Summary:
+  - `current_1h_late_loss_guard`: 69 trades, `+$6.03`, 69.6% win,
+    max DD `-$3.66`.
+  - `high_conf_80_no_chase`: 41 trades, `+$5.70`, 80.5% win,
+    max DD `-$1.73`.
+  - `research_original_late`: 74 trades, `+$5.59`, 67.6% win,
+    max DD `-$3.14`.
+  - `high_conf_80_entry70_no_chase`: 33 trades, `+$4.72`, 78.8% win,
+    max DD `-$1.37`.
+  - `high_conf_80`: 49 trades, `+$2.65`, 69.4% win, max DD `-$3.46`.
+- Updated interpretation: plain `high_conf_80` is no longer the clean primary
+  candidate because it failed the May Predexon outside check. The no-chase
+  variants are now the more interesting BTC1H candidates: lower trade count,
+  materially better win rate, and lower drawdown across Feb/Mar/Apr/May
+  Predexon. They still need true post-freeze websocket shadow validation before
+  any live promotion.
+
+2026-05-15/16 BTC1H replay audit fixes and corrected websocket sweep:
+
+- Subagent audit found two BTC1H replay fidelity issues:
+  - `scripts\replay_btc1h_core_ws_counterfactual.py` only added the last event
+    in a same-`received_at_ns` batch to `changed_events`, so simultaneous quote
+    batches could miss evaluation for earlier events in the batch.
+  - The websocket replay did not enforce a hard maximum Coinbase BTC tick age,
+    so some older May rows could use stale as-of BTC.
+- Patched `scripts\replay_btc1h_core_ws_counterfactual.py`:
+  - Add each row's event to `changed_events` inside the per-row loop.
+  - Add `--max-btc-spot-age-sec` defaulting to `180` and skip evaluations with
+    older captured Coinbase ticks.
+  - Record this gate in replay metadata.
+- Subagent audit also noted Predexon BTC1H had top-level sizes attached but the
+  shared `may8examine.signals_for_variant` path did not enforce chosen-side
+  visible quantity. Patched `scripts\may8examine.py` to reject chosen sides with
+  `visible_qty < 1`, and patched `scripts\backtest_predexon_orderbooks.py` to
+  write `visible_qty` into BTC1H trade rows.
+- Validation:
+  - `python -m py_compile scripts\replay_btc1h_core_ws_counterfactual.py
+    scripts\may8examine.py scripts\backtest_predexon_orderbooks.py` passed.
+  - Reran May Predexon after the visible-size patch:
+    `backtest_outputs\predexon_btc1h_may1_06_stride30_highconf_visible_20260515_233413`.
+    Results matched the pre-patch May run exactly, so the May no-chase evidence
+    was not coming from zero-quantity top-book quotes.
+- Corrected May6-May12 websocket cadence sweep on
+  `data\live_capture_gapless\live_capture_gapless_20260512_paused.duckdb`,
+  with captured settlement and `--max-btc-spot-age-sec 180`, written to:
+  `backtest_outputs\btc1h_highconf_ws_fixed_stride_sweep_20260515.csv`.
+
+```
+variant                         stride  trades  pnl    win%   maxDD
+high_conf_80                    1s      35      +1.59  74.3%  -1.81
+high_conf_80                    5s      25      +3.70  84.0%  -0.77
+high_conf_80                    10s     21      +2.18  81.0%  -0.86
+high_conf_80                    15s     20      +3.95  90.0%  -0.74
+high_conf_80                    20s     13      +1.89  84.6%  -0.74
+high_conf_80                    30s     14      +2.30  85.7%  -0.70
+high_conf_80_no_chase           1s      32      -0.29  68.8%  -2.44
+high_conf_80_no_chase           5s      22      +2.75  81.8%  -1.06
+high_conf_80_no_chase           10s     18      +2.33  83.3%  -0.86
+high_conf_80_no_chase           15s     17      +4.13  94.1%  -0.74
+high_conf_80_no_chase           20s     12      +1.68  83.3%  -0.74
+high_conf_80_no_chase           30s     12      +1.85  83.3%  -0.70
+high_conf_80_entry70_no_chase   1s      29      +1.33  72.4%  -1.74
+high_conf_80_entry70_no_chase   5s      19      +4.16  89.5%  -0.71
+high_conf_80_entry70_no_chase   10s     15      +1.76  80.0%  -0.77
+high_conf_80_entry70_no_chase   15s     14      +4.51  100%   0.00
+high_conf_80_entry70_no_chase   20s     10      +1.18  80.0%  -0.72
+high_conf_80_entry70_no_chase   30s     10      +1.35  80.0%  -0.70
+```
+
+- Interpretation:
+  - Corrected websocket replay still supports the BTC1H high-confidence family.
+  - Plain `high_conf_80` is the most cadence-stable on May6-May12 websocket
+    data, positive from 1s through 30s.
+  - `high_conf_80_no_chase` is better on Predexon May and at 5s-30s websocket
+    cadence, but it loses at 1s under the corrected replay, so it is promising
+    but cadence-sensitive rather than deployment-proven.
+  - `entry70_no_chase` remains research-only because it adds another tuned cap.
+- Started `scripts\btc_1hr_high_conf80_no_chase_shadow.py` in paper mode as PID
+  `21264` with output log
+  `logs\btc_1hr_high_conf80_no_chase_shadow_20260515_234133.out.log`. This is
+  for forward validation only; no live orders.
+
+2026-05-16 BTC1H high-confidence robustness audit:
+
+- Added `scripts\analyze_btc1h_highconf_robustness.py`, a fixed-artifact audit
+  script. It does not search thresholds; it consolidates frozen BTC1H candidate
+  trade files and recomputes PnL under extra adverse entry stress of 0c, 1c,
+  2c, and 3c.
+- Output:
+  `backtest_outputs\btc1h_highconf_robustness_20260516_003059`.
+- Important artifact hygiene note: an earlier analyzer run
+  `btc1h_highconf_robustness_20260516_003026` mis-parsed websocket `win=1.0`
+  as false and was deleted. Use only the `003059` output.
+- Inputs:
+  - Predexon Feb10-Mar31 legacy high-confidence trades. The patched Feb-Mar
+    rerun timed out and only wrote `data_report.json`, so the legacy Feb-Mar
+    section remains directional and should not be treated as fully refreshed
+    visible-size evidence.
+  - Patched visible-size Predexon Apr1-14, Apr15-30, and May3-5.
+  - Corrected websocket May6-May12 cadence sweep with 180s BTC tick age gate.
+- Predexon no-extra-stress summary:
+  - `current_1h_late_loss_guard`: 66 trades, `+$6.09`, 69.7% win,
+    max DD `-$3.66`.
+  - `high_conf_80_no_chase`: 38 trades, `+$5.86`, 81.6% win,
+    max DD `-$1.73`.
+  - `research_original_late`: 71 trades, `+$5.65`, 67.6% win,
+    max DD `-$3.14`.
+  - `high_conf_80_entry70_no_chase`: 30 trades, `+$4.86`, 80.0% win,
+    max DD `-$1.37`.
+  - `high_conf_80`: 46 trades, `+$2.81`, 69.6% win, max DD `-$3.46`.
+- Predexon with +2c additional adverse entry stress:
+  - `high_conf_80_no_chase`: 38 trades, `+$5.10`, 81.6% win,
+    max DD `-$1.81`.
+  - `current_1h_late_loss_guard`: 66 trades, `+$4.77`, 69.7% win,
+    max DD `-$3.78`.
+  - `high_conf_80_entry70_no_chase`: 30 trades, `+$4.26`, 80.0% win,
+    max DD `-$1.41`.
+  - `research_original_late`: 71 trades, `+$4.23`, 67.6% win,
+    max DD `-$3.28`.
+  - `high_conf_80`: 46 trades, `+$1.89`, 69.6% win, max DD `-$3.58`.
+- Corrected websocket with +2c additional adverse entry stress:
+  - Plain `high_conf_80` remains positive at every tested cadence:
+    1s `+$0.89`, 5s `+$3.20`, 10s `+$1.76`, 15s `+$3.55`,
+    20s `+$1.63`, 30s `+$2.02`.
+  - `high_conf_80_no_chase` remains positive from 5s through 30s but is
+    negative at 1s: 1s `-$0.93`, 5s `+$2.31`, 10s `+$1.97`,
+    15s `+$3.79`, 20s `+$1.44`, 30s `+$1.61`.
+  - `entry70_no_chase` remains positive across cadences, but because it adds a
+    further selected entry cap, keep it research-only until a future holdout.
+- Updated interpretation:
+  - For a conservative signal candidate, plain `high_conf_80` has the best
+    websocket cadence stability.
+  - For drawdown reduction, `high_conf_80_no_chase` remains the best
+    hypothesis, but the 1s websocket loss means it cannot be called fully robust
+    yet.
+  - Do not promote any BTC1H variant from this alone; keep both paper shadows
+    collecting post-freeze decisions and validate against the live ledger later.
+
+2026-05-16 BTC1H high-confidence significance audit:
+
+- Added `scripts\analyze_btc1h_highconf_significance.py`.
+  It reads the fixed robustness audit input trades and performs:
+  - A breakeven random-outcome Monte Carlo null: each trade wins with
+    probability equal to its all-in premium, so expected PnL is zero.
+  - Paired event-level comparisons between variants, filling skipped events
+    with zero PnL.
+  This is a sanity check only, not a strategy search.
+- Output:
+  `backtest_outputs\btc1h_highconf_significance_20260516_003359`.
+- Predexon breakeven-null results:
+  - `high_conf_80_no_chase`: 38 trades, `+$5.86`, 81.6% win,
+    p(PnL >= observed) `0.0271`.
+  - `high_conf_80_entry70_no_chase`: 30 trades, `+$4.86`, 80.0% win,
+    p `0.0429`, but remains research-only because it adds a selected entry cap.
+  - `current_1h_late_loss_guard`: 66 trades, `+$6.09`, 69.7% win,
+    p `0.0736`.
+  - `research_original_late`: 71 trades, `+$5.65`, 67.6% win,
+    p `0.1014`.
+  - `high_conf_80`: 46 trades, `+$2.81`, 69.6% win, p `0.2360`.
+- Corrected websocket breakeven-null highlights:
+  - 1s `high_conf_80`: 35 trades, `+$1.59`, p `0.3521`.
+  - 5s `high_conf_80`: 25 trades, `+$3.70`, p `0.0763`.
+  - 15s `high_conf_80`: 20 trades, `+$3.95`, p `0.0370`.
+  - 1s `high_conf_80_no_chase`: 32 trades, `-$0.29`, p `0.6281`.
+  - 15s `high_conf_80_no_chase`: 17 trades, `+$4.13`, p `0.0182`.
+  Websocket cadence rows are overlapping replays of the same May6-May12 days,
+  so these are stability checks, not independent validation samples.
+- Paired event-level checks:
+  - Predexon `high_conf_80_no_chase` versus plain `high_conf_80`:
+    `+$3.05` incremental over 46 events, sign-flip p `0.1537`.
+  - Predexon `high_conf_80_no_chase` versus current late loss guard:
+    `-$0.23` incremental over 66 events, sign-flip p `0.9430`.
+  - Websocket no-chase versus plain high-conf is mixed by cadence:
+    worse at 1s and 5s, near-flat/slightly better at 10s/15s, worse again at
+    20s/30s.
+- Updated interpretation:
+  - The most defensible current BTC1H statement is: high-confidence filtering
+    appears useful; no-chase is a plausible drawdown/liquidity-regime filter,
+    but it is not proven superior to plain high-conf.
+  - Do not replace the live strategy based on this audit alone. The required
+    next gate is post-freeze shadow/live-ledger validation from the two running
+    paper shadows.
+
+2026-05-16 BTC1H Feb-Mar visible-size rerun and refreshed audits:
+
+- The all-at-once patched Feb10-Mar31 Predexon rerun had timed out after
+  writing only `data_report.json`, so it was not counted. Reran the same
+  patched visible-size BTC1H replay in weekly chunks:
+  - `backtest_outputs\predexon_btc1h_20260210_20260217_stride30_highconf_visible_20260516_003528`
+  - `backtest_outputs\predexon_btc1h_20260217_20260224_stride30_highconf_visible_20260516_003528`
+  - `backtest_outputs\predexon_btc1h_20260224_20260303_stride30_highconf_visible_20260516_003528`
+  - `backtest_outputs\predexon_btc1h_20260303_20260310_stride30_highconf_visible_20260516_003528`
+  - `backtest_outputs\predexon_btc1h_20260310_20260317_stride30_highconf_visible_20260516_003528`
+  - `backtest_outputs\predexon_btc1h_20260317_20260324_stride30_highconf_visible_20260516_003528`
+  - `backtest_outputs\predexon_btc1h_20260324_20260401_stride30_highconf_visible_20260516_003528`
+- Most early chunks generated no trades after the stricter visible-liquidity
+  path. The patched Feb-Mar trade evidence comes from Mar17-Mar31:
+  - Mar17-Mar24: `current_1h_late_loss_guard` 1 trade `+$0.42`;
+    `high_conf_80` 1 trade `-$0.68`; `high_conf_80_no_chase` 1 trade `+$0.25`;
+    `research_original_late` 2 trades `-$0.05`.
+  - Mar24-Apr1: `current_1h_late_loss_guard` 12 trades `+$2.50`;
+    `high_conf_80` 7 trades `+$1.44`; `high_conf_80_no_chase` 7 trades
+    `+$1.32`; `high_conf_80_entry70_no_chase` 5 trades `+$0.84`;
+    `research_original_late` 12 trades `+$2.50`.
+- Updated `scripts\analyze_btc1h_highconf_robustness.py` to use the patched
+  weekly Feb-Mar chunks instead of the legacy pre-visible-size Feb-Mar file.
+  Fresh robustness output:
+  `backtest_outputs\btc1h_highconf_robustness_20260516_012255`.
+- Refreshed Predexon no-extra-stress summary:
+  - `high_conf_80_no_chase`: 38 trades, `+$5.86`, 81.6% win,
+    max DD `-$1.73`.
+  - `current_1h_late_loss_guard`: 65 trades, `+$5.65`, 69.2% win,
+    max DD `-$3.66`.
+  - `research_original_late`: 70 trades, `+$5.21`, 67.1% win,
+    max DD `-$3.14`.
+  - `high_conf_80_entry70_no_chase`: 30 trades, `+$4.86`, 80.0% win,
+    max DD `-$1.37`.
+  - `high_conf_80`: 46 trades, `+$2.81`, 69.6% win, max DD `-$3.46`.
+- Refreshed Predexon +2c extra adverse-entry stress:
+  - `high_conf_80_no_chase`: 38 trades, `+$5.10`, 81.6% win,
+    max DD `-$1.81`.
+  - `current_1h_late_loss_guard`: 65 trades, `+$4.35`, 69.2% win,
+    max DD `-$3.78`.
+  - `high_conf_80_entry70_no_chase`: 30 trades, `+$4.26`, 80.0% win,
+    max DD `-$1.41`.
+  - `research_original_late`: 70 trades, `+$3.81`, 67.1% win,
+    max DD `-$3.28`.
+  - `high_conf_80`: 46 trades, `+$1.89`, 69.6% win, max DD `-$3.58`.
+- Updated `scripts\analyze_btc1h_highconf_significance.py` to read the latest
+  robustness audit automatically. Fresh significance output:
+  `backtest_outputs\btc1h_highconf_significance_20260516_012312`.
+  Predexon breakeven-null p-values:
+  - `high_conf_80_no_chase`: p `0.0270`.
+  - `high_conf_80_entry70_no_chase`: p `0.0426`.
+  - `current_1h_late_loss_guard`: p `0.0892`.
+  - `research_original_late`: p `0.1210`.
+  - `high_conf_80`: p `0.2376`.
+  Paired event-level comparison remains cautious:
+  `high_conf_80_no_chase` beats plain `high_conf_80` by `+$3.05`, but
+  sign-flip p is `0.1539`; versus current late loss guard it is `+$0.21`,
+  p `0.9470`.
+- Updated interpretation after full patched refresh:
+  `high_conf_80_no_chase` is the strongest BTC1H research candidate on
+  Predexon after visible-size enforcement and stress testing, but the paired
+  comparison and websocket cadence sensitivity still block declaring it
+  deployment-ready. Keep it in paper shadow and require post-freeze forward
+  validation.
+
+2026-05-16 BTC15M F2 Apr1-14 robust rerun:
+
+- Reran the frozen F2 Predexon validator for Apr1-14 on request:
+  `backtest_outputs\btc15m_f2_robust_apr1_14_fresh_20260516_012635`.
+- Command:
+  `python scripts\backtest_btc15m_f2_predexon_range.py --start 2026-04-01T00:00:00Z --end 2026-04-15T00:00:00Z --stress-cents 2 --drop-proxy-near-strike-usd 20 --threads 8`.
+- Input scale: 1,218,851 Predexon top rows, 1,218,851 level-0 size rows,
+  303,181 feature rows, 546,736 side candidates, 1,283 events.
+- Replay rules: first qualifying signal per event, provider timestamp as
+  available time, separate YES/NO executable top asks, visible top quantity
+  gate/cap, Coinbase BTC 1m backward-asof spot/60m realized vol, Kalshi
+  metadata settlement, Kalshi taker fee, and +2c adverse entry stress.
+- Results reproduced the previous robust Apr1-14 output:
+  - `base_f2`: 96 trades, `+$9.48`, 62.50% win, max DD `-$2.70`,
+    Sharpe `2.02`.
+  - `ttl10_12_entry55_q50`: 29 trades, `+$4.96`, 68.97% win,
+    max DD `-$1.66`, Sharpe `1.88`.
+  - `ttl6_12`: 89 trades, `+$8.83`, 62.92% win, max DD `-$2.41`,
+    Sharpe `1.93`.
+- Interpretation unchanged: Apr1-14 looks good for F2, but this is not enough
+  for deployment because later April, May Predexon, and live websocket replay
+  have been much weaker or negative.
+
+2026-05-16 BTC15M transfer-gate audit:
+
+- Added `scripts\audit_btc15m_transfer_gate.py`.
+  This is an audit script, not a search script: it reads frozen artifacts and
+  applies a conservative promotion gate across Apr1-14 train, Apr15-30
+  validation, May1-12 validation, Jan proxy external, and live websocket replay.
+- Fresh output:
+  `backtest_outputs\btc15m_transfer_gate_audit_20260516_013152`.
+- Promotion result: 0 BTC15M F2/regime candidates passed.
+- Key rows:
+  - `base_f2`: Apr1-14 96 trades `+$9.48`; Apr15-30 184 trades `+$3.11`;
+    May1-12 94 trades `-$4.69`; Jan proxy 28 trades `-$0.54`;
+    live websocket proxy 101 trades `-$9.46`; official live subset 25 trades
+    `-$3.33`.
+  - `ttl6_12`: Apr1-14 89 trades `+$8.83`; Apr15-30 154 trades `+$3.30`;
+    May1-12 79 trades `-$3.63`; Jan proxy 26 trades `-$0.47`; no dedicated
+    live replay row in the frozen audit.
+  - `strict_ttl10_12_entry55_q50`: Apr1-14 29 trades `+$4.96`; Apr15-30
+    49 trades `+$4.12`; May1-12 17 trades `-$0.93`; Jan proxy 6 trades
+    `-$0.17`; no dedicated live replay row in the frozen audit.
+  - `liquid_highrv32_not_against`: Apr1-14 28 trades `+$4.95`; Apr15-30
+    41 trades `+$4.67`; May1-12 7 trades `+$1.25`; Jan proxy 9 trades
+    `-$0.32`; live websocket proxy 5 trades `+$0.03`, with 0 official subset
+    trades. This is too small and Jan-negative, so it is not promotable.
+- Independent read-only subagent checks agreed:
+  - High-RV/volatility regimes reduce broad F2 damage and look plausible, but
+    fail Jan/live or shrink to too few trades.
+  - Loss streaks, win streaks, and recent outcome filters are not predictive:
+    Apr1-14 `base_f2` max loss streak permutation p `0.7311`; Apr15-30 p
+    `0.5459`.
+  - Contract price-history features such as `yes_mid_chg` and `side_mid_chg`
+    look good on some April slices but fail Jan/live transfer.
+  - Microstructure/liquidity gates such as visible quantity, quote speed, TTL,
+    entry, and distance-to-strike do not pass all validation slices.
+  - Conservative ML: live-compatible XGBoost remains the only BTC15M ML
+    candidate that did not immediately fail live websocket diagnostics, but it
+    had only 1 April final-test trade, so it is paper-shadow/future-holdout
+    only. Logistic/MLP/naive tree paths are rejected.
+- Decision:
+  do not deploy any BTC15M F2/regime/streak/price-history candidate from this
+  batch. The valid research takeaway is that low realized-volatility broad F2
+  is dangerous; it is not yet a positive trading signal.
+
+2026-05-16 BTC1H promotion-gate audit:
+
+- Added `scripts\audit_btc1h_promotion_gate.py`.
+  This is an audit script, not a search script. It reads the frozen BTC1H
+  robustness/significance artifacts and post-freeze paper-shadow ledgers.
+- Fresh outputs:
+  `backtest_outputs\btc1h_promotion_gate_audit_20260516_013738` and, after
+  adding the entry70 shadow DB/log reader,
+  `backtest_outputs\btc1h_promotion_gate_audit_20260516_013956`.
+- Gate:
+  - Predexon +2c adverse-entry stress PnL must be positive with at least
+    25 trades.
+  - Breakeven-null p-value must be <= 0.10.
+  - All websocket cadence replays must be positive under +2c stress.
+  - Post-freeze shadow must have at least 20 settled trades and positive
+    realized PnL.
+- Result: 0 BTC1H candidates passed.
+- Candidate rows:
+  - `high_conf_80`: Predexon 46 trades `+$1.89`, win 69.57%,
+    max DD `-$3.58`; breakeven-null p `0.2376`; websocket +2c stress positive
+    at all 6 cadences with minimum cadence PnL `+$0.89`; post-freeze shadow
+    currently 1 settled trade `+$0.24`. Blocked by weak null p-value and too
+    little forward shadow evidence.
+  - `high_conf_80_no_chase`: Predexon 38 trades `+$5.10`, win 81.58%,
+    max DD `-$1.81`; breakeven-null p `0.0270`; websocket +2c stress positive
+    at 5/6 cadences but 1-second cadence was `-$0.93`; post-freeze shadow
+    currently 1 settled trade `+$0.27`. Blocked by websocket cadence
+    instability and too little forward shadow evidence.
+  - `high_conf_80_entry70_no_chase`: Predexon 30 trades `+$4.26`, win 80.0%,
+    max DD `-$1.41`; breakeven-null p `0.0426`; websocket +2c stress positive
+    at all 6 cadences with minimum cadence PnL `+$0.75`; it adds an extra
+    entry cap and had 0 settled post-freeze shadow trades at audit time, so it
+    remains research-only.
+- Decision:
+  keep `high_conf_80` and `high_conf_80_no_chase` as paper shadows. Do not
+  promote either solely from current backtests. If looking for the next BTC1H
+  candidate, the most natural frozen shadow to add is `high_conf_80_entry70_no_chase`,
+  but it must be treated as a new candidate requiring forward evidence.
+
+2026-05-16 BTC1H entry70 no-chase paper shadow:
+
+- Added `scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py`.
+  It mirrors the existing BTC1H websocket paper-shadow wrappers, but forces:
+  `--paper`, `--signal-strategy high_conf_80_entry70_no_chase`,
+  `--sizing-policy flat_max`, one-contract sizing, `$100` shadow bankroll, and
+  separate DB/capture paths.
+- Smoke validation:
+  - `python -m py_compile scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py`
+  - `python scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py --dry-run --once --paper-report-sec 15`
+  - Dry-run connected to Kalshi and Kraken websockets and exited cleanly.
+- Started paper-only forward shadow:
+  - PID at start/check: `7744`
+  - Command: `python -u scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py`
+  - Stdout log:
+    `logs\btc_1hr_high_conf80_entry70_no_chase_shadow_20260516_013914.out.log`
+  - DB:
+    `%USERPROFILE%\.btc_kalshi_bot\btc_1hr_high_conf80_entry70_no_chase_shadow.db`
+  - Capture DB:
+    `%USERPROFILE%\.btc_kalshi_bot\btc_1hr_high_conf80_entry70_no_chase_shadow_capture.duckdb`
+- This process is paper-only and should be used strictly for forward validation.
+  It should not be promoted until it has enough settled post-freeze decisions
+  and still passes the BTC1H promotion-gate audit.
+
+2026-05-16 BTC15M live-compatible ML post-freeze check:
+
+- Refreshed the frozen live-compatible XGBoost model on post-freeze BTC15M
+  websocket capture only:
+  `backtest_outputs\btc15m_livecompat_xgb_postfreeze_ws_20260516_014159`.
+- Command:
+  `python scripts\backtest_btc15m_ml_live_ws_holdout.py --model-dir backtest_outputs\btc15m_live_compatible_models_20260515 --models xgboost_tabular --start 2026-05-15T23:30:00Z`.
+- Replay window:
+  `2026-05-15 23:30:00 UTC` through
+  `2026-05-16 07:42:03 UTC`.
+- Data scale:
+  623,090 top-of-book websocket rows, 8,465 BTC rows, 3,586 lifecycle rows,
+  953,241 reconstructed side candidates, 32 events.
+- Result:
+  - `xgboost_tabular`, frozen gate `pred_win_prob>=0.84` and
+    `pred_ev>=0.14`: 5 trades, raw `-$1.25`, +2c-stressed `-$1.35`,
+    40.0% win, max DD `-$1.50`.
+  - The 5 selected events were 2 wins / 3 losses; no official result subset was
+    present in this replay, so this is proxy-settled.
+- Added `scripts\audit_btc15m_ml_promotion_gate.py`.
+  Fresh output:
+  `backtest_outputs\btc15m_ml_promotion_gate_audit_20260516_014511`.
+- ML promotion-gate result:
+  - `xgboost_tabular`: blocked by too few April final-test trades
+    (1 trade) and negative post-freeze websocket replay.
+  - `logistic_calibrator`: blocked by negative April final test and negative
+    inspected websocket replay.
+ - Decision:
+  do not build or run a BTC15M live-compatible XGBoost paper shadow from this
+  model version. The first clean post-freeze replay is already negative, so the
+  model returns to research-only status.
+
+2026-05-16 BTC15M F2 expanded January external check:
+
+- Aggregated the Jan 8 through Jan 14 partial Predexon BTC15M F2 validation
+  chunks from:
+  `backtest_outputs\btc15m_f2_predexon_jan08_partial_20260516_015239`
+  through
+  `backtest_outputs\btc15m_f2_predexon_jan14_partial_partial_20260516_015239`.
+- This aggregation uses the actual trade-level CSVs sorted by decision time,
+  not hand-added daily summaries, so max drawdown and Sharpe are computed on
+  the real external trade sequence.
+- Same frozen robust rules as the April rerun:
+  first qualifying signal per event, separate YES/NO executable top asks,
+  visible top quantity gate/cap, as-of BTC minute close and 60m realized vol,
+  Kalshi metadata settlement, Kalshi taker fees, and +2c adverse-entry stress.
+- Combined result:
+
+  | strategy | trades | +2c-stressed PnL | return on $100 | ROP | win rate | max DD | Sharpe |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | `base_f2` | 113 | `-$7.30` | `-7.30%` | `-12.31%` | `46.02%` | `-$10.03` | `-1.43` |
+  | `ttl10_12_entry55_q50` | 32 | `-$1.75` | `-1.75%` | `-11.11%` | `43.75%` | `-$3.97` | `-0.64` |
+  | `ttl6_12` | 102 | `-$4.57` | `-4.57%` | `-8.53%` | `48.04%` | `-$8.38` | `-0.94` |
+
+- Day-level pattern:
+  Jan 9 and Jan 10 were positive, but Jan 11 through Jan 14 erased the edge.
+  This is a regime-transfer failure, not one isolated bad fill.
+- Decision:
+  BTC15M F2 remains rejected for deployment. The April 1-14 run is positive,
+  but it does not survive a separate January external validation window.
+
+2026-05-16 BTC15M F2 streak and single-feature transfer refresh:
+
+- Patched `scripts\analyze_btc15m_f2_streak_patterns.py` to emit
+  `external_gate_checks.csv`, which applies every Apr1-14 train-selected
+  median gate to an untouched external trade file.
+- Fresh diagnostic outputs:
+  - Expanded January external:
+    `backtest_outputs\btc15m_f2_streak_patterns_extcheck_20260516_020408`
+  - May1-12 external:
+    `backtest_outputs\btc15m_f2_streak_patterns_may_extcheck_20260516_020454`
+- Streak result:
+  no exploitable win/loss streak pattern. Loss-streak permutation p-values
+  stayed high:
+  - Apr1-14 `base_f2`: `0.7311`
+  - Apr15-30 `base_f2`: `0.5459`
+  - Jan8-14 `base_f2`: `0.7665`
+  Transition probabilities also did not transfer; for example Jan8-14
+  `base_f2` had `p_win_after_win=46.15%` and
+  `p_win_after_loss=46.67%`.
+- The most tempting transfer gate was `ttl6_12` with
+  `fair_edge_cents < 14.7678`:
+  - Apr1-14 train: 44 trades, `+$5.55`
+  - Apr15-30 validation: 94 trades, `+$3.71`
+  - Jan8-14 external: 50 trades, `+$1.12`
+  - May1-12 external: 60 trades, `-$0.56`
+  This fails full transfer.
+- Strict filter:
+  requiring train PnL > 0, Apr15-30 PnL > 0, Jan8-14 PnL > 0,
+  May1-12 PnL > 0, and at least 10 trades in each external set leaves
+  0 candidates.
+- Decision:
+  F2 streak/recent-outcome gates and simple single-feature gates are rejected.
+  Do not revive them unless a materially new model family or data source is
+  introduced.
+
+2026-05-16 BTC1H simple gate audit:
+
+- Ran a constrained one-feature gate audit from
+  `backtest_outputs\btc1h_highconf_robustness_20260516_012255\all_input_trades.csv`.
+- Split discipline:
+  - Train/selection: Predexon BTC1H through Apr30, excluding `pred_may3_5_visible`.
+  - Validation: Predexon `pred_may3_5_visible`.
+  - Test: May6-12 websocket replay, with 1-second cadence used as the harshest
+    latency/replay cadence.
+  - PnL uses one contract, Kalshi taker fee, and +2c adverse-entry stress.
+- Baselines under +2c stress:
+
+  | variant | train trades | train PnL | May3-5 trades | May3-5 PnL | WS 1s trades | WS 1s PnL | WS 1s win | WS 1s max DD |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|
+  | `high_conf_80` | 27 | `+$3.05` | 19 | `-$1.16` | 35 | `+$0.89` | 74.3% | `-$1.61` |
+  | `high_conf_80_no_chase` | 23 | `+$3.58` | 15 | `+$1.52` | 32 | `-$0.93` | 68.8% | `-$1.88` |
+  | `high_conf_80_entry70_no_chase` | 18 | `+$2.41` | 12 | `+$1.85` | 29 | `+$0.75` | 72.4% | `-$1.82` |
+
+- Eight simple gates were positive on train, May3-5, and WS 1s. The best
+  coherent ones were all variants of `high_conf_80_entry70_no_chase`:
+
+  | gate | train PnL | May3-5 PnL | WS 1s PnL | WS 1s trades | WS 1s max DD |
+  |---|---:|---:|---:|---:|---:|
+  | baseline | `+$2.41` | `+$1.85` | `+$0.75` | 29 | `-$1.82` |
+  | `entry_price >= 0.59` | `+$1.55` | `+$1.04` | `+$0.93` | 27 | `-$1.82` |
+  | `visible_qty < 1500.25` | `+$3.79` | `+$0.82` | `+$0.77` | 22 | `-$0.97` |
+
+- Stress check for `high_conf_80_entry70_no_chase`:
+  - Baseline WS 1s: +2c `+$0.75`, +3c `+$0.46`, +4c `+$0.17`.
+  - `entry_price >= 0.59` WS 1s: +2c `+$0.93`, +3c `+$0.66`, +4c `+$0.39`.
+  - `visible_qty < 1500.25` WS 1s: +2c `+$0.77`, +3c `+$0.55`, +4c `+$0.33`.
+- Decision:
+  `high_conf_80_entry70_no_chase` is still the best BTC1H paper-forward
+  candidate. The `entry_price >= 0.59` subset is a possible future refinement,
+  but it is not live-promotable until the currently running entry70 shadow has
+  enough settled post-freeze trades and still passes the promotion gate.
+
+2026-05-16 BTC1H entry59-70 no-chase paper shadow:
+
+- Implemented paper-only candidate `high_conf_80_entry59_70_no_chase`.
+- Live-engine changes:
+  - Added the strategy name to `SUPPORTED_SIGNAL_STRATEGIES` in
+    `scripts\btc_1hr_research_live.py`.
+  - It reuses the high-confidence `side_probability >= 80%` logic and the
+    existing 10-minute no-chase guard.
+  - It adds a frozen entry band: `0.59 <= entry_price <= 0.70`.
+- Paper wrapper:
+  `scripts\btc_1hr_high_conf80_entry59_70_no_chase_shadow.py`.
+  It forces `--paper`, `flat_max`, one-contract sizing, `$100` shadow bankroll,
+  and separate DB/capture files:
+  - `%USERPROFILE%\.btc_kalshi_bot\btc_1hr_high_conf80_entry59_70_no_chase_shadow.db`
+  - `%USERPROFILE%\.btc_kalshi_bot\btc_1hr_high_conf80_entry59_70_no_chase_shadow_capture.duckdb`
+- Reproducibility wiring:
+  - Added the same variant to `scripts\replay_btc1h_core_ws_counterfactual.py`.
+  - Added the same variant to `scripts\backtest_predexon_orderbooks.py`.
+  - Added the variant to the BTC1H robustness/audit candidate lists.
+- Validation:
+  - `python -m py_compile` passed for the touched live/backtest/audit/test files.
+  - Unit test passed:
+    `test_high_conf_80_entry59_70_no_chase_requires_entry_floor_and_cap`.
+  - Wrapper dry-run passed; it connected to Kalshi and Kraken websockets and
+    exited cleanly without live order submission.
+  - Direct Predexon smoke:
+    `backtest_outputs\predexon_btc1h_entry59_70_smoke_20260516_022554`.
+    Window Mar24-Apr1, 4 trades, `+$1.27`, 100% win. This smoke only proves
+    wiring; it is too small to validate edge.
+  - Websocket replay smoke:
+    `backtest_outputs\btc1h_entry59_70_ws_smoke_20260516_023258`.
+    It found 0 trades in the first 3 replay events, but successfully produced
+    summary/trades artifacts for the new variant.
+- Started paper-only forward shadow:
+  - PID at start/check: `7828`
+  - stdout:
+    `logs\btc_1hr_high_conf80_entry59_70_no_chase_shadow_20260516_021231.out.log`
+  - stderr file exists and was empty at startup.
+  - Startup log confirmed mode `paper`, strategy
+    `high_conf_80_entry59_70_no_chase`, capture enabled, and Kalshi/Kraken
+    websockets connected.
+- Decision:
+  this is a paper-forward candidate only. It is not live-promotable until it has
+  enough settled post-freeze paper trades and the promotion audit still passes.
+
+2026-05-16 BTC1H entry59-70 derived promotion-audit wiring:
+
+- Added `scripts\analyze_btc1h_entry59_70_derived.py`.
+  It creates a conservative derived audit by filtering already-generated
+  `high_conf_80_entry70_no_chase` trade rows to `0.59 <= entry_price <= 0.70`.
+  This is not a full causal replay because it does not search for a later
+  in-band signal when a cheap first signal was filtered out.
+- Fresh output:
+  `backtest_outputs\btc1h_entry59_70_derived_20260516_0241`.
+- Conservative +2c-stressed result:
+
+  | source | trades | PnL | win rate | max DD | Sharpe |
+  |---|---:|---:|---:|---:|---:|
+  | Predexon prior replay rows | 24 | `+$2.59` | 79.17% | `-$1.44` | 1.29 |
+  | May6-12 websocket replay rows | 90 | `+$13.51` | 85.56% | `-$2.95` | 4.00 |
+
+- Harsh 1-second websocket cadence subset:
+
+  | cadence | trades | PnL | win rate | max DD | Sharpe |
+  |---:|---:|---:|---:|---:|---:|
+  | 1s | 27 | `+$0.93` | 74.07% | `-$1.82` | 0.41 |
+  | 5s | 17 | `+$3.94` | 94.12% | `-$0.73` | 3.84 |
+  | 10s | 15 | `+$1.46` | 80.00% | `-$0.85` | 0.89 |
+  | 15s | 13 | `+$3.82` | 100.00% | `$0.00` | 46.21 |
+  | 20s | 9 | `+$1.59` | 88.89% | `-$0.74` | 1.54 |
+  | 30s | 9 | `+$1.77` | 88.89% | `-$0.72` | 1.71 |
+
+- Patched `scripts\audit_btc1h_promotion_gate.py` to read the latest
+  `btc1h_entry59_70_derived_*` output as a labelled non-promotable evidence
+  source.
+- Fresh promotion gate:
+  `backtest_outputs\btc1h_promotion_gate_audit_20260516_023854`.
+- Gate status:
+  `high_conf_80_entry59_70_no_chase` does not pass. Failure reasons:
+  `predexon_stress_not_positive_or_too_few`,
+  `breakeven_null_not_strong`, `too_few_postfreeze_shadow_settled`,
+  `research_only_extra_entry_gate_requires_forward_shadow`, and
+  `derived_entry_band_audit_not_full_causal_replay`.
+- Also added the variant to `scripts\analyze_btc1h_highconf_significance.py`
+  so future full-causal robustness/significance reruns remain aligned.
+
+2026-05-16 BTC15M F2 robust Apr1-14 rerun on request:
+
+- Fresh command:
+  `python -u scripts\backtest_btc15m_f2_predexon_range.py --start 2026-04-01 --end 2026-04-15 --out-dir backtest_outputs\btc15m_f2_robust_apr1_14_fresh_20260516_025621 --threads 12 --stress-cents 2`.
+- Output:
+  `backtest_outputs\btc15m_f2_robust_apr1_14_fresh_20260516_025621`.
+- Data/rules:
+  Predexon BTC15M top/level-0 snapshots from Apr 1 00:00 UTC through Apr 15
+  00:00 UTC, 1,218,851 raw top rows, 303,181 feature rows, 1,283 events,
+  first qualifying signal per event, one-contract top-of-book executable fill,
+  separate YES/NO book construction, causal BTC minute close only, Kalshi taker
+  fees, and +2c adverse entry stress.
+- Results:
+
+  | strategy | trades | PnL | return on $100 | ROP | win rate | max DD | Sharpe |
+  |---|---:|---:|---:|---:|---:|---:|---:|
+  | `base_f2` | 96 | `+$9.48` | `+9.48%` | 18.76% | 62.50% | `-$2.70` | 2.02 |
+  | `ttl10_12_entry55_q50` | 29 | `+$4.96` | `+4.96%` | 32.98% | 68.97% | `-$1.66` | 1.88 |
+  | `ttl6_12` | 89 | `+$8.83` | `+8.83%` | 18.72% | 62.92% | `-$2.41` | 1.93 |
+
+- Interpretation:
+  this reproduces the positive Apr1-14 in-sample/training result. It should not
+  be read as deployable by itself because later external checks, especially Jan
+  partial and live websocket transfer, were weaker or negative for broad F2.
+
+2026-05-16 BTC1H entry59-70 direct full-causal replay aggregate:
+
+- Completed the pending direct Predexon replay chunks for
+  `high_conf_80_entry59_70_no_chase`:
+  - `backtest_outputs\predexon_btc1h_entry59_70_direct_mar24_apr01_20260516_024401`
+  - `backtest_outputs\predexon_btc1h_entry59_70_direct_apr01_apr08_20260516_024401`
+  - `backtest_outputs\predexon_btc1h_entry59_70_direct_apr08_apr15_20260516_024401`
+  - `backtest_outputs\predexon_btc1h_entry59_70_direct_may03_may06_20260516_024401`
+- Patched `scripts\aggregate_btc1h_entry59_70_direct.py`:
+  - fixed mixed-format UTC parsing so fractional-second rows are not silently
+    dropped;
+  - distinguishes zero-trade chunks from truly missing trade files.
+- Correct aggregate output:
+  `backtest_outputs\btc1h_entry59_70_direct_aggregate_20260516_0309`.
+- +2c stress direct replay summary:
+
+  | split | trades | PnL | win rate | max DD | Sharpe |
+  |---|---:|---:|---:|---:|---:|
+  | all | 16 | `+$2.80` | 87.50% | `-$1.41` | 2.03 |
+  | Mar24-Apr1 train | 4 | `+$1.19` | 100.00% | `$0.00` | 11.47 |
+  | Apr1-Apr8 train | 0 | `$0.00` | n/a | `$0.00` | n/a |
+  | Apr8-Apr15 validation | 2 | `+$0.57` | 100.00% | `$0.00` | 19.00 |
+  | May3-May6 external | 10 | `+$1.04` | 80.00% | `-$1.41` | 0.77 |
+
+- Interpretation:
+  the full-causal direct replay is positive, but the evidence is thin and uneven:
+  Apr1-Apr8 produced no trades, Apr8-Apr15 has only 2 validation trades, and May
+  external weakens the Sharpe materially. Keep this as a paper-shadow candidate,
+  not a promoted live strategy, until it accumulates settled forward trades.
+
+2026-05-16 BTC1H entry59-70 safety review and first paper fill:
+
+- Subagent review found a real safety gap: although intended as paper-only,
+  `high_conf_80_entry59_70_no_chase` was selectable through the generic live
+  executor.
+- Patched `scripts\btc_1hr_research_live.py` with
+  `PAPER_ONLY_SIGNAL_STRATEGIES` and a `validate_args` live-mode block.
+- Patched `scripts\btc_1hr_high_conf80_entry59_70_no_chase_shadow.py` so the
+  wrapper rejects overrides for `--signal-strategy`, `--sizing-policy`,
+  `--db-path`, and `--capture-db-path`.
+- Added targeted tests in `scripts\test_research_live_safety.py` and ran:
+  `python -m py_compile scripts\btc_1hr_research_live.py scripts\btc_1hr_high_conf80_entry59_70_no_chase_shadow.py scripts\aggregate_btc1h_entry59_70_direct.py scripts\test_research_live_safety.py`
+  plus:
+  `python -m unittest scripts.test_research_live_safety.ResearchLiveSafetyTests.test_high_conf_80_entry59_70_no_chase_requires_entry_floor_and_cap scripts.test_research_live_safety.ResearchLiveSafetyTests.test_entry59_70_strategy_is_blocked_in_live_mode scripts.test_research_live_safety.ResearchLiveSafetyTests.test_entry59_70_shadow_wrapper_rejects_identity_overrides`.
+  Result: 3 tests passed.
+- Wrapper smoke with `--dry-run --once --paper-report-sec 15 --no-capture`
+  started cleanly and connected/disconnected Kalshi + Kraken websockets. A smoke
+  without `--no-capture` collided with the already-running shadow DuckDB writer,
+  which is expected single-writer behavior.
+- First post-freeze paper-shadow trade:
+  `KXBTCD-26MAY1605-T78399.99`, side NO, entry 70c, model p_yes 0.1427,
+  net edge 13.73c, 1 contract, paper filled at `2026-05-16T08:52:09Z`.
+  Hourly paper report at 03:00 local showed settled win, realized PnL `+$0.28`,
+  bankroll `$100.28`, trades 1, wins 1.
+- Patched `scripts\analyze_btc1h_highconf_significance.py` to honor
+  `--out-dir`, parse mixed UTC timestamps correctly, and explicitly derive
+  `high_conf_80_entry59_70_no_chase` rows from `entry70_no_chase` rows with
+  `0.59 <= entry_price <= 0.70` for significance sanity checks.
+- Fresh significance output:
+  `backtest_outputs\btc1h_highconf_significance_20260516_0312`.
+  Derived entry59-70 Predexon null p-value: `0.1310` on 24 trades, weaker than
+  entry70 (`0.0428`) and no-chase (`0.0277`).
+- Fresh promotion gate:
+  `backtest_outputs\btc1h_promotion_gate_audit_20260516_0312`.
+  Result: still not promoted. It has 1 settled post-freeze shadow trade, but
+  fails on weak breakeven-null p-value, too few shadow trades, research-only
+  forward-gate requirements, and the derived-audit caveat.
+
+2026-05-16 BTC1H high-confidence direct comparison refresh:
+
+- Ran like-for-like direct Predexon causal replays for:
+  `high_conf_80_no_chase`, `high_conf_80_entry70_no_chase`, and
+  `high_conf_80_entry59_70_no_chase`.
+- Replay chunks:
+  - `backtest_outputs\predexon_btc1h_highconf_direct_mar24_apr01_20260516_0320`
+  - `backtest_outputs\predexon_btc1h_highconf_direct_apr01_apr08_20260516_0320`
+  - `backtest_outputs\predexon_btc1h_highconf_direct_apr08_apr15_20260516_0320`
+  - `backtest_outputs\predexon_btc1h_highconf_direct_apr15_apr23_20260516_0340`
+  - `backtest_outputs\predexon_btc1h_highconf_direct_apr23_may01_20260516_0340`
+  - `backtest_outputs\predexon_btc1h_highconf_direct_may03_may06_20260516_0320`
+- Added `scripts\aggregate_btc1h_highconf_direct.py` and aggregate output:
+  `backtest_outputs\btc1h_highconf_direct_aggregate_20260516_0349`.
+- +2c stress all-window direct replay:
+
+  | variant | trades | PnL | win rate | max DD | Sharpe | breakeven-null p |
+  |---|---:|---:|---:|---:|---:|---:|
+  | `high_conf_80_no_chase` | 39 | `+$5.37` | 82.05% | `-$1.81` | 2.24 | 0.0399 |
+  | `high_conf_80_entry70_no_chase` | 32 | `+$4.78` | 81.25% | `-$1.41` | 2.17 | 0.0479 |
+  | `high_conf_80_entry59_70_no_chase` | 27 | `+$3.41` | 81.48% | `-$1.44` | 1.68 | 0.1100 |
+
+- Split findings:
+  - Apr23-May1 is the weakest April slice: no-chase and entry70 both barely
+    positive at `+$0.06`; entry59-70 is negative at `-$0.37`.
+  - May3-May6 external: entry70 is strongest (`+$1.85`, 12 trades), no-chase is
+    next (`+$1.52`, 15 trades), entry59-70 is weaker (`+$1.04`, 10 trades).
+- Paper-shadow status from logs/SQLite:
+  - `high_conf_80_no_chase`: 2 settled paper wins, realized `+$0.55`.
+  - `high_conf_80_entry70_no_chase`: 1 settled paper win, realized `+$0.28`.
+  - `high_conf_80_entry59_70_no_chase`: 1 settled paper win, realized `+$0.28`.
+- Interpretation:
+  entry59-70 is not the best candidate after direct comparison; it filters out
+  too much and has weaker null evidence. The live-forward candidates to keep
+  shadowing are no-chase and entry70. Entry70 has the cleaner drawdown/cadence
+  profile; no-chase has higher total PnL but previously showed 1-second
+  websocket cadence instability.
+
+2026-05-16 BTC1H high-confidence older Predexon validation:
+
+- Checked local KXBTCD Predexon coverage and found BTC1H data from Feb9 through
+  May6. Added older direct replay validation for Feb9-Mar24.
+- Initial Feb9-Feb21 12-day chunk OOMed during Pandas merge, so it was split
+  into smaller chunks:
+  - `predexon_btc1h_highconf_direct_feb09_feb13_20260516_0420`: no trades.
+  - `predexon_btc1h_highconf_direct_feb13_feb17_20260516_0420`: no trades.
+  - `predexon_btc1h_highconf_direct_feb17_feb19_20260516_0425`: no trades.
+  - `predexon_btc1h_highconf_direct_feb19_feb21_20260516_0425`: no trades.
+  - `predexon_btc1h_highconf_direct_feb21_mar05_20260516_0355`: no trades.
+  - `predexon_btc1h_highconf_direct_mar05_mar16_20260516_0355`: no trades.
+  - `predexon_btc1h_highconf_direct_mar16_mar24_20260516_0355`: one
+    no-chase trade, win.
+- Corrected `scripts\aggregate_btc1h_highconf_direct.py` split labels so
+  pre-Mar24 rows are labelled `feb09_mar24_old_val`.
+- Full aggregate output:
+  `backtest_outputs\btc1h_highconf_direct_aggregate_feb09_may06_20260516_0433`.
+- +2c stress full direct replay, Feb9-May6 available windows:
+
+  | variant | trades | PnL | win rate | max DD | Sharpe | breakeven-null p |
+  |---|---:|---:|---:|---:|---:|---:|
+  | `high_conf_80_no_chase` | 40 | `+$5.60` | 82.50% | `-$1.81` | 2.33 | 0.0344 |
+  | `high_conf_80_entry70_no_chase` | 32 | `+$4.78` | 81.25% | `-$1.41` | 2.17 | 0.0479 |
+  | `high_conf_80_entry59_70_no_chase` | 27 | `+$3.41` | 81.48% | `-$1.44` | 1.68 | 0.1100 |
+
+- Interpretation:
+  the older Feb9-Mar24 data does not falsify the high-conf candidates; it mostly
+  has no qualifying trades. The best current candidates remain no-chase and
+  entry70. No-chase has better total/statistical evidence; entry70 has lower
+  drawdown and avoids the expensive >70c rows. Neither is ready for live
+  promotion without more settled forward shadow trades and websocket-cadence
+  agreement.
+
+2026-05-16 BTC1H high-confidence promotion safety hardening:
+
+- Tightened `scripts\btc_1hr_research_live.py` so all high-confidence research
+  candidates are blocked in generic `live` mode until promotion:
+  `high_conf_80`, `high_conf_80_no_chase`, `high_conf_80_entry70_no_chase`,
+  and `high_conf_80_entry59_70_no_chase`.
+- Locked the shadow wrappers for `high_conf_80`, `high_conf_80_no_chase`, and
+  `high_conf_80_entry70_no_chase` the same way the entry59-70 wrapper was
+  locked: callers cannot override `--signal-strategy`, `--sizing-policy`,
+  `--db-path`, or `--capture-db-path`.
+- Added targeted safety tests for all high-conf live-mode blocks and shadow
+  wrapper override rejection.
+- Validation:
+  `python -m py_compile scripts\btc_1hr_research_live.py scripts\btc_1hr_high_conf80_shadow.py scripts\btc_1hr_high_conf80_no_chase_shadow.py scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py scripts\btc_1hr_high_conf80_entry59_70_no_chase_shadow.py scripts\test_research_live_safety.py`
+  and targeted unittest for the high-confidence guards/wrappers passed:
+  5 tests OK.
+- Smoke-tested all four wrappers with `--dry-run --once --paper-report-sec 15
+  --no-capture`; each started with the correct strategy and connected to
+  Kalshi/Kraken websockets. Capture was disabled for the smoke to avoid
+  colliding with the already-running shadow DuckDB writers.
+- Refreshed promotion gate:
+  `backtest_outputs\btc1h_promotion_gate_audit_20260516_0410`.
+  Result: 0 high-confidence candidates are promoted.
+
+2026-05-16 BTC1H no-chase 1s websocket instability diagnostic:
+
+- Added `scripts\analyze_btc1h_no_chase_ws_instability.py`.
+  This is a fixed diagnostic, not a threshold search. It reads the frozen
+  high-confidence robustness artifact and asks whether the existing 70c entry
+  cap explains `high_conf_80_no_chase` failing the 1-second websocket cadence.
+- Output:
+  `backtest_outputs\btc1h_no_chase_ws_instability_20260516_0415`.
+- +2c stress diagnostic on websocket rows:
+  - 1s `high_conf_80_no_chase` rows with entry `>70c`:
+    11 trades, combined `-$1.41`.
+  - 1s `high_conf_80_no_chase` rows with entry `<=70c`:
+    21 trades, `+$0.48`.
+  - At 5s, `>70c` no-chase rows also lose `-$1.61`, while `<=70c` rows make
+    `+$3.92`.
+- Interpretation:
+  the 70c cap is not arbitrary curve-fitting after this diagnostic; it directly
+  removes the rows responsible for the harsh websocket cadence instability.
+  `high_conf_80_entry70_no_chase` is now the cleaner forward candidate than
+  broad no-chase, even though broad no-chase has slightly higher aggregate
+  Predexon PnL.
+
+2026-05-16 BTC1H promotion gate updated with direct aggregate:
+
+- Patched `scripts\audit_btc1h_promotion_gate.py` so when the Feb9-May6 direct
+  aggregate exists it is used for the Predexon trade-count/PnL/null gate. The
+  audit also records the no-chase 1s `>70c` and `<=70c` diagnostic PnL columns.
+- Fresh output:
+  `backtest_outputs\btc1h_promotion_gate_audit_20260516_0418`.
+- Result:
+  0 candidates pass.
+- Updated gate table highlights:
+  - `high_conf_80_no_chase`: direct 40 trades, `+$5.60`, p `0.0344`, but fails
+    websocket cadence because 1s replay is negative. Diagnostic: 1s `>70c`
+    no-chase rows `-$1.41`, 1s `<=70c` rows `+$0.48`.
+  - `high_conf_80_entry70_no_chase`: direct 32 trades, `+$4.78`, p `0.0479`,
+    all websocket cadences positive, but only 1 settled post-freeze paper trade.
+  - `high_conf_80_entry59_70_no_chase`: direct 27 trades, `+$3.41`, p `0.1100`,
+    not significant enough and only 1 settled post-freeze paper trade.
+- Current decision:
+  `entry70_no_chase` is the best forward-test candidate, not a deployment. It
+  needs more settled paper-shadow trades before live promotion.
+
+2026-05-16 BTC15M F2 robust Apr1-14 and transfer validation:
+
+- Refreshed the frozen BTC15M F2 validator on Apr1-14 with robust rules:
+  one-contract taker fills, first qualifying signal per event, separate YES/NO
+  executable top asks, visible top quantity gate, causal BTC as-of joins, no
+  candle high/low decision data, +2c adverse entry stress, and proxy
+  near-strike drops when exact settlement metadata is missing.
+- Output:
+  `backtest_outputs\btc15m_f2_robust_apr1_14_fresh_20260516_025621`.
+- Apr1-14 +2c stress:
+  - `base_f2`: 96 trades, `+$9.48`, 62.50% win, max DD `-$2.70`, Sharpe 2.02.
+  - `ttl6_12`: 89 trades, `+$8.83`, 62.92% win, max DD `-$2.41`, Sharpe 1.93.
+  - `ttl10_12_entry55_q50`: 29 trades, `+$4.96`, 68.97% win, max DD `-$1.66`,
+    Sharpe 1.88.
+- Refreshed live websocket transfer check on the full current BTC15M capture:
+  `2026-05-12 10:42:45 UTC` through about `2026-05-16 10:18 UTC`,
+  7.7M top-book rows and 363 events. Output:
+  `backtest_outputs\btc15m_f2_live_ws_transfer_20260516_041505`.
+- Live websocket proxy +2c stress:
+  - `base_f2`: 113 trades, `-$7.63`, 50.44% win, max DD `-$11.36`, Sharpe -1.44.
+  - `ttl6_12`: 104 trades, `-$5.29`, 51.92% win, max DD `-$9.66`, Sharpe -1.04.
+  - `ttl10_12_entry55_q50`: 39 trades, `+$3.76`, 64.10% win, max DD `-$1.73`,
+    Sharpe 1.23.
+- Refreshed Jan7-17 Predexon in smaller chunks after the full 10-day materialize
+  hit a memory ceiling. Outputs:
+  `backtest_outputs\btc15m_f2_predexon_jan07_10_fresh_20260516_042521`,
+  `backtest_outputs\btc15m_f2_predexon_jan10_13_fresh_20260516_042521`, and
+  `backtest_outputs\btc15m_f2_predexon_jan13_17_fresh_20260516_042521`.
+- Jan7-17 chunk aggregate +2c stress:
+  - `base_f2`: 196 trades, `-$12.96`, 45.41% win.
+  - `ttl6_12`: 179 trades, `-$10.22`, 46.37% win.
+  - `ttl10_12_entry55_q50`: 54 trades, `-$3.59`, 42.59% win.
+- Existing exact Predexon checks:
+  - Apr15-30 strict `ttl10_12_entry55_q50`: 49 trades, `+$4.12`, 61.22% win.
+  - May1-12 strict `ttl10_12_entry55_q50`: 17 trades, `-$0.93`, 47.06% win.
+- Interpretation:
+  broad F2 and `ttl6_12` are rejected because they lose on live websocket
+  transfer. The strict `ttl10_12_entry55_q50` subset is the only F2-style
+  candidate still worth shadowing: it wins Apr1-14, Apr15-30, and May12-16
+  live capture, but it loses Jan7-17 and May1-12. January is weaker evidence
+  because those rows use `coinbase_open_minute_proxy` target metadata, while
+  April/May are mostly Kalshi metadata, but May1-12 is still a real negative
+  transfer check. Do not deploy strict F2 yet; keep it as paper shadow only
+  and require more future websocket holdout before promotion.
+
+2026-05-16 BTC15M live-compatible XGBoost future holdout check:
+
+- Freeze protocol:
+  `docs\2026-05-15_btc15m_future_holdout_freeze.md`.
+  Candidate was frozen before future evaluation:
+  `backtest_outputs\btc15m_live_compatible_models_20260515`,
+  model `xgboost_tabular`, gate `pred_win_prob >= 0.84` and
+  `pred_ev >= 0.14`, live-compatible features only.
+- Ran the frozen model on post-freeze local websocket capture only:
+  `2026-05-15 23:36:03 UTC` through `2026-05-16 10:32:53 UTC`.
+  Output:
+  `backtest_outputs\btc15m_livecompat_xgb_future_ws_20260516_043252`.
+- Post-freeze websocket result:
+  - `xgboost_tabular`: 5 trades, raw `-$1.25`, +2c stress `-$1.35`,
+    40.00% win, max DD `-$1.50`, Sharpe -1.18.
+  - `logistic_calibrator`: 29 trades, raw `-$0.82`, +2c stress `-$1.40`,
+    58.62% win, max DD `-$5.28`, Sharpe -0.52.
+- Diagnostic:
+  the XGBoost failures included high-entry 68-72c rows where the lognormal
+  fair-value model often disagreed or showed weak edge. Simple sanity overlays
+  tested read-only on the already-selected model trades did not rescue the
+  frozen candidate without killing nearly all trade count; e.g. `entry<=60c`
+  reduced post-freeze XGBoost to 1 losing trade, and fair-value agreement rules
+  often produced zero post-freeze trades.
+- Decision:
+  demote the live-compatible XGBoost candidate. It is no longer a leading
+  BTC15M promotion candidate because its first clean future websocket holdout
+  failed. Keep the artifact for research, not deployment.
+
+2026-05-16 BTC15M RV/fair-value calibration sanity check:
+
+- Tested whether the F2 fair-value model failure is just a realized-volatility
+  scale problem. Recomputed lognormal probabilities from causal `btc_spot`,
+  `floor_strike`, `ttl_min`, and `rv_60m * scale` for scales
+  `0.50, 0.75, 1.00, 1.25, 1.50, 2.00`.
+- Output:
+  `backtest_outputs\btc15m_rv_scale_sanity_20260516_0445\rv_scale_summary.csv`.
+- Protocol:
+  no websocket tuning; select the best scale by Apr1-14 only, then inspect
+  Apr15-30, May1-12, and Jan7-17 chunks. Rules used the same first-event,
+  top-ask, visible-quantity, taker-fee, and +2c stress assumptions as the F2
+  validators.
+- Result:
+  Apr1-14 selects scale `1.00` for both broad F2 and strict
+  `ttl10_12_entry55_q50`.
+  - Strict F2 scale `1.00`: Apr1-14 `+$4.96`, Apr15-30 `+$4.12`,
+    May1-12 `-$0.93`, Jan7-17 `-$9.65`.
+  - Strict F2 scale `2.00`: Jan7-17 improves to `+$2.11`, but Apr15-30 falls
+    to `-$0.14`, May1-12 remains `-$1.09`, and trade count collapses.
+  - Broad F2 scale `1.00`: Apr1-14 `+$9.48`, Apr15-30 `+$3.11`,
+    May1-12 `-$4.69`, Jan7-17 `-$30.37`.
+- Interpretation:
+  there is no single RV multiplier that fixes transfer. The bad windows are not
+  explained by a stable volatility under/over-scaling issue. More complex fair
+  value work needs a regime-aware model and must validate on future websocket
+  capture; do not patch production with a volatility multiplier.
+
+2026-05-16 BTC15M orderbook/history feature pass:
+
+- Read-only subagent review of same-contract price-history and orderbook
+  features found no deployable additive rule.
+- Summary:
+  `book_imbalance` and `micropressure` filters made small Apr1-14 gains on
+  strict F2, but did not repair May/Jan transfer. `yes_mid`/`side_mid` history
+  features were too sparse in the selected strict-F2 artifacts outside April,
+  and momentum/no-chase history filters failed train/validation or lacked
+  coverage.
+- Decision:
+  keep same-contract price-history features as research-only. They are not a
+  robust deployment gate until the websocket replay artifact stores the same
+  feature columns and a frozen rule passes future capture.
+
+2026-05-16 candidate readiness and data-fidelity audit:
+
+- Read-only subagent audit compared the current tracked candidates:
+  BTC1H `high_conf_80_entry70_no_chase`, BTC15M strict
+  `ttl10_12_entry55_q50`, and BTC15M live-compatible XGBoost.
+- Current ranking:
+  1. BTC1H `high_conf_80_entry70_no_chase`: closest to deployable, but still
+     paper-only. Evidence: Feb9-May6 direct aggregate 32 trades, `+$4.78`,
+     81.25% win, max DD `-$1.41`, p `0.0479`; websocket cadence checks
+     positive. Blocker: only 1 settled post-freeze paper trade.
+  2. BTC15M strict `ttl10_12_entry55_q50`: keep as lower-confidence shadow.
+     Evidence: wins Apr1-14, Apr15-30, and May12-16 local websocket proxy
+     replay. Blockers: loses May1-12 and Jan7-17; official-settlement subset
+     in live replay is only 6 trades.
+  3. BTC15M live-compatible XGBoost/logistic: demoted/rejected for promotion.
+     Evidence: first clean post-freeze websocket holdout lost, and April-only
+     repair rules either fail test, vanish on websocket, or have too little
+     sample size.
+- Data-fidelity hierarchy:
+  - Promotion-grade: local live websocket capture with official Kalshi
+    lifecycle/private result, plus exact first-signal-per-event FOK/reprice
+    evidence.
+  - Useful but not promotion-grade: Predexon snapshots. They are valuable for
+    broad rejection and rough transfer, but provider-time snapshots cannot prove
+    live FOK fillability, queue position, or websocket gap behavior.
+  - Discount heavily: proxy settlement and January BTC15M proxy-target metadata.
+    January is currently useful as a warning sign, not a definitive promotion
+    gate.
+- Operational note:
+  current BTC15M shadow log is dry-run style and can print repeated
+  `would FOK` messages for one event. Treat it as opportunity telemetry, not a
+  settled PnL ledger, unless the wrapper records first-event paper fills with
+  official settlement.
+
+2026-05-16 BTC15M strict F2 paper-shadow fix:
+
+- Patched `scripts\btc15m_lowdd_live.py` to support a real `--mode paper`
+  path for BTC15M with a separate mock bankroll. Paper mode now writes
+  `paper_filled` rows under `paper_<live_mode>` and can report realized/open
+  paper PnL from the local trade DB without depending on the real Kalshi
+  portfolio.
+- Patched `scripts\btc15m_f2_ttl10_12_shadow.py` from dry-run to paper mode
+  with `$100` mock bankroll and the frozen strict F2 gates:
+  TTL `10-12m`, spread `<=2c`, entry `2-55c`, side fair probability `>=60%`,
+  fair edge `>=12c`, visible top ask quantity `>=50`, max one contract, and
+  max final reprice worsening `2c`.
+- Verification:
+  `python -m py_compile scripts\btc15m_lowdd_live.py scripts\btc15m_f2_ttl10_12_shadow.py scripts\test_btc15m_shadow_config.py`
+  passed. `python -m unittest scripts.test_btc15m_shadow_config` passed. A
+  20-second paper-mode smoke run connected to Kalshi and Kraken websockets,
+  used the `$100` mock bankroll, logged paper PnL reports, and exited cleanly.
+- Restarted only the old BTC15M strict shadow process. New log:
+  `logs\btc15m_f2_ttl10_12_shadow_20260516_045857.out.log`. It is running in
+  paper mode and writing to
+  `%USERPROFILE%\.btc_kalshi_bot\btc15m_f2_ttl10_12_shadow_trades.db`.
+
+2026-05-16 BTC15M F2 win/loss streak and pattern detectability:
+
+- Script:
+  `scripts\analyze_btc15m_f2_streak_patterns.py`.
+- Main output:
+  `backtest_outputs\btc15m_f2_streak_patterns_20260516_050137`.
+  External checks:
+  `backtest_outputs\btc15m_f2_streak_patterns_may_external_20260516_0503`
+  and
+  `backtest_outputs\btc15m_f2_streak_patterns_jan_external_20260516_0503`.
+- Protocol:
+  Apr1-14 was diagnostic/training, Apr15-30 validation, May1-12 and Jan13-17
+  external checks. This pass was intentionally read-only and did not use future
+  websocket data for fitting.
+- Result:
+  there is no convincing Markov/streak signal. For strict
+  `ttl10_12_entry55_q50`, Apr1-14 `p(win after win)=0.684`,
+  `p(win after loss)=0.667`, Fisher p `1.000`; Apr15-30
+  `p(win after win)=0.567`, `p(win after loss)=0.667`, Fisher p `0.554`.
+  Max loss streak permutation p-values were high, so observed loss streaks look
+  compatible with random clustering.
+- Several median gates looked tempting on Apr15-30 but failed transfer:
+  `base_f2 rv_60m >= 0.3198` was Apr15-30 `+$8.62`, May1-12 `+$0.66`, but
+  Jan13-17 `-$8.98`; `base_f2 ttl_min >= 9.11` was Apr15-30 `+$3.37`,
+  May1-12 `+$2.11`, but Jan13-17 `-$3.92`; `base_f2 distance_bps >= -4.43`
+  was Apr15-30 `+$1.56`, May1-12 `+$2.54`, but Jan13-17 `-$8.05`.
+- ML sanity on the same train/validation split did not produce a deployable
+  BTC15M streak/pattern model. Logistic gates improved broad F2 validation
+  (`base_f2` selected 81/184 Apr15-30 trades for `+$5.29` vs all `+$3.11`),
+  but this is only a hypothesis and needs external/live transfer. HGB overfit:
+  train AUC high, validation PnL weak/negative.
+- Decision:
+  do not add a streak, prior-win, RV, TTL, or distance gate to production. The
+  strict F2 paper shadow remains useful for future websocket evidence, but
+  streak structure is not currently an exploitable edge.
+
+2026-05-16 BTC15M F2 conservative entry/liquidity gate rerun:
+
+- A read-only failure-window review suggested strict F2 plus `entry <= 0.50`
+  and `visible_qty >= 250` might rescue the bad windows. I added this as a
+  named fixed rule in `scripts\backtest_btc15m_f2_predexon_range.py`:
+  `ttl10_12_entry50_q250`.
+- Important correction:
+  a hand-filtered estimate looked too good because it filtered already-selected
+  trades. The proper validator applies the gate before first-event selection,
+  preserving first qualifying signal semantics.
+- Clean Predexon reruns with +2c stress:
+  - Apr1-14:
+    `ttl10_12_entry55_q50` 28 trades, `+$4.48`, 67.86% win, max DD `-$1.66`;
+    `ttl10_12_entry50_q250` 21 trades, `+$3.70`, 66.67% win, max DD `-$1.03`.
+  - Apr15-30:
+    `ttl10_12_entry55_q50` 47 trades, `+$4.11`, 61.70% win, max DD `-$2.23`;
+    `ttl10_12_entry50_q250` 35 trades, `+$4.41`, 62.86% win, max DD `-$1.49`.
+  - May1-12:
+    `ttl10_12_entry55_q50` 17 trades, `-$0.93`, 47.06% win, max DD `-$3.15`;
+    `ttl10_12_entry50_q250` 10 trades, `+$1.06`, 60.00% win, max DD `-$1.03`.
+  - Jan13-17:
+    `ttl10_12_entry55_q50` 29 trades, `-$4.44`, 34.48% win, max DD `-$4.48`;
+    `ttl10_12_entry50_q250` 15 trades, `-$2.33`, 33.33% win, max DD `-$2.38`.
+- Live websocket replay through `2026-05-16 11:13:47 UTC`:
+  `backtest_outputs\btc15m_f2_live_ws_entry50_q250_20260516_0520`.
+  Proxy +2c: 33 trades, `+$4.05`, 63.64% win, max DD `-$1.57`,
+  Sharpe `1.45`. Official subset: 6 trades, `+$1.86`, 83.33% win.
+- Decision:
+  `ttl10_12_entry50_q250` is better than strict F2 on May1-12 and live
+  websocket replay, and has lower drawdown in April, but it still fails
+  Jan13-17. Keep it as a research/paper-shadow candidate only. It is not
+  deployable until the January failure is explained or enough future websocket
+  evidence demonstrates the older Predexon/proxy regime is not representative.
+
+2026-05-16 BTC15M source-of-truth and liquidity/regime follow-up:
+
+- Expanded `scripts\backtest_btc15m_f2_predexon_range.py` with causal rule
+  variants, applied before first-event selection:
+  `ttl10_12_entry50_q500`, `ttl10_12_entry50_q1000`,
+  `ttl10_12_entry50_q500_rvmax040`, and
+  `ttl10_12_entry50_q250_qspeed05`.
+- New Predexon outputs:
+  `backtest_outputs\btc15m_f2_liq_regime_apr01_14_20260516_052801`,
+  `backtest_outputs\btc15m_f2_liq_regime_apr15_30_20260516_052801`,
+  `backtest_outputs\btc15m_f2_liq_regime_may01_12_20260516_052801`, and
+  `backtest_outputs\btc15m_f2_liq_regime_jan13_17_20260516_052801`.
+- +2c stress results:
+  - Apr1-14: q250 `22 / +$4.18 / 68.18% / DD -$1.03`;
+    q500 `21 / +$3.72 / 66.67% / DD -$1.03`; q1000
+    `18 / +$3.31 / 66.67% / DD -$1.02`; qspeed05
+    `20 / +$5.21 / 75.00% / DD -$0.97`.
+  - Apr15-30: q250 `37 / +$4.42 / 62.16% / DD -$1.49`;
+    q500 `37 / +$4.46 / 62.16% / DD -$1.49`; q1000
+    `28 / +$3.92 / 64.29% / DD -$1.52`; qspeed05
+    `34 / +$4.08 / 61.76% / DD -$1.89`.
+  - May1-12: q250 `10 / +$1.06 / 60.00% / DD -$1.03`;
+    q500 `9 / +$1.64 / 66.67% / DD -$1.03`; q1000
+    `6 / +$0.93 / 66.67% / DD -$1.03`; qspeed05
+    `9 / +$1.59 / 66.67% / DD -$0.54`.
+  - Jan13-17: q250 `15 / -$2.33 / 33.33% / DD -$2.38`;
+    q500 `11 / -$2.04 / 27.27% / DD -$2.09`; q1000
+    `1 / -$0.34 / 0.00% / DD -$0.34`; qspeed05
+    `10 / -$2.69 / 20.00% / DD -$2.69`.
+- Live websocket replay outputs:
+  `backtest_outputs\btc15m_f2_live_ws_liq_q250_20260516_053202`,
+  `backtest_outputs\btc15m_f2_live_ws_liq_q500_20260516_053202`, and
+  `backtest_outputs\btc15m_f2_live_ws_liq_q1000_20260516_053202`.
+  Spot-model +2c proxy results were q250 `34 / +$3.52 / 61.76% /
+  DD -$1.64`, q500 `31 / +$3.06 / 61.29% / DD -$1.65`, q1000
+  `29 / +$3.01 / 62.07% / DD -$1.76`. Official subset was only
+  6 trades, all proxy/official results matched.
+- Patched `scripts\backtest_btc15m_f2_live_ws_holdout.py` to support
+  `--btc-model rolling60`, a Coinbase/Kraken proxy for the 60-second averaging
+  used by Kalshi crypto settlements. This was a research-only replay option,
+  not a live bot change.
+- Rolling-60 live replay outputs:
+  `backtest_outputs\btc15m_f2_live_ws_roll60_q250_20260516_053920`,
+  `backtest_outputs\btc15m_f2_live_ws_roll60_q500_20260516_053920`, and
+  `backtest_outputs\btc15m_f2_live_ws_roll60_q1000_20260516_053920`.
+  Rolling60 worsened live replay: q250 `60 / -$4.17 / 45.00% /
+  DD -$7.29`, q500 `58 / -$5.09 / 43.10% / DD -$7.88`, q1000
+  `57 / -$5.42 / 42.11% / DD -$8.20`.
+- Source-of-truth audit:
+  Kalshi crypto markets settle from CF Benchmarks RTI 60-second averages, not
+  Coinbase/Kraken last trade. CF Benchmarks says BRTI is the price input for
+  Kalshi Bitcoin event-contract settlement, and Kalshi's help page says crypto
+  expirations average 60 one-second RTI values before expiration.
+- In our January Predexon BTC15M data, `floor_strike` is missing and the fair
+  value model uses a Coinbase open-minute proxy as the price-to-beat. The
+  Kalshi settlement result is official, but the model input is not. Across
+  Jan13-17 events, official result vs Coinbase-proxy result mismatched 48/331
+  events (`14.5%`). For q250 selected trades, official PnL was `-$2.33`, but
+  diagnostic Coinbase-proxy settlement PnL would have been `+$0.67`; for q500,
+  official `-$2.04` vs proxy `+$0.96`.
+- Decision:
+  the January failure should not be ignored, but it is primarily evidence that
+  Coinbase/Kraken proxy fair value is not the correct core model for BTC15M.
+  Do not deploy new BTC15M fair-value variants until we either obtain CF BRTI
+  live/history or prove on a large official/live websocket holdout that the
+  exchange-spot proxy remains profitable after source-mismatch risk.
+
+2026-05-16 BTC1H replay-fidelity correction:
+
+- Patched `scripts\replay_btc1h_core_ws_counterfactual.py` with a
+  `--use-signal-scan-log` mode. This replays top-of-book state forward but
+  only evaluates at captured `signal_scan` timestamps. Ordinary delta scans
+  only evaluate markets changed since the previous scan; full-chain scans are
+  allowed only when the captured scan reason/counts indicate a full scan
+  (`initial_full_book`, `event_refresh`, `btc_candle_refresh`, `kraken`, etc.).
+- Also added `--live-scan-semantics` for quote-group replays and changed the
+  default BTC spot freshness gate from `180s` to the live bot's `15s`.
+- Found and fixed a second replay mismatch source: the script was recomputing
+  `rv_60m` from close-to-close returns, while the live bot's BTC cache uses
+  its normalized live volatility column. Replay now preserves `rv_15m`,
+  `rv_60m`, `rv_1d`, and `rkurt_60m` from the live BTC cache unless
+  `--recompute-btc-rv` is explicitly supplied.
+- Evidence:
+  - Old replay `backtest_outputs\btc1h_entry70_shadow_ws_replay_stride1_20260516_0525`
+    invented an extra `KXBTCD-26MAY1606-T78099.99` winner because it evaluated
+    a stale market inside the full event surface after a different ticker
+    changed.
+  - Corrected signal-log replay
+    `backtest_outputs\btc1h_entry70_livefaithful_onevariant_preserverv_20260516_060429`
+    produced one trade, matching the shadow ledger's one filled trade:
+    `KXBTCD-26MAY1605-T78399.99` NO at `0.70`.
+- Remaining caveat:
+  the corrected replay matches the trade set, but the reconstructed model
+  probability for that trade (`p_yes=0.117`) still differs from the live
+  `signal_scan` / shadow ledger value (`p_yes=0.142`). The most likely cause is
+  live event TTL staleness between event refreshes; the live bot stores
+  `ttl_hours` at event refresh time and reuses it until the next refresh. This
+  did not change pass/fail for the matched trade, but future BTC1H promotion
+  tests should either reconstruct event-refresh TTL exactly or import the live
+  signal path directly.
+
+2026-05-16 BTC15M F2 deployment-gate audit:
+
+- Added `scripts\audit_btc15m_f2_deployment_gate.py`, an audit-only script
+  that freezes four F2 candidates before reading live data:
+  `q250`, `q250_qspeed05`, `q500`, and `q1000`. It loads the live websocket
+  capture once, evaluates every candidate with the same causal execution
+  assumptions, joins the existing historical Predexon windows, and writes a
+  gate report.
+- Output:
+  `backtest_outputs\btc15m_f2_deployment_gate_20260516_135343`.
+- Live capture covered `2026-05-12 10:42:45 UTC` through
+  `2026-05-16 19:53:44 UTC`, with `8,567,091` top-of-book rows,
+  `114,356` BTC rows, `37,237` lifecycle rows, `404` meta markets, and `111`
+  official-result markets.
+- Gate results:
+  - `q250`: Apr1-14 `22 / +$4.18`, Apr15-30 `37 / +$4.42`,
+    May1-12 `10 / +$1.06`, Jan13-17 `15 / -$2.33`,
+    live proxy `37 / +$3.90 / DD -$1.57`, official subset
+    `6 / +$1.86`.
+  - `q250_qspeed05`: Apr1-14 `20 / +$5.21`, Apr15-30
+    `34 / +$4.08`, May1-12 `9 / +$1.59`, Jan13-17
+    `10 / -$2.69`, live proxy `32 / +$2.53 / DD -$2.12`,
+    official subset `5 / +$1.40`.
+  - `q500`: Apr1-14 `21 / +$3.72`, Apr15-30 `37 / +$4.46`,
+    May1-12 `9 / +$1.64`, Jan13-17 `11 / -$2.04`,
+    live proxy `35 / +$2.92 / DD -$2.14`, official subset
+    `6 / +$1.86`.
+  - `q1000`: Apr1-14 `18 / +$3.31`, Apr15-30 `28 / +$3.92`,
+    May1-12 `6 / +$0.93`, Jan13-17 `1 / -$0.34`,
+    live proxy `33 / +$2.75 / DD -$2.26`, official subset
+    `6 / +$1.88`.
+- Verdict:
+  none are deployment-ready under the conservative gate. All have positive
+  live proxy PnL and positive official subset PnL, but all fail because:
+  `jan_negative_or_source_mismatch`, `too_few_live_proxy_trades`, and
+  `too_few_live_official_trades`.
+- Interpretation:
+ these remain promising paper/research candidates, not production candidates.
+ The next proof requirement is more official/live websocket data and a clean
+ BTC15M settlement-source solution; do not promote based on proxy PnL alone.
+
+2026-05-16 BTC15M expanded Predexon/live replay refresh:
+
+- Used all completed BTC15M Predexon files currently available without stopping
+  the ongoing backfill. Inventory at refresh time:
+  - January: `2026-01-08 02:45 UTC` through `2026-01-27 12:30 UTC`
+    (`~11.43M` snapshots in manifest).
+  - April: `2026-04-01` through `2026-04-30`.
+  - May: through `2026-05-12 22:30 UTC`.
+  - Latest live websocket holdout: `2026-05-12 10:42:45 UTC` through
+    `2026-05-16 20:14:38 UTC`.
+- The full one-shot Predexon range run wrote a prepared cache but failed in a
+  pandas merge due memory pressure. Re-ran January in smaller non-overlapping
+  chunks and combined with the existing April/May outputs.
+- Combined output:
+  `backtest_outputs\btc15m_f2_combined_predexon_live_20260516_142944`.
+- Combined Predexon, one contract, 2c adverse-entry stress:
+  - `q1000`: `63` trades, `+$8.95`, return on $100 `+8.95%`, ROP `29.78%`,
+    win rate `61.90%`, path DD `-$2.24`, Sharpe `2.29`.
+  - `q500`: `101` trades, `+$8.65`, return on $100 `+8.65%`, ROP `17.89%`,
+    win rate `56.44%`, path DD `-$5.77`, Sharpe `1.72`.
+  - `q250_qspeed05`: `103` trades, `+$7.98`, return on $100 `+7.98%`,
+    ROP `16.28%`, win rate `55.34%`, path DD `-$6.93`, Sharpe `1.59`.
+  - `q250`: `130` trades, `+$7.71`, return on $100 `+7.71%`, ROP `12.18%`,
+    win rate `54.62%`, path DD `-$7.44`, Sharpe `1.35`.
+  - Broad `base_f2` remained negative: `816` trades, `-$2.12`.
+- Latest live websocket evidence, same frozen candidates:
+  - `q250`: `37` trades, `+$3.90`, DD `-$1.57`, Sharpe `1.31`.
+  - `q500`: `35` trades, `+$2.92`, DD `-$2.14`, Sharpe `1.00`.
+  - `q1000`: `33` trades, `+$2.75`, DD `-$2.26`, Sharpe `0.97`.
+  - Official-result subset is still tiny (`5-6` trades depending on variant),
+    so this is not yet deployment proof.
+- New candidate worth tracking, not promoted:
+  `q1000_yes` (same `q1000` filters but YES side only) had `30` Predexon
+  trades for `+$7.97`, DD `-$0.98`, Sharpe `3.31`, and `7` live proxy trades
+  for `+$1.39`, DD `-$0.52`. This was discovered during expanded analysis, so
+  it needs fresh untouched/live validation before any production use.
+- Interpretation:
+  strict liquidity helps, and the q1000/high-liquidity subset looks better than
+  q250 on Predexon, but the Jan13-23 proxy-settlement regime is a real warning.
+  Treat January negatives as either source-mismatch risk or regime failure until
+  BTC15M official strike/settlement source is solved.
+
+2026-05-16 BTC15M/BTC1H promotion status refresh:
+
+- Refreshed the BTC15M deployment replay on the live websocket capture:
+  `backtest_outputs\btc15m_f2_deployment_gate_latest_20260516_154453`.
+  The capture now runs through `2026-05-16 21:45 UTC` and still fails every
+  broad F2 candidate under the conservative gate.
+- Latest BTC15M broad-candidate live proxy results:
+  - `q250`: `38` trades, `+$3.37`, DD `-$1.64`, official subset
+    `6 / +$1.86`.
+  - `q500`: `36` trades, `+$2.39`, DD `-$2.14`, official subset
+    `6 / +$1.86`.
+  - `q1000`: `34` trades, `+$2.22`, DD `-$2.33`, official subset
+    `6 / +$1.88`.
+  - All fail due too few live proxy trades, too few official live settlements,
+    and the January negative/source-mismatch blocker.
+- Refreshed the side-filter gate:
+  `backtest_outputs\btc15m_f2_side_gate_20260516_154703`.
+  `q1000_yes` remains the cleanest BTC15M research candidate but still fails
+  promotion: `32` Predexon trades for `+$7.23`, `7` live proxy trades for
+  `+$1.39`, and only `2` official-settled live trades.
+- Independent read-only subagent audit agreed:
+  no BTC15M or BTC1H candidate is real-money deployable today under the
+  current conservative gate. The best BTC15M forward candidate is
+  `q1000_yes`; the best BTC1H forward candidate is
+  `high_conf_80_entry70_no_chase`, blocked mainly by insufficient
+  post-freeze shadow settlements.
+- Operational follow-up started:
+  - BTC15M q1000 paper shadow:
+    `logs\btc15m_f2_q1000_shadow_20260516_154320.out.log`.
+  - BTC15M q1000 YES-only paper shadow:
+    `logs\btc15m_f2_q1000_yes_shadow_20260516_154320.out.log`.
+  - BTC1H high-confidence multi-shadow:
+    `logs\btc_1hr_highconf_multi_shadow_20260516_154813.out.log`.
+- These are paper-only forward validators. Do not promote them to real-money
+  execution until the live/official-settled evidence threshold is met.
+
+2026-05-16 BTC15M Jan28 tail refresh:
+
+- New Predexon late-window data arrived while the backfill continued. Ran:
+  `backtest_outputs\btc15m_f2_predexon_jan28_tail_20260516_155406`
+  for `2026-01-28 02:00 UTC` through `2026-01-29 00:00 UTC`.
+- The fresh tail weakens low-liquidity variants:
+  - `q250`: `5` trades, `-$1.31`.
+  - `q500`: `3` trades, `-$0.22`.
+  - `q1000`: `1` trade, `+$0.75`.
+- Folded this into:
+  `backtest_outputs\btc15m_f2_combined_predexon_live_refresh2_20260516_155638`
+  and refreshed the side gate:
+  `backtest_outputs\btc15m_f2_side_gate_refresh2_20260516_155645`.
+- Updated combined Predexon, one contract, 2c adverse-entry stress:
+  - `q1000`: `66` trades, `+$8.96`, win `60.61%`, DD `-$2.24`,
+    Sharpe `2.23`.
+  - `q500`: `108` trades, `+$7.67`, win `54.63%`, DD `-$5.77`,
+    Sharpe `1.47`.
+  - `q250_qspeed05`: `109` trades, `+$7.67`, win `54.13%`,
+    DD `-$6.93`, Sharpe `1.49`.
+  - `q250`: `140` trades, `+$5.14`, win `52.14%`, DD `-$7.44`,
+    Sharpe `0.86`.
+  - `base_f2`: `860` trades, `-$3.62`.
+- Side result after the refresh:
+  `q1000_yes` is now `33` Predexon trades for `+$7.98`, win `69.70%`,
+  DD `-$0.98`, Sharpe `3.04`; live evidence is unchanged and still too thin
+  (`7` proxy trades, `2` official-settled trades). It remains the best BTC15M
+  shadow candidate, not a deployable live strategy.
+
+2026-05-16 BTC15M official settlement proxy audit:
+
+- Added audit-only script:
+  `scripts\audit_btc15m_official_proxy_settlement.py`.
+- Output:
+  `backtest_outputs\btc15m_official_proxy_audit_20260516_161842`.
+- Compared all captured BTC15M official Kalshi `determined` lifecycle results
+  against the local BTC-close proxy used by websocket replay.
+- Results:
+  - Official markets: `111`.
+  - Proxy-computable markets: `111`.
+  - Matches: `107`.
+  - Mismatches: `4`.
+  - Overall match rate: `96.40%`.
+  - Farther than `$10` from strike: `102` markets, `100` matches
+    (`98.04%`).
+- Mismatches:
+  - `KXBTC15M-26MAY121700-00`: official YES, proxy NO, proxy distance
+    `-$7.75`.
+  - `KXBTC15M-26MAY150645-45`: official NO, proxy YES, proxy distance
+    `+$12.22`.
+  - `KXBTC15M-26MAY151345-45`: official YES, proxy NO, proxy distance
+    `-$15.66`.
+  - `KXBTC15M-26MAY151445-45`: official NO, proxy YES, proxy distance
+    `+$0.68`.
+- Interpretation:
+  proxy settlement is good enough for research triage but not good enough to
+  replace official-settled validation for deployment. Candidate-specific
+  `6/6` proxy/official agreement is encouraging, but the all-market mismatch
+  rate keeps official-settled sample size as a real blocker.
+
+2026-05-16 BTC15M REST official fill for replay trades:
+
+- Added audit-only script:
+  `scripts\fill_btc15m_live_ws_official_results.py`.
+- Output:
+  `backtest_outputs\btc15m_live_ws_rest_official_20260516_162103`.
+- This filled finalized Kalshi REST `result` for all unique closed market
+  tickers appearing in the latest live-replay candidate trades, then recomputed
+  official PnL with the same 2c adverse-entry stress.
+- This materially changed the BTC15M deployment view:
+  - `q250`: `38` official-filled trades, `-$1.63`, win `47.37%`.
+  - `q500`: `36` official-filled trades, `-$1.61`, win `47.22%`.
+  - `q1000`: `34` official-filled trades, `-$1.78`, win `47.06%`.
+  - `q250_qspeed05`: `33` official-filled trades, `-$2.00`, win `45.45%`.
+- Refreshed side gate with REST-filled official results:
+  `backtest_outputs\btc15m_f2_side_gate_rest_official_20260516_162134`.
+- Side-gate result:
+  - Broad `q1000/q500/q250` are rejected because official-filled live PnL is
+    negative despite positive proxy PnL.
+  - `q1000_yes` remains positive on the REST-filled live subset:
+    `7` live official trades for `+$1.39`, win `71.43%`, but it still fails
+    promotion because the sample is too small (`33` Predexon trades and only
+    `7` live official trades).
+- Operational decision:
+  stopped the broad BTC15M `q1000` paper shadow. Keep only `q1000_yes` for
+  BTC15M forward validation.
+- Also paused the exact BTC1H real-money
+  `.codex_work\run_btc_1hr_late_only_loss_guard_live.py` process after checking
+  the promotion audit still had zero passing BTC1H candidates. The BTC1H
+  high-confidence multi-strategy paper shadow remains running, and the BTC15M
+  capture/backfill processes remain running.
+
+2026-05-16 BTC15M q1000 official live side split:
+
+- Audited the REST-filled live replay rows directly.
+- `q1000` broad split on live official REST results:
+  - YES side: `7` trades, `+$1.39`, win `71.43%`.
+  - NO side: `27` trades, `-$3.17`, win `40.74%`.
+  - Combined: `34` trades, `-$1.78`.
+- Interpretation:
+  the broad q1000 signal was only positive under proxy settlement because the
+  NO side was being mis-scored by the Coinbase-close proxy for several markets.
+  On actual Kalshi outcomes, the NO side is not viable. Any future BTC15M F2
+  promotion must be YES-only unless a new official-settlement backtest proves
+  otherwise.
+
+2026-05-16 BTC15M q1000_yes live staging patch:
+
+- Added disabled-by-default rolling risk controls to
+  `scripts\btc15m_lowdd_live.py`:
+  - `BTC15M_RISK_WINDOW_HOURS`.
+  - `BTC15M_ROLLING_TRADE_CAP`.
+  - `BTC15M_ROLLING_PREMIUM_CAP_DOLLARS`.
+- The risk gate counts `submitted`, `filled`, and `partial_filled` trades in
+  the selected strategy mode. It blocks before order submission if either the
+  rolling trade count is already at cap or the new trade would push rolling
+  premium-at-risk over cap. This is intentionally premium-at-risk, not a
+  fragile settlement-PnL estimate, because official settlement can lag and
+  proxy settlement has already been proven deployment-unsafe.
+- Added staged live wrapper:
+  `scripts\btc15m_f2_q1000_yes_live.py`.
+- Wrapper freezes:
+  - strategy `h02`.
+  - TTL `10..12` minutes.
+  - spread `<= 2c`.
+  - edge `>= 12c`.
+  - entry `2c..50c`.
+  - side probability `>= 60%`.
+  - top visible qty `>= 1000`.
+  - YES-only.
+  - one contract max.
+  - rolling 24h cap: max `4` at-risk trades and max `$2.00` at-risk premium.
+- Validation:
+  - `python -m py_compile scripts\btc15m_lowdd_live.py scripts\btc15m_f2_q1000_yes_live.py scripts\btc15m_f2_q1000_yes_shadow.py scripts\test_btc15m_shadow_config.py`
+    passed.
+  - `python -m unittest scripts.test_btc15m_shadow_config -v` passed
+    (`5` tests).
+  - Dry-run smoke with the staged live gates connected to Kalshi and Kraken WS,
+    displayed the expected q1000 YES-only config and risk caps, and exited
+    cleanly after `20s`.
+- Current deployment decision:
+  this wrapper is staged but not auto-started. Strict promotion still has not
+  passed; `q1000_yes` is the only BTC15M forward candidate, but it remains
+  sample-size limited on official-settled live data.
+
+2026-05-16 BTC15M refreshed official gate after staging:
+
+- Refreshed current live replay gate:
+  `backtest_outputs\btc15m_f2_deployment_gate_refresh_20260516_163841`.
+- Filled REST official Kalshi outcomes for the refreshed live replay trades:
+  `backtest_outputs\btc15m_live_ws_rest_official_refresh_20260516_163841`.
+- Re-ran side gate:
+  `backtest_outputs\btc15m_f2_side_gate_rest_official_refresh_20260516_163841`.
+- Key correction:
+  broad F2 variants are officially negative on live replay even though proxy
+  replay is positive.
+  - `q250`: `37` official trades, `-$1.10`, win `48.65%`.
+  - `q500`: `35` official trades, `-$1.08`, win `48.57%`.
+  - `q1000`: `33` official trades, `-$1.25`, win `48.48%`.
+  - `q250_qspeed05`: `32` official trades, `-$1.47`, win `46.88%`.
+- Side-gate result:
+  - `q1000_yes`: Predexon `33` trades, `+$7.98`, win `69.70%`,
+    Sharpe `3.04`; live official `7` trades, `+$1.39`, win `71.43%`.
+  - Still fails strict promotion due `too_few_predexon_trades`,
+    `too_few_live_proxy_trades`, and `too_few_live_official_trades`.
+  - `q1000_yes_edge15`: even better Predexon stats (`27` trades,
+    `+$8.09`, win `74.07%`, Sharpe `3.69`) but only `3` live official
+    trades, so it is less deployable, not more.
+- Added Jan29 partial Predexon slice from the ongoing backfill:
+  `backtest_outputs\btc15m_f2_predexon_jan29_partial_20260516_164316`.
+  It added no `q1000` trades, only tiny q250/q500 evidence.
+- Combined Jan29 partial with prior Predexon:
+  `backtest_outputs\btc15m_f2_combined_predexon_plus_jan29_20260516_164544`.
+- Re-ran side gate with Jan29 included:
+  `backtest_outputs\btc15m_f2_side_gate_plus_jan29_20260516_164544`.
+  The deploy decision did not change.
+- REST check note:
+  direct `/markets/{ticker}` REST lookup for some old January tickers returns
+  `404`, likely because those markets are outside the current endpoint's
+  availability window. Do not use current REST 404 as evidence that old
+  metadata results are wrong; use the local market manifest result column for
+  historical scoring unless a historical endpoint-specific verifier is added.
+- Current decision remains:
+  no strategy passes strict production promotion. The only real-money path that
+  is technically staged is `q1000_yes` micro-live with hard caps, but that would
+  be a bounded forward test, not a fully proven deployment.
+
+2026-05-16 BTC15M YES-only rescue search:
+
+- Added audit/search bridge:
+  `scripts\audit_btc15m_yes_rescue_search.py`.
+- Purpose:
+  search only historical Predexon side-candidate rows for broader YES-only
+  filters, then evaluate screened rules once on live websocket capture with
+  REST-filled official Kalshi outcomes. This was designed to avoid using live
+  official outcomes as the search objective.
+- Output:
+  `backtest_outputs\btc15m_yes_rescue_search_20260516_1723`.
+- Search universe:
+  - Predexon rows: `260,610`.
+  - Rules tested: `1,944`.
+  - Screened historical rules carried to live: `18`.
+  - Live YES candidate rows: `44,470`.
+  - Live unique tickers with REST official outcomes: `116`.
+- Result:
+  no deploy-ready strategy.
+- Best live-official rows:
+  - `yes_rescue_00475`: Predexon `58` trades, `+$7.55`, Sharpe `2.07`,
+    one bad window; live official only `2` trades, `+$0.93`.
+  - `yes_rescue_00421`: Predexon `51` trades, `+$6.04`, Sharpe `1.74`,
+    one bad window; live official only `2` trades, `+$0.93`.
+  - `yes_rescue_00134`: Predexon `52` trades, `+$8.23`, Sharpe `2.37`,
+    one bad window; live official `7` trades, `+$0.39`, but much weaker than
+    proxy (`+$1.39`).
+  - `yes_rescue_00152`: Predexon `66` trades, `+$9.06`, Sharpe `2.32`,
+    no bad historical windows, but live official `8` trades, `-$0.27`.
+- Interpretation:
+  the rescue search confirms the blocker is not merely the original q1000_yes
+  threshold. When we broaden enough to get more historical trades, live
+  official performance either stays too sparse or turns negative. Do not
+  promote a BTC15M YES-only variant from this run.
+
+2026-05-16 BTC15M distance-gated YES rescue search:
+
+- Output:
+  `backtest_outputs\btc15m_yes_rescue_search_distance_20260516_1730`.
+- Search universe:
+  - Predexon rows: `260,610`.
+  - Rules tested: `1,080`.
+  - Historical rules carried to live: `34`.
+  - Live YES candidate rows: `44,348`.
+  - Live unique tickers with REST official outcomes: `116`.
+- Result:
+  no deploy-ready strategy.
+- Best live-official positives were still too sparse:
+  - `yes_rescue_00341` / `yes_rescue_00342`: Predexon `58` trades,
+    `+$7.55`, Sharpe `2.07`; live official only `2` trades, `+$0.93`.
+  - `yes_rescue_00458`: Predexon `50` trades, `+$8.03`, Sharpe `2.46`;
+    live official only `4` trades, `+$0.81`.
+  - `yes_rescue_00048`: Predexon `51` trades, `+$6.84`, Sharpe `1.97`;
+    live official only `4` trades, `+$0.81`.
+  - `yes_rescue_00099`: Predexon `51` trades, `+$8.73`, Sharpe `2.62`;
+    live official only `1` trade, `+$0.44`.
+- Rules with more live-official trades did not hold up strongly:
+  - `yes_rescue_00076` / `yes_rescue_00077`: live official `7` trades,
+    `+$0.39`, win `57.14%`, Sharpe `0.28`.
+  - `yes_rescue_00104`: Predexon `54` trades, `+$10.25`, Sharpe `3.01`,
+    but live official `2` trades, `-$0.15`.
+- Interpretation:
+  distance-from-strike filtering improves some historical optics, but it does
+  not create enough confirmed live-official evidence. The same production
+  blocker remains: the live-replay official gate is too sparse and too fragile
+  to justify real-money promotion.
+
+2026-05-16 BTC15M refreshed live capture gate at 17:38 local:
+
+- Refreshed standard F2 deployment gate:
+  `backtest_outputs\btc15m_f2_deployment_gate_refresh_20260516_173512`.
+- Capture covered `2026-05-12 10:42:45 UTC` through
+  `2026-05-16 23:35:13 UTC`, with `8,742,972` quote rows after metadata,
+  `8,821,875` top rows, `419` markets, and `113` captured official-result
+  markets.
+- Standard gate still failed every broad BTC15M candidate due
+  `jan_negative_or_source_mismatch`, `too_few_live_proxy_trades`, and
+  `too_few_live_official_trades`.
+- Refilled the new replay trades with REST official Kalshi results:
+  `backtest_outputs\btc15m_live_ws_rest_official_refresh_20260516_173816`.
+- REST official result was negative for every broad both-side candidate even
+  though proxy PnL was positive:
+  - `q250`: `38` trades, official `-$0.64`, proxy `+$4.36`.
+  - `q500`: `36` trades, official `-$0.62`, proxy `+$3.38`.
+  - `q1000`: `34` trades, official `-$0.79`, proxy `+$3.21`.
+  - `q250_qspeed05`: `33` trades, official `-$1.01`, proxy `+$2.99`.
+- Re-ran side gate with the REST-official live file:
+  `backtest_outputs\btc15m_f2_side_gate_rest_official_refresh_20260516_173852`.
+- Side gate again failed all candidates. Closest remains:
+  - `q1000_yes`: Predexon `33` trades, `+$7.98`, Sharpe `3.04`;
+    live proxy `7` trades, `+$1.39`; live official `7` trades, `+$1.39`.
+    It fails only on sample-size gates: too few Predexon, live proxy, and
+    live official trades.
+- Proxy-vs-official diagnostic:
+  - The latest broad replay had `38` unique markets and `5` proxy/REST-official
+    result mismatches.
+  - `4/5` mismatches were NO-side proxy wins that became official YES losses.
+  - The flipped markets had small Coinbase-close proxy distance from strike
+    (mean absolute distance about `$12`, median about `$15.38`) versus about
+    `$55` for non-flipped broad candidate rows.
+- Interpretation:
+  the current broad BTC15M F2 signal is not deployable because proxy settlement
+  is overstating edge, especially on near-strike NO-side outcomes. The YES-only
+  split is directionally interesting because it avoids most of that failure
+  mode, but it remains a forward-test candidate, not a production strategy.
+
+2026-05-16 BTC15M compact refinement and new q250/qty500 shadow:
+
+- Output:
+  `backtest_outputs\btc15m_compact_refine_20260516_1820`.
+- Method:
+  refined only the already-materialized candidate-trade family from
+  `backtest_outputs\btc15m_f2_combined_predexon_plus_jan29_20260516_164544`
+  and evaluated on the latest REST-official live replay
+  `backtest_outputs\btc15m_live_ws_rest_official_refresh_20260516_173816`.
+  This was intentionally much faster than rebuilding full side-candidate
+  matrices from raw websocket rows.
+- Best compact row:
+  `ttl10_12_entry50_q250` with both sides allowed, side probability `>= 0.60`,
+  net edge `>= 12c`, entry `<= 50c`, spread `<= 2c`, and visible top-book
+  quantity `>= 500`.
+- Historical candidate-trade evidence:
+  - Total: `63` trades, `+$8.31`, win `61.90%`, max DD `-$1.97`,
+    Sharpe `2.09`.
+  - `pred_apr01_14`: `19` trades, `+$4.67`, win `73.68%`.
+  - `pred_apr15_30`: `32` trades, `+$3.89`, win `62.50%`.
+  - `pred_may01_12`: `6` trades, `+$0.16`, win `50.00%`.
+  - Small January slices were mixed: `pred_jan18_23` `2` trades `-$0.95`,
+    `pred_jan25_27p` `2` trades `+$1.28`,
+    `pred_jan27_1230_jan28_0200` `2` trades `-$0.74`.
+- Latest REST-official live replay:
+  - `17` trades, `+$4.30`, win `76.47%`, max DD `-$1.58`, Sharpe `2.34`.
+  - Daily split: May 12 `+$1.89`, May 13 `+$1.58`, May 14 `-$0.52`,
+    May 15 `+$1.50`, May 16 `-$0.15`.
+- Interpretation:
+  this is the strongest new forward-test candidate because it has more
+  REST-official live trades than `q1000_yes` and keeps a high top-book visible
+  quantity gate. It is not production-ready yet because it was selected during
+  a live-result refinement pass, has weak/mixed small-sample January and May
+  subwindows, and still needs forward shadow trades after freeze.
+- Temporarily added and started a paper-only wrapper:
+  `scripts\btc15m_f2_q250_qty500_shadow.py`, with log
+  `logs\btc15m_f2_q250_qty500_shadow_20260516_181629.out.log`.
+  Startup confirmed paper mode, H02, TTL `10..12`, edge `12c`, min side
+  probability `0.60`, visible qty `500`, both sides allowed, max `1` contract,
+  and live Kalshi/Kraken websocket connections.
+- Important correction:
+  this wrapper did not exactly reproduce the compact rule. The compact rule was
+  "take the first q250-style signal only if that first signal has visible qty
+  `>= 500`"; setting live min visible qty to `500` instead can wait for a later
+  different signal in the same event. That is a different, more optimistic
+  behavior.
+- Stopped the q250/qty500 paper process and removed the wrapper to avoid
+  collecting misleading evidence.
+- Newly backfilled Jan30 partial stress:
+  `backtest_outputs\btc15m_f2_predexon_jan30_partial_20260516_181836`.
+  - Broad `base_f2`: `31` trades, `-$2.11`.
+  - `ttl10_12_entry50_q250`: `5` trades, `+$0.45`.
+  - Exact compact q250 trade rows with first-signal visible qty `>= 500`:
+    `0` trades.
+  - Simple live-style min-qty-500 (`ttl10_12_entry50_q500`): `3` trades,
+    `-$0.45`.
+- Updated interpretation:
+  the compact q250/qty500 idea remains an interesting diagnostic from the
+  existing live replay, but it is not directly deployable through the current
+  live scanner and has no positive new Jan30 evidence. Do not promote it.
+
+2026-05-16 BTC15M settlement-source audit:
+
+- Primary source:
+  Kalshi's crypto-market help page says crypto contracts settle using CF
+  Benchmarks Real-Time Indexes, with the expiration value equal to the average
+  of the relevant RTI over the final 60 seconds before expiration.
+- Local confirmation:
+  Kalshi REST market metadata exposes `expiration_value` for finalized BTC15M
+  markets. In
+  `backtest_outputs\btc15m_live_ws_rest_official_refresh_20260516_173816\market_results.csv`,
+  all `38/38` replay markets had non-null `expiration_value`.
+- Implication:
+  Coinbase/Kraken close is a proxy, not settlement truth. Any live strategy
+  whose edge is concentrated near the strike can look good under proxy PnL and
+  lose under REST-official settlement.
+- Decision-distance guard scan on materialized candidate trades:
+  - For q1000, YES-only remains the only useful filter:
+    `33` Predexon trades, `+$7.98`; `7` live REST-official trades, `+$1.39`.
+  - Broad q250/q500/q1000 remain REST-official negative on live replay when no
+    decision-distance filter is used.
+  - Adding a causal aligned-distance guard (`>= 5bps`, `>= 10bps`, etc.) often
+    removes nearly all live trades. Example: q1000 YES with `>= 5bps` has
+    `20` Predexon trades and `+$6.05`, but `0` live REST-official trades.
+- Interpretation:
+  the right next model improvement is not "use Kraken/Coinbase harder"; it is
+  either obtain a live CF RTI/BRTI feed or explicitly model/guard the
+  RTI-versus-exchange basis. With current data, simple decision-distance guards
+  are too sparse to deploy.
+
+2026-05-16 BTC15M expiration-value basis quant:
+
+- Data:
+  `backtest_outputs\btc15m_live_ws_rest_official_refresh_20260516_173816`
+  market REST results and replay trades.
+- All `38/38` finalized markets had Kalshi `expiration_value`.
+- Basis definition:
+  `expiration_value - proxy_close_btc_spot`, where proxy close was the replay's
+  exchange close sample.
+- Basis stats on the 38 markets:
+  - mean `+$3.36`
+  - median `+$2.40`
+  - std `$12.02`
+  - min `-$18.89`
+  - max `+$31.16`
+  - 90th percentile `+$19.46`
+  - 95th percentile `+$23.02`
+- Proxy/official result mismatches:
+  `5/38` markets.
+  - Mismatches had mean basis `+$16.24`, median `+$22.34`.
+  - Matches had mean basis `+$1.41`, median `+$0.69`.
+- If one could know close-distance at close, rejecting proxy-close distance
+  within `$25` of strike would remove all 5 observed mismatches, but this is
+  not a causal decision-time filter. It is only valid as a label-quality rule
+  for historical proxy-labeled research.
+- The practical live lesson:
+  because the RTI/exchange basis can be `20-30` dollars near expiry, strategies
+  betting within that distance of the strike are exposed to settlement-index
+  noise unless we have a live CF RTI feed or a very conservative causal
+  distance/edge margin.
+
+2026-05-16 CF Benchmarks access check:
+
+- CF Benchmarks API docs expose the correct WebSocket endpoint:
+  `wss://www.cfbenchmarks.com/ws/v4`.
+- The docs state that the WebSocket API requires an API key obtained by
+  contacting CF Benchmarks for a license. Auth can be sent as the websocket
+  protocol array `['cfb', username, password]` or as HTTP Basic auth.
+- Local `credentials.env` currently has Kalshi and Predexon credentials only;
+  there is no CF Benchmarks/BRTI credential.
+- Deployment implication:
+  without CF RTI/BRTI access, BTC15M fair-value strategies are trading against
+  an imperfect exchange-spot proxy. That can be acceptable only with a wide
+  causal edge/distance guard and enough REST-official live proof. Current
+  q1000/q1000_yes evidence is still too sparse for that.
+
+2026-05-16 18:34-19:07 MST refreshed BTC15M official gate and readiness check:
+
+- Refreshed causal replay through the latest BTC15M live capture:
+  `backtest_outputs\btc15m_f2_deployment_gate_refresh_20260516_183441`.
+  Broad variants remained proxy-positive but not deployable:
+  - `q250`: live proxy `39` trades, `+$3.84`; gate official subset `7`,
+    `+$2.32`; still fails January/source mismatch and sample-size gates.
+  - `q500`: live proxy `37`, `+$2.86`; gate official subset `7`, `+$2.32`.
+  - `q1000`: live proxy `35`, `+$2.69`; gate official subset `7`, `+$2.34`.
+- REST-filled official settlement for that replay:
+  `backtest_outputs\btc15m_live_ws_rest_official_refresh_20260516_183818`.
+  This is the stronger audit than captured lifecycle-only official rows.
+  Official +2c PnL was negative for all broad variants:
+  - `q250`: `39` trades, `-$1.16`, win `48.72%`.
+  - `q500`: `37` trades, `-$1.14`, win `48.65%`.
+  - `q1000`: `35` trades, `-$1.31`, win `48.57%`.
+  - `q250_qspeed05`: `34` trades, `-$1.50`, win `47.06%`.
+- Re-ran side gate with REST-official live rows:
+  `backtest_outputs\btc15m_f2_side_gate_rest_official_refresh_20260516_183849`.
+  Best BTC15M side candidate remains `q1000_yes`, but it is not deployable:
+  Predexon `33` trades, `+$7.98`, Sharpe `3.04`; live official `8` trades,
+  `+$0.87`, win `62.5%`. Failure reasons are too few Predexon, live proxy,
+  and live official trades.
+- Added conservative readiness checker:
+  `scripts\check_btc_deployment_readiness.py`.
+  Latest output:
+  `backtest_outputs\deployment_readiness_20260516_184321`.
+  It correctly prefers REST-official settlement over lifecycle-only official
+  rows and reports `production_ready_count = 0`. No BTC15M or BTC1H strategy is
+  production-ready under the current gate.
+- Added fast materialized first-signal filter grid:
+  `scripts\audit_btc15m_materialized_filter_grid.py`.
+  Latest output:
+  `backtest_outputs\btc15m_materialized_filter_grid_20260516_190636`.
+  This avoids the optimistic error of waiting for a later better signal in the
+  same event. A rule means: accept the frozen strategy's first event-level
+  signal only if that exact row also passes the extra causal filter.
+- Strongest materialized research candidate:
+  `q250` first signal with visible quantity `>= 500`, spread `<= 2c`, TTL
+  `10-12m`, entry `<= 50c`, p `>= 0.60`, edge `>= 12c`.
+  - Historical materialized evidence: `63` trades, `+$8.31`, win `61.90%`,
+    max DD `-$1.97`, Sharpe `2.09`.
+  - Latest live REST-official replay: `17` trades, `+$4.30`, win `76.47%`,
+    max DD `-$1.58`, Sharpe `2.34`.
+  - This is only a research pass, not deployment-ready, because it has only
+    `17` official live trades and was selected after seeing this live replay.
+- Subagent diagnostics:
+  - Broad q250 official/proxy degradation is fully explained by 5 settlement
+    flips: non-flipped rows are `+$1.51` proxy and official, while flipped
+    rows are `+$2.33` proxy but `-$2.67` official.
+  - NO side is the main source of flips. q250 YES has `9` official trades,
+    `+$0.33`; q1000 YES has `8`, `+$0.87`.
+  - Decision-time spread, entry, edge, TTL, RV, quote speed, and distance did
+    not cleanly separate flips from non-flips in this small sample.
+  - Visible quantity `>= 500` is directionally helpful for q250 but must be
+    tested exactly as a first-signal skip rule; the live q500 reselection
+    behavior is a different rule and loses under REST-official settlement.
+  - BTC1H is not closer to deployability: current multi-shadow still has
+    `0` trades and the prior BTC1H promotion audit has `0` promoted candidates.
+- Predexon data-quality update:
+  late12 BTC15M backfill was around `2303/7835` windows (`~29.4%`) and
+  `data\predexon_kalshi_orderbooks` was about `1.824 GB`.
+  Jan30 is patchy: `89/96` ok windows, `7` empty, and many edge-missing/thin
+  intervals; the partial Jan30 stress weakens deployment confidence but is not
+  by itself a clean failure proof.
+- Current research direction:
+  do not deploy broad q250/q500/q1000; do not deploy q1000_yes yet; do not
+  deploy the q250 qty>=500 research candidate yet. The next honest promotion
+  path is either more forward REST-official live evidence or a causal
+  settlement-index improvement, ideally a CF Benchmarks RTI/BRTI feed.
+
+2026-05-16 exact q250 qty>=500 first-signal shadow:
+
+- Added a default-off executor gate:
+  `BTC15M_H02_FIRST_SIGNAL_MIN_VISIBLE_QTY`.
+  When set above `BTC15M_H02_MIN_VISIBLE_QTY`, the live scanner builds the base
+  H02 signal first, then rejects and locks the event if that first signal has
+  too little visible top-book quantity. This tests the materialized rule
+  exactly and avoids the optimistic behavior of waiting for a later higher-qty
+  tick in the same event.
+- Added paper-only wrapper:
+  `scripts\btc15m_f2_q250_qty500_firstskip_shadow.py`.
+  Configuration:
+  H02, TTL `10..12m`, spread `<=2c`, edge `>=12c`, entry `0.02..0.50`,
+  side probability `>=0.60`, base visible qty `>=250`, first-signal visible
+  qty `>=500`, both sides allowed, max `1` contract, paper mode only.
+- Tests:
+  `python -m unittest scripts.test_btc15m_shadow_config -v` now has 7 tests
+  passing, including distinct base-min-qty vs first-signal-skip behavior and
+  wrapper paper-only checks.
+- Started paper shadow:
+  `logs\btc15m_f2_q250_qty500_firstskip_shadow_20260516_191138.out.log`.
+  Startup confirmed paper mode, Kraken/Kalshi websockets, first-signal
+  min-qty `500`, and no real order submission.
+
+2026-05-16 Boston-flight shutdown handoff:
+
+- User needed to shut down quickly. Logged current state before stopping
+  processes.
+- Running Kalshi Python PIDs before shutdown:
+  `3768` BTC15M live capture, `11640` BTC1H multi-strategy shadow, `11652`
+  BTC15M q1000 YES shadow, `15596` BTC15M q250 qty500 first-skip shadow,
+  `23204` Predexon BTC15M backfill, `19348` Predexon helper/low-memory process.
+- Latest q250 qty500 first-skip shadow status:
+  `logs\btc15m_f2_q250_qty500_firstskip_shadow_20260516_191138.out.log`.
+  It was healthy, connected to Kalshi and Kraken websockets, and had `0`
+  trades / `0` settled / `$0.00` PnL. It had only seen an event outside the
+  `10..12m` TTL window at the tail.
+- Latest Predexon BTC15M late12 backfill status:
+  `logs\predexon_btc15m_late12_levels_{20260515_211347}.out.log`.
+  It had reached about `[2330/7835]`, around
+  `KXBTC15M-26JAN310800-00` (`2026-01-31 12:48 -> 13:00 UTC`).
+- Added but not fully run before shutdown:
+  `scripts\fill_btc15m_predexon_official_results.py`, which REST-fills
+  materialized Predexon trade rows with official Kalshi results. Also patched
+  `scripts\audit_btc15m_materialized_filter_grid.py` to accept
+  `--pred-pnl-col` and `--pred-win-col`. Next resume step should be:
+  1. Run `python -m py_compile scripts\fill_btc15m_predexon_official_results.py scripts\audit_btc15m_materialized_filter_grid.py`.
+  2. Run official-fill on
+     `backtest_outputs\btc15m_f2_combined_predexon_plus_jan29_20260516_164544\combined_predexon_trades.parquet`.
+  3. Re-run the materialized grid with
+     `--pred-pnl-col pnl_official_rest_2c --pred-win-col win_pnl_official_rest_2c`.
+  4. Compare whether the q250 first-signal qty>=500 candidate still works when
+     both historical Predexon and live websocket rows use official settlement.
+- No production-ready strategy existed at shutdown. Latest readiness output:
+  `backtest_outputs\deployment_readiness_20260516_184321`,
+  `production_ready_count = 0`.
+
+2026-05-17 MDT / 2026-05-18 UTC Codex resume: official Predexon fill and grid
+refresh:
+
+- Re-checked running Python processes with the Kalshi/BTC/Predexon filters:
+  no matching process was running.
+- `python -m py_compile scripts\fill_btc15m_predexon_official_results.py
+  scripts\audit_btc15m_materialized_filter_grid.py` passed.
+- First REST-fill attempt hit a Kalshi public REST `404` for an old Predexon
+  ticker (`KXBTC15M-26JAN072300-00`). Patched
+  `scripts\fill_btc15m_predexon_official_results.py` to keep missing markets
+  unfilled and record `fetch_error=404_not_found` instead of aborting.
+- Official fill output:
+  `backtest_outputs\btc15m_predexon_rest_official_20260517_codex`.
+  Coverage was only `374/880` unique market tickers; `506` returned
+  `404_not_found`. This means January stress windows are still not
+  REST-official-filled in this artifact.
+- Strategy-level official fill results:
+  - `ttl10_12_entry50_q250`: `69/142` official-filled rows, `+$9.66`,
+    win `63.77%`, max DD `-$1.49`, Sharpe `2.34`.
+  - `ttl10_12_entry50_q500`: `67/109`, `+$9.82`, win `64.18%`.
+  - `ttl10_12_entry50_q1000`: `52/66`, `+$8.16`, win `65.38%`.
+  - Broad `base_f2`: `374/880`, `+$7.90`, but Sharpe only `0.82` and the
+    missing January coverage makes this incomplete.
+- Window-level warning for `ttl10_12_entry50_q250`:
+  April and May rows filled and were positive (`pred_apr01_14 +$4.18`,
+  `pred_apr15_30 +$4.42`, `pred_may01_12 +$1.06`), but every January window
+  had `0` official-filled rows. The old proxy January negatives therefore
+  still matter as stress evidence.
+- Official-Predexon materialized grid output:
+  `backtest_outputs\btc15m_materialized_filter_grid_pred_official_20260517_codex`.
+  Top row remained the q250 first-signal skip rule:
+  first `q250` signal only, visible qty `>=500`, spread `<=2c`, TTL `10-12m`,
+  entry `<=50c`, side fair probability `>=0.60`, edge `>=12c`.
+  It had `57` Predexon official-filled trades, `+$8.72`, win `64.91%`,
+  max DD `-$1.97`, Sharpe `2.33`, plus the same live REST-official `17`
+  trades, `+$4.30`, win `76.47%`, max DD `-$1.58`.
+- Interpretation:
+  q250 qty>=500 first-signal survives the official-filled April/May Predexon
+  subset and the existing live REST-official replay, but it is still research
+  only. It was selected after seeing live replay, has only `17` official live
+  trades, lacks REST-official January stress coverage, and fails deployment
+  sample-size discipline.
+- Refreshed readiness:
+  `backtest_outputs\deployment_readiness_20260517_codex`; verdict remains
+  `production_ready_count = 0`. Do not deploy broad q250/q500/q1000,
+  q1000_yes, q250 qty>=500 first-signal, or any BTC1H candidate from this
+  evidence.
+
+2026-05-17 MDT / 2026-05-18 UTC GPT Pro loop and stricter current-state
+artifacts:
+
+- Built and submitted a GPT Pro strategy-advisor packet:
+  `gpt_pro_packets\strategy_advisor_20260517_203137`.
+  Saved the full Pro response at
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260517_203833.md`.
+- Pro verdict, after reviewing the packet: nothing is deployable now. It
+  ranked the most plausible paths as:
+  1. BTC15M q250 first-signal qty>=500, spread <=2c, TTL 10-12m, entry <=50c,
+     side fair p >=0.60, edge >=12c.
+  2. BTC15M q1000 YES-only.
+  3. BTC1H high_conf_80_entry70_no_chase as a slow-burn paper shadow.
+  It explicitly treated these as forward-validation paths, not live-trading
+  approvals.
+- Added the Chrome/GPT Pro resilience notes to the local skill/workflow:
+  Chrome extension access may appear via the Browser runtime as an extension
+  browser rather than a dedicated `chrome` namespace; long pasted packets may
+  become a ChatGPT pasted-text attachment and should be submitted with the
+  `data-testid="send-button"` path. `scripts\save_gpt_pro_review.ps1` saves
+  the Windows clipboard, so browser-extracted responses must be written
+  directly if the clipboard still contains the original prompt.
+- Metadata-settlement fill output:
+  `backtest_outputs\btc15m_predexon_metadata_settlement_20260517_codex`.
+  REST results still cover only `374/880` unique historical tickers, but local
+  Predexon market metadata has official-looking results for `880/880`.
+  Treat this as historical provider metadata settlement evidence, not a fresh
+  Kalshi REST final gate.
+  - Broad `base_f2` on metadata labels is weak: `880` trades, `-$1.40`, win
+    `52.16%`, max DD `-$18.05`.
+  - Broad `ttl10_12_entry50_q250` on metadata labels is only `+$5.17` across
+    `142` trades, win `52.11%`, max DD `-$7.44`; the broad q strategy remains
+    unattractive.
+- Metadata-settlement materialized grid output:
+  `backtest_outputs\btc15m_materialized_filter_grid_metadata_settlement_20260517_codex`.
+  Top row remains `mat_grid_00019`, the q250 first-signal qty>=500 skip rule:
+  `63` historical materialized trades, `+$8.31`, win `61.90%`, max DD
+  `-$1.97`, Sharpe `2.09`; live REST-official replay still `17` trades,
+  `+$4.30`, win `76.47%`, max DD `-$1.58`, Sharpe `2.34`.
+  This is a research pass only. It has too few live official trades and was
+  selected after seeing the live replay.
+- Settlement-flip attribution output:
+  `backtest_outputs\btc15m_settlement_flip_attribution_20260517_codex`.
+  Broad q strategies still degrade mainly through NO-side settlement flips:
+  broad q250 NO had `30` rows, `4` flips, proxy `+$2.51`, official `-$1.49`;
+  broad q1000 NO had `27` rows, `4` flips, proxy `+$1.82`, official `-$2.18`.
+  The materialized q250 top rule still had `2/10` NO flips, but remained
+  positive because the filtered live sample also had stronger non-flip rows.
+- Patched `scripts\check_btc_deployment_readiness.py` so the current
+  materialized first-signal grid is included in readiness. New output:
+  `backtest_outputs\deployment_readiness_20260517_materialized_codex`.
+  Verdict remains `FAIL`, `production_ready_count = 0`. The q250 materialized
+  row is now visible and explicitly blocked by
+  `research_pass_not_deployment_ready`, `too_few_live_official_trades`, and
+  `too_few_live_proxy_trades`.
+- Added `scripts\check_btc_forward_shadow_status.py` for repeatable read-only
+  liveness/ledger checks. Latest status output:
+  `backtest_outputs\btc_forward_shadow_status_20260517_codex`.
+  As of `2026-05-18T03:01:27Z`, all four intended forward processes were
+  running:
+  BTC15M live capture PID `1724`, BTC15M q250 qty500 first-skip paper PID
+  `7052`, BTC15M q1000 YES paper PID `24840`, BTC1H high_conf_80_entry70
+  paper PID `16216`.
+  BTC15M q250 and q1000 paper ledgers still had `0` fills. BTC1H had `1`
+  post-restart paper fill since `2026-05-18T02:42:00Z`:
+  `KXBTCD-26MAY1723-T76899.99`, NO, `1` contract, entry `0.66`, fee estimate
+  `0.02`, close `2026-05-18T03:00:00Z`. The `21:00` MDT hourly shadow report
+  showed the trade settled as a win: total BTC1H shadow moved from `-$0.10`
+  realized over 3 settled trades to `+$0.22` realized over 4 settled trades.
+- Current conclusion: continue forward evidence collection and official
+  settlement refreshes. Do not deploy BTC15M q250 first-signal, q1000 YES,
+  broad q strategies, or BTC1H high-conf variants from this evidence.
+
+2026-05-17 MDT / 2026-05-18 UTC fragility and shadow-ledger official audit:
+
+- Added `scripts\analyze_btc15m_materialized_fragility.py`.
+  Output:
+  `backtest_outputs\btc15m_materialized_fragility_20260517_codex`.
+  This is not a new search. It audits the already-known q250/q1000
+  first-signal rules by side, causal decision-distance guard, historical
+  metadata labels, historical REST subset, and live REST-official replay.
+- q250 first-signal qty>=500 side split:
+  - BOTH: Predexon metadata `63` trades, `+$8.31`, win `61.90%`; live
+    REST-official `17`, `+$4.30`, win `76.47%`.
+  - YES-only: Predexon metadata `28`, `+$4.44`, win `64.29%`; live
+    REST-official `7`, `+$1.37`, win `71.43%`. No live proxy/official flips
+    in this tiny sample.
+  - NO-only: Predexon metadata `35`, `+$3.87`, win `60.00%`; live
+    REST-official `10`, `+$2.93`, win `80.00%`, but live proxy PnL was
+    `+$4.93` with `100%` proxy wins. The NO side is where the settlement-basis
+    false confidence lives.
+- q250 live flip detail:
+  the top q250 BOTH rule had 2 live NO-side proxy/official flips:
+  `KXBTC15M-26MAY152330-30` and `KXBTC15M-26MAY160130-30`, with official
+  minus proxy basis `+$22.34` and `+$31.16`. Both were causal decision-time
+  aligned distance only about `2.0-2.8 bps`, so a `>=5 bps` distance guard
+  removes them but also leaves only `1` live trade. This is not enough to
+  rescue deployment.
+- Window fragility:
+  q250 BOTH is strong in April (`pred_apr01_14 +$4.67`, `pred_apr15_30
+  +$3.89`) but only `+$0.16` over 6 trades in `pred_may01_12` and has small
+  negative two-trade January pockets. The bad-window gate did not fire because
+  those windows were below the minimum `3`-trade window threshold, but the
+  shape is still a warning.
+- Added `scripts\check_btc_shadow_official_settlement.py`.
+  Output:
+  `backtest_outputs\btc_shadow_official_settlement_20260517_codex`.
+  This read-only audit fetches Kalshi REST market results for paper-shadow
+  ledgers and recomputes hold-to-settlement PnL using recorded entry/fee.
+  It was then upgraded to also compute proxy settlement from
+  `data\btc_1m_research_live_cache.parquet`, so proxy/official result and PnL
+  disagreement are machine-readable.
+- BTC1H shadow official audit:
+  BTC15M q250 and q1000 YES paper ledgers still had `0` fills. BTC1H
+  high_conf80 entry70 no-chase had `4` paper fills, all official REST-finalized
+  as NO wins, `+$1.22` official PnL on `$2.78` premium. The one post-restart
+  trade since `2026-05-18T02:42:00Z` was also an official NO win, `+$0.32`.
+  Latest refreshed output:
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`.
+  The all-history BTC1H shadow proxy-vs-official comparison is now explicit:
+  proxy PnL `+$0.22`, official PnL `+$1.22`, delta `+$1.00`, with `1`
+  proxy/official result mismatch. The mismatched trade was
+  `KXBTCD-26MAY1613-T78199.99`: Coinbase proxy close `78202.65` would mark it
+  YES, but Kalshi official expiration value `78148.24` finalized NO.
+- Found a BTC1H paper-accounting bug/risk:
+  the running BTC1H shadow's periodic `SHADOW report` used local Coinbase
+  candle close as the settlement proxy, not Kalshi official result. It reported
+  the first 3 settled trades as `2` wins / `1` loss and `-$0.10`, while REST
+  official settlement says all 3 were wins and `+$0.90`.
+- Patched `scripts\btc_1hr_research_live.py` for future runs:
+  paper summaries now use Kalshi public REST official result by default
+  (`BTC_1HR_PAPER_SETTLEMENT_SOURCE=official`) and keep trades open until the
+  market is finalized. `BTC_1HR_PAPER_SETTLEMENT_SOURCE=proxy` is available
+  only as an explicit fallback. Startup logs now include `paper_settlement=...`.
+  The currently running BTC1H paper process was not restarted, so it still has
+  the old in-memory proxy-summary behavior until a future restart.
+- Verification:
+  `python -m py_compile scripts\btc_1hr_research_live.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\analyze_btc15m_materialized_fragility.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config -v` passed `7/7`
+  with the pre-existing logging ResourceWarnings.
+- Deployment interpretation:
+  this strengthens the no-deploy verdict. BTC15M still needs many more
+  post-freeze live official fills; BTC1H has a promising tiny official shadow
+  ledger but also just exposed a paper-summary/official-settlement mismatch,
+  which must be fixed in a restarted shadow and observed forward before any
+  promotion discussion. Refreshed readiness output
+  `backtest_outputs\deployment_readiness_latest_codex` remains `FAIL` with
+  `production_ready_count = 0`. The readiness summary now includes
+  `shadow_official_ledger` rows. BTC1H all-history shadow is blocked by
+  `proxy_official_settlement_mismatch`, `proxy_official_pnl_disagreement`,
+  `shadow_ledger_only_not_full_promotion_gate`, and
+  `too_few_shadow_official_trades`. The since-restart BTC1H row is also not
+  deployable: `1` official trade, `+$0.32`, blocked by
+  `too_few_shadow_official_trades` and `shadow_ledger_only_not_full_promotion_gate`.
+
+## 2026-05-17/18 GPT Pro review loop and forward-basis reporting
+
+- Refreshed live process state:
+  `btc15m_live_capture.py`, `btc15m_f2_q250_qty500_firstskip_shadow.py`,
+  `btc15m_f2_q1000_yes_shadow.py`, and
+  `btc_1hr_high_conf80_entry70_no_chase_shadow.py` were all running. The two
+  BTC15M paper shadow ledgers still had `0` fills. BTC1H high-conf entry70
+  no-chase had `4` paper fills, with `1` since `2026-05-18T02:42:00Z`.
+- Built and submitted a fresh GPT Pro packet:
+  `gpt_pro_packets\strategy_advisor_20260517_211908`. Saved Pro's response at
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_032726_utc.md`.
+- GPT Pro agreed with the local gate:
+  no BTC15M or BTC1H strategy is deployable. It ranked the research paths as
+  `q250` first-signal qty>=500, `q1000_yes`, then BTC1H
+  `high_conf80_entry70_no_chase`, all still blocked by sample size,
+  official-settlement/ledger hygiene, and/or selection leakage.
+- Pro recommended restarting the BTC1H shadow with official settlement enabled,
+  but this was not done because the standing rule is not to kill/restart running
+  live/capture/shadow processes unless explicitly asked. The running BTC1H
+  process therefore still has old in-memory proxy-summary behavior, even though
+  the code has been patched for future starts.
+- Patched `scripts\check_btc_shadow_official_settlement.py` to make the daily
+  forward ledger report more useful without touching live processes. It now
+  includes model edge/spread/entry spot plus settlement-basis fields:
+  `official_minus_proxy_spot`, `official_minus_proxy_bps`,
+  `entry_spot_minus_strike`, `proxy_close_minus_strike`,
+  `official_expiration_minus_strike`, and distance-in-bps columns. It leaves
+  `quote_age_ms` and `top_visible_qty` blank when the existing ledger schema did
+  not record them.
+- Latest refreshed official-shadow output:
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`.
+  BTC15M q250/q1000 shadow fills remain `0`. BTC1H all-history official PnL
+  remains `+$1.22` on `4` official settled rows, proxy PnL `+$0.22`, with `1`
+  proxy/official result mismatch. The new basis report shows the since row
+  `KXBTCD-26MAY1723-T76899.99` had official-minus-proxy spot `-$111.67`; it
+  still settled as a NO win, but the magnitude reinforces that proxy close is
+  not a safe settlement substitute.
+- Refreshed readiness:
+  `backtest_outputs\deployment_readiness_latest_codex` remains `FAIL` with
+  `production_ready_count = 0`. No live deployment.
+- Added reusable local skill:
+  `C:\Users\ahmed\.codex\skills\kalshi-btc-strategy-research`, validated with
+  `quick_validate.py`. It captures the repeatable process/status/readiness/GPT
+  Pro/no-deploy workflow for future Kalshi BTC research sessions.
+
+## 2026-05-17/18 Forward evidence report consolidation
+
+- Refreshed process/status again:
+  all four expected Python processes were still running. The latest status
+  output is `backtest_outputs\btc_forward_shadow_status_latest_codex`.
+  BTC15M q250 first-signal and q1000 YES shadow ledgers still had `0` paper
+  fills. BTC1H high-conf entry70 no-chase still had `4` paper fills, `1` since
+  `2026-05-18T02:42:00Z`.
+- Refreshed official settlement:
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`. BTC1H remains
+  `+$1.22` official PnL over `4` official-settled rows, with proxy PnL `+$0.22`
+  and `1` proxy/official result mismatch. The basis watch remains large:
+  latest since-row basis `official_minus_proxy_spot = -$111.67`.
+- Refreshed readiness:
+  `backtest_outputs\deployment_readiness_latest_codex` remains `FAIL` with
+  `production_ready_count = 0`.
+- Added `scripts\build_btc_forward_evidence_report.py`, a read-only daily
+  report builder that combines:
+  process/capture status, REST-official shadow settlement, focused readiness
+  blockers, and a basis watchlist. Latest output:
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`.
+- The latest consolidated report verdict is still:
+  `NO DEPLOY: readiness production_ready_count is 0.` It highlights the current
+  hard blockers:
+  BTC15M shadow fills are still absent; BTC1H evidence is still tiny and has an
+  old proxy-summary mismatch; near-strike settlement-basis rows are too large to
+  ignore.
+- Updated the `Kalshi BTC forward evidence refresh` heartbeat to run the new
+  consolidated report builder after the status, official-settlement, and
+  readiness refreshes. It still must not deploy or restart processes unless
+  explicitly asked.
+
+## 2026-05-17/18 Official materialized readiness and ledger-realism patch
+
+- Confirmed the Predexon REST-official fill path had already run:
+  `backtest_outputs\btc15m_predexon_rest_official_20260517_codex`.
+  It filled `374` unique market REST results across `2,424` combined
+  Predexon trade rows. The official-filled materialized grid is:
+  `backtest_outputs\btc15m_materialized_filter_grid_pred_official_20260517_codex`.
+- Patched `scripts\check_btc_deployment_readiness.py` so the readiness gate
+  prefers `btc15m_materialized_filter_grid_pred_official_*` or
+  `btc15m_materialized_filter_grid_rest_official_*` before falling back to
+  older metadata-scored materialized grids. This prevents the latest readiness
+  report from silently using the stale metadata-settlement materialized table.
+- Refreshed readiness after that patch:
+  `backtest_outputs\deployment_readiness_latest_codex`.
+  It now points to
+  `backtest_outputs\btc15m_materialized_filter_grid_pred_official_20260517_codex`
+  as `materialized_grid_dir` and still reports
+  `production_ready_count = 0`.
+- With REST-official historical settlement, the top q250 materialized row is
+  still research-interesting but not deployable:
+  `q250:mat_grid_00019` has `57` historical official-filled Predexon trades,
+  `+$8.72` Predexon official PnL, `17` live official trades, and `+$4.30`
+  live official PnL. It remains blocked by
+  `research_pass_not_deployment_ready`, `too_few_live_official_trades`, and
+  `too_few_live_proxy_trades`.
+- Refreshed forward status:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`.
+  All four expected processes were running:
+  BTC15M capture PID `1724`, BTC15M q250 qty500 first-skip shadow PID `7052`,
+  BTC15M q1000 YES shadow PID `24840`, and BTC1H high-conf entry70 no-chase
+  shadow PID `16216`. BTC15M q250 and q1000 shadow ledgers still had `0`
+  paper fills. BTC1H had `5` paper fills total and `2` since
+  `2026-05-18T02:42:00Z`; the newest paper row was
+  `KXBTCD-26MAY1800-T76999.99`, NO, entry `0.68`, created
+  `2026-05-18T03:44:22.567875+00:00`.
+- Refreshed official shadow settlement:
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`.
+  BTC1H had `5` paper fills but only `4` official-finalized rows so far:
+  all-history official PnL `+$1.22`, proxy PnL `+$0.22`, with `1`
+  proxy/official result mismatch. Since `2026-05-18T02:42:00Z`, BTC1H had
+  `2` paper fills, but only `1` official-finalized row, `+$0.32`; the
+  `KXBTCD-26MAY1800-T76999.99` row was still active/unfinalized at refresh.
+- Patched future ledger realism fields:
+  `scripts\btc_1hr_research_live.py` now persists `available_qty`,
+  `top_visible_qty`, `quote_received_at_ns`, `signal_received_at_ns`,
+  `quote_age_ms`, `edge_threshold_cents`, `strike`, `ttl_min`, and the
+  decision-time YES/NO book prices into `research_live_trades`. The BTC15M
+  H02/F2 signal/reprice path in `scripts\btc15m_lowdd_live.py` now populates
+  those fields before calling the shared recorder. Existing running shadows
+  were not restarted, so the new columns only apply after a future restart or
+  new process start.
+- Patched `scripts\check_btc_shadow_official_settlement.py` and
+  `scripts\build_btc_forward_evidence_report.py` to surface those fields when
+  present and leave them blank for old ledger rows.
+- Validation:
+  `python -m py_compile scripts\btc_1hr_research_live.py
+  scripts\btc15m_lowdd_live.py scripts\check_btc_shadow_official_settlement.py
+  scripts\build_btc_forward_evidence_report.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\fill_btc15m_predexon_official_results.py
+  scripts\audit_btc15m_materialized_filter_grid.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53` tests, with only the
+  existing logging ResourceWarnings and pandas all-NaN warning.
+- Refreshed consolidated report:
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`.
+  Verdict remains:
+  `NO DEPLOY: readiness production_ready_count is 0.`
+- Snapshot-inspected the live BTC15M q250/q1000 shadow capture DuckDBs instead
+  of opening the live writers directly:
+  `.codex_work\shadow_capture_snapshots_20260517_215450`.
+  The zero paper fills appear to be genuine no-signal behavior, not dead
+  processes. q250 snapshot had `270` capture-health rows, `251,915`
+  `ws_orderbook_top` rows, `2,766` Kraken ticker rows, and `140,903`
+  `signal_scan` rows; q1000 snapshot had `684` capture-health rows, `466,503`
+  `ws_orderbook_top` rows, `5,295` Kraken ticker rows, and `275,065`
+  `signal_scan` rows. Both had `order_decision = 0` and `candidate_count = 0`
+  for every scan. Latest q250/q1000 scans were rejecting the current event
+  because TTL was around `5.17m`, outside the frozen `10-12m` window, with
+  earlier rejects mostly `h02_no_edge`, stale BTC spot, and spread filters.
+
+## 2026-05-17/18 Current live-replay expansion and q250 official degradation
+
+- Refreshed forward status at `2026-05-18T03:58:39Z`:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`.
+  All four expected processes were still running. The BTC15M q250/q1000 shadow
+  capture DBs were readable and actively updating:
+  q250 had `145,216` `signal_scan` rows, q1000 YES had `279,363`, and both
+  had `0` nonzero-candidate scans and `0` order-decision rows. Latest rejects
+  were `h02_ttl_outside_1.40` / `h02_ttl_outside_1.39`, so the zero-fill state
+  still looks like no qualifying signals rather than a dead shadow.
+- Patched `scripts\check_btc_forward_shadow_status.py` and
+  `scripts\build_btc_forward_evidence_report.py` so the normal forward report
+  now includes signal-scan diagnostics: signal rows, nonzero-candidate rows,
+  latest signal detail, and order-decision rows. Latest report:
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`.
+- Patched `scripts\backtest_btc15m_f2_live_ws_holdout.py` with two replay
+  controls needed for exact frozen candidates:
+  `--first-signal-visible-qty-min` implements the q250 first-signal skip
+  semantics, and `--side yes|no|both` implements side-specific candidates such
+  as q1000 YES. This avoids the earlier optimistic mistake of filtering to
+  higher visible quantity before choosing the first signal.
+- Patched `scripts\fill_btc15m_live_ws_official_results.py` so it can REST-fill
+  single-rule replay files without a pre-existing `candidate` column and so
+  summary rows include proxy/official mismatch counts plus official-minus-proxy
+  PnL delta.
+- Ran exact q250 first-skip replay on the full current live websocket capture:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_latest_codex`.
+  Command shape:
+  F2/H02, side both, TTL `10-12m`, spread `<=2c`, entry `0.02..0.50`,
+  base visible qty `>=250`, then first-signal visible qty `>=500`.
+  Capture window was `2026-05-12T10:42:45Z` through
+  `2026-05-18T04:00:53Z`, with `9,189,119` orderbook top rows.
+  Replay found `39` base first signals, rejected `15` because first-signal
+  visible qty was below `500`, and kept `24` closed proxy-settled trades.
+- REST-filled those `24` q250 first-skip trades:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_rest_official_latest_codex`.
+  All `24` markets had REST official results. Official +2c-stress PnL:
+  `+$3.74`, win `66.67%`, max DD `-$1.64`, Sharpe `1.58`. Proxy +2c PnL:
+  `+$6.74`, win `79.17%`. There were `3` proxy/official result mismatches
+  and official-minus-proxy PnL was `-$3.00`.
+- The new May 16 q250 first-skip slice is the key warning:
+  `11` official-filled trades, official PnL `-$0.67`, win `45.45%`, while
+  proxy PnL was `+$2.33`. This is the same settlement-basis false-positive
+  pattern that harmed broad q strategies. Overall q250 first-skip remains
+  positive on the full current live capture, but it is materially less robust
+  than the earlier `17`-trade official snapshot and is still not deployable.
+- Ran q1000 YES on the same current capture:
+  `backtest_outputs\btc15m_f2_live_ws_q1000_yes_latest_codex`, then REST-filled
+  at `backtest_outputs\btc15m_f2_live_ws_q1000_yes_rest_official_latest_codex`.
+  Exact rule: YES-only, TTL `10-12m`, spread `<=2c`, entry `0.02..0.50`,
+  visible qty `>=1000`, side fair probability `>=0.60`, edge `>=12c`.
+  It had only `8` REST-official trades, `+$0.90`, win `62.5%`, max DD `-$1.00`;
+  proxy and official agreed on all `8`. This remains far too small to promote.
+- Patched `scripts\check_btc_deployment_readiness.py` so focused latest live
+  REST-official replays are added to readiness as
+  `latest_live_replay_rest_official` rows. Latest readiness now includes:
+  - `q250_firstskip_qty500`: `24` official trades, `+$3.74`, blocked by
+    `latest_live_replay_only_not_full_promotion_gate`,
+    `too_few_live_official_trades`, `proxy_official_settlement_mismatch`, and
+    `proxy_official_pnl_disagreement`.
+  - `q1000_yes`: `8` official trades, `+$0.90`, blocked by
+    `latest_live_replay_only_not_full_promotion_gate` and
+    `too_few_live_official_trades`.
+  Readiness remains `production_ready_count = 0`.
+- Validation:
+  `python -m py_compile scripts\check_btc_forward_shadow_status.py
+  scripts\build_btc_forward_evidence_report.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\fill_btc15m_live_ws_official_results.py
+  scripts\check_btc_shadow_official_settlement.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53` tests, with only the
+  pre-existing logging ResourceWarnings and pandas all-NaN warning.
+- Current interpretation:
+  no deploy. q250 first-skip is still the most interesting BTC15M path, but
+  the expanded REST-official live replay makes it less convincing, not more.
+  q1000 YES is cleaner on proxy/official agreement but has only `8` official
+  trades. Continue forward shadow collection and official settlement refreshes;
+  do not tune thresholds on these expanded live rows.
+
+## 2026-05-17/18 Latest official diagnostics and forward report refresh
+
+- Added diagnostics-only audit:
+  `scripts\analyze_btc15m_latest_live_replay_diagnostics.py`, output
+  `backtest_outputs\btc15m_latest_live_replay_diagnostics_latest_codex`.
+  This does not search for new thresholds; it only checks pre-existing
+  side/distance/near-strike cuts on the latest q250 first-skip and q1000 YES
+  REST-official live replay rows.
+- Diagnostic result: no deployable rescue cut. For `q250_firstskip_qty500`,
+  all `24` official rows remain `+$3.74` with `3` proxy/official result
+  mismatches and `-$3.00` official-minus-proxy PnL delta. All mismatches were
+  NO-side trades. YES-only removes the mismatches but leaves just `8` trades,
+  `+$0.88`, win `62.5%`, Sharpe `0.61`. Requiring aligned distance `>=5bps`
+  leaves only `1` trade. Excluding proxy-near-strike rows leaves `22` trades,
+  `+$3.78`, but still `2` proxy/official mismatches and a `-$2.00`
+  official-minus-proxy delta. The q250 issue is therefore settlement-basis
+  fragility, not one obvious bad near-strike row.
+- `q1000_yes` still has clean proxy/official agreement on the current exact
+  replay, but only `8` official rows, `+$0.90`, win `62.5%`, max DD `-$1.00`.
+  It remains research-only.
+- Refreshed BTC1H official shadow settlement:
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`.
+  The previously active `KXBTCD-26MAY1800-T76999.99` row finalized as a NO win.
+  BTC1H high-conf80 entry70 no-chase shadow now has `5/5`
+  official-finalized paper rows, official PnL `+$1.52`, official win `100%`,
+  proxy PnL `+$0.52`, and `1` proxy/official mismatch. Since
+  `2026-05-18T02:42:00Z`, it has `2` official rows, `+$0.62`, no mismatches.
+  This is encouraging but still far too small and shadow-ledger-only.
+- Re-checked processes with the required `Get-CimInstance` filter at the end
+  of the run. All four target Python processes were running:
+  BTC15M live capture PID `1724`, BTC15M q250 qty500 first-skip shadow PID
+  `7052`, BTC15M q1000 YES shadow PID `24840`, and BTC1H high-conf80 entry70
+  no-chase shadow PID `16216`. Latest status artifact:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex` at
+  `2026-05-18T04:17:37Z`. q250 was readable and still had `0` paper fills,
+  `168,245` signal scans, `0` nonzero-candidate scans, and latest reject
+  `h02_ttl_outside_12.39`. q1000/BTC1H capture DB reads hit live DuckDB
+  writer locks on this status refresh, but process checks and trade-ledger
+  reads still showed q1000 `0` paper fills and BTC1H `5` paper fills.
+- Refreshed readiness:
+  `backtest_outputs\deployment_readiness_latest_codex`, created
+  `2026-05-18T04:16:37Z`. `production_ready_count = 0`. The focused blockers
+  remain:
+  `q250_firstskip_qty500` blocked by
+  `latest_live_replay_only_not_full_promotion_gate`,
+  `too_few_live_official_trades`, `proxy_official_settlement_mismatch`, and
+  `proxy_official_pnl_disagreement`; `q1000_yes` blocked by
+  `latest_live_replay_only_not_full_promotion_gate` and
+  `too_few_live_official_trades`; BTC1H shadow rows blocked by
+  shadow-ledger-only, too-few-shadow-official-trades, and the older
+  proxy/official mismatch.
+- Refreshed consolidated report:
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+  `2026-05-18T04:17:44Z`. Verdict remains:
+  `NO DEPLOY: readiness production_ready_count is 0.`
+- Validation:
+  `python -m py_compile scripts\check_btc_forward_shadow_status.py
+  scripts\build_btc_forward_evidence_report.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\fill_btc15m_live_ws_official_results.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\analyze_btc15m_latest_live_replay_diagnostics.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53` tests, with the known
+  logging ResourceWarnings and pandas all-NaN warning.
+- Current interpretation:
+  do not deploy. q250 first-skip is still interesting but materially weakened
+  by official settlement. q1000 YES is clean but too small. BTC1H forward
+  shadow has a nice tiny official streak, but tiny streaks are not evidence
+  of deployability. The honest next loop is either more forward official
+  shadow collection or a GPT Pro re-review using this updated q250/BTC1H
+  evidence before designing the next frozen validation plan.
+
+## 2026-05-17/18 GPT Pro re-review and post-freeze forward baseline
+
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  explicitly include the consolidated forward report, exact q250/q1000
+  REST-official replay summaries, and the latest live-replay diagnostics:
+  `btc_forward_evidence_report_`,
+  `btc15m_f2_live_ws_q250_firstskip_rest_official_`,
+  `btc15m_f2_live_ws_q1000_yes_rest_official_`, and
+  `btc15m_latest_live_replay_diagnostics_`.
+- Built and submitted GPT Pro packet:
+  `gpt_pro_packets\strategy_advisor_20260517_222023`.
+  Chrome extension automation worked through the `Sami` profile with a Pro
+  composer; ChatGPT converted the long bundle into a pasted markdown
+  attachment. The response was saved at
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260517_222556_response.md`.
+  The initial `save_gpt_pro_review.ps1` run captured the Windows clipboard
+  prompt rather than the Chrome response, so
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260517_222556.md` is only
+  the prompt echo and should not be treated as the review.
+- GPT Pro agreed with the local gate:
+  no deploy, not even a small canary. It ranked the most plausible paths as
+  (1) BTC15M q250 first-signal qty>=500, weakened by official settlement;
+  (2) BTC15M q1000 YES, cleaner but too sparse; and
+  (3) BTC1H high_conf80_entry70_no_chase, encouraging but microscopic and
+  shadow-ledger-only. It recommended freezing those tracks, tracking
+  post-freeze live websocket evidence from `2026-05-18T04:17:44Z` onward,
+  prioritizing settlement-basis modeling / CF Benchmarks approximation, and
+  requiring at least `100` BTC15M or `50` BTC1H post-freeze official-settled
+  rows across at least `7` calendar days before promotion.
+- Ran frozen post-freeze q250 replay from `2026-05-18T04:17:44Z`:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_20260518_041744_codex`.
+  Rule was exact q250 first-signal qty>=500, TTL `10-12m`, spread `<=2c`,
+  entry `0.02..0.50`, fair probability `>=0.60`, edge `>=12c`. Capture end
+  was `2026-05-18T04:29:06.966391Z`; `13,525` top rows were scanned but there
+  were `0` closed proxy-settled signals and `0` official rows.
+- Ran frozen post-freeze q1000 YES replay from the same freeze point:
+  `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_20260518_041744_codex`.
+  It also had `0` closed proxy-settled signals and `0` official rows. This is
+  expected this soon after the freeze point; it establishes a clean forward
+  baseline rather than evidence of edge.
+- Patched `scripts\backtest_btc15m_f2_live_ws_holdout.py` so empty
+  post-freeze windows write clean empty artifacts instead of crashing on
+  missing `proxy_result`, and so missing proxy close prices remain unresolved
+  instead of becoming accidental NO labels. Also cleaned the datetime fallback
+  assignment in the proxy-settlement path.
+- Refreshed status and official settlement with
+  `--since-utc 2026-05-18T04:17:44Z`:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex` and
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created at
+  `2026-05-18T04:29:33Z`. All four target processes were running. Since the
+  freeze point, BTC15M q250/q1000 and BTC1H all had `0` paper fills. q250 had
+  `176,422` signal scans, `0` nonzero-candidate scans, latest reject
+  `h02_ttl_outside_0.48`; q1000 had `310,796` signal scans, `0`
+  nonzero-candidate scans, latest reject `h02_ttl_outside_0.46`.
+- Refreshed readiness and report after the post-freeze baseline:
+  `backtest_outputs\deployment_readiness_latest_codex`, created
+  `2026-05-18T04:29:42Z`, and
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+  `2026-05-18T04:29:48Z`. Readiness remains
+  `production_ready_count = 0`; the consolidated report remains
+  `NO DEPLOY`.
+- Added diagnostic-only settlement-basis watch:
+  `scripts\build_btc15m_settlement_basis_watch.py`, output
+  `backtest_outputs\btc15m_settlement_basis_watch_latest_codex`, created
+  `2026-05-18T04:32:42Z`. It combines the broad BTC15M REST-official live
+  replay plus exact q250 first-skip and q1000 YES REST-official rows into one
+  row-level basis table. It is not a threshold search.
+- Basis watch result:
+  q250 first-skip NO has `16` official/proxy rows, `3` mismatches, mismatch
+  rate `18.75%`, official PnL `+$2.86`, proxy PnL `+$5.86`,
+  official-minus-proxy PnL delta `-$3.00`, mean official-minus-proxy basis
+  `+$8.52`, and max absolute basis `$31.16`. q250 first-skip YES has `8`
+  rows, `0` mismatches, and no PnL delta. q1000 YES has `8` rows,
+  `0` mismatches, and no PnL delta. This makes the current research fork very
+  explicit: q250 has more signal but a NO-side settlement-basis problem;
+  q1000 YES is cleaner but extremely sparse.
+- Future GPT Pro packets now include `btc15m_settlement_basis_watch_` artifacts
+  and prioritize `settlement_basis_summary.csv` when present.
+
+## 2026-05-17/18 Forward refresh and kill-or-continue control table
+
+- Refreshed process state again with the GPT Pro freeze timestamp
+  `--since-utc 2026-05-18T04:17:44Z`. All four expected runners were still
+  present: BTC15M capture PID `1724`, BTC15M q250 first-skip shadow PID
+  `7052`, BTC15M q1000 YES shadow PID `24840`, and BTC1H high-conf80 entry70
+  no-chase shadow PID `16216`.
+- Refreshed post-freeze q250/q1000 live websocket replays:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_20260518_041744_codex`
+  and
+  `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_20260518_041744_codex`.
+  Capture end advanced to `2026-05-18T04:35:21.909619Z`; each replay saw
+  `23,975` top rows, `13,499` quote rows after metadata, and `0` raw F2 hits,
+  `0` first signals, `0` closed proxy trades, and `0` official rows.
+- Refreshed shadow status:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+  `2026-05-18T04:35:30Z`. Since the freeze point, q250/q1000/BTC1H still had
+  `0` paper fills. q250 had `182,401` signal scans, `0`
+  nonzero-candidate scans, latest detail `stale_btc_spot`; q1000 had
+  `316,822` signal scans, `0` nonzero-candidate scans, latest detail
+  `h02_ttl_outside_9.52`. The live capture DB read hit a transient writer
+  lock, but process state and q250/q1000 shadow DBs were live.
+- Refreshed official shadow settlement:
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+  `2026-05-18T04:35:28Z`. BTC15M q250/q1000 still had `0` fills. BTC1H remained
+  `5` official-filled paper rows all-time, official PnL `+$1.52`, proxy PnL
+  `+$0.52`, and `1` proxy/official mismatch; since the freeze timestamp it had
+  `0` official rows.
+- Refreshed readiness and consolidated report:
+  `backtest_outputs\deployment_readiness_latest_codex`, created
+  `2026-05-18T04:35:51Z`, and
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+  `2026-05-18T04:36:03Z`. Readiness remains
+  `production_ready_count = 0`; the consolidated verdict remains
+  `NO DEPLOY`.
+- Added `scripts\build_btc_kill_continue_report.py`, a deployment-control
+  summary that combines readiness, forward shadows, post-freeze replay, and
+  settlement-basis artifacts without searching thresholds. Latest output:
+  `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T04:38:24Z`.
+- Kill-or-continue actions:
+  - `broad_q_families`: `KILL_FOR_DEPLOYMENT`; broad q strategies are
+    REST-official negative and settlement-fragile.
+  - `q250_firstskip_qty500`: `CONTINUE_FORWARD_ONLY`; it has `24` latest
+    official replay rows, `+$3.74`, but `3` basis mismatches and `-$3.00`
+    official-minus-proxy PnL delta, with `0` post-freeze fills so far.
+  - `q1000_yes`: `CONTINUE_FORWARD_ONLY_SPARSE`; it has `8` official replay
+    rows, `+$0.90`, `0` basis mismatches, and `0` post-freeze fills.
+  - `btc1h_high_conf80_entry70_no_chase`:
+    `OBSERVE_ONLY_RESTART_WITH_PERMISSION`; `5` official all-time shadow rows,
+    `+$1.52`, `1` old proxy/official mismatch, and `0` post-freeze rows. A
+    clean official-settlement shadow restart would require explicit permission.
+- Future GPT Pro packets now include `btc_kill_continue_` artifacts and
+  prioritize `kill_continue_summary.csv` when present.
+- Validation:
+  `python -m py_compile scripts\build_btc_kill_continue_report.py
+  scripts\build_btc15m_settlement_basis_watch.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53` tests, with only the
+  known logging ResourceWarnings and pandas all-NaN warning.
+- Final process check after validation again showed only the four expected
+  runners: BTC15M capture PID `1724`, q250 shadow PID `7052`, q1000 YES shadow
+  PID `24840`, and BTC1H high-conf80 entry70 no-chase shadow PID `16216`.
+
+## 2026-05-17/18 Signal-health refresh and GPT Pro packet v2
+
+- Added `scripts\analyze_btc15m_shadow_signal_health.py`, a diagnostic-only
+  audit for the BTC15M q250 first-skip and q1000 YES paper-shadow capture
+  DuckDBs. It does not search thresholds or promote strategies; it checks
+  whether zero post-freeze fills look like genuine no-signal behavior or a
+  broken/stale capture path.
+- Refreshed BTC15M signal health:
+  `backtest_outputs\btc15m_shadow_signal_health_latest_codex`, created
+  `2026-05-18T04:46:19Z`, using the GPT Pro freeze timestamp
+  `2026-05-18T04:17:44Z`.
+  Both BTC15M shadow capture DBs were readable. Since the freeze:
+  q250 had `21,885` signal-scan rows, `0` nonzero-candidate rows, `0`
+  selected rows, top detail family `h02_ttl_outside` at `76.13%`, and stale
+  BTC spot detail families at about `11.13%`. q1000 YES had `21,774`
+  signal-scan rows, `0` nonzero-candidate rows, `0` selected rows, top detail
+  family `h02_ttl_outside` at `76.06%`, and stale BTC spot detail families at
+  about `11.07%`.
+- Interpretation: zero BTC15M post-freeze fills are mostly frozen-rule
+  no-signal behavior, not a dead shadow. Stale BTC spot remains worth
+  monitoring but is secondary to TTL/no-edge rejection in this window.
+- Refreshed process/status/official/readiness/consolidated reports with
+  `--since-utc 2026-05-18T04:17:44Z`. Latest artifacts:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`
+  (`2026-05-18T04:46:40Z`),
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`
+  (`2026-05-18T04:46:46Z`),
+  `backtest_outputs\deployment_readiness_latest_codex`
+  (`2026-05-18T04:46:49Z`), and
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`
+  (`2026-05-18T04:46:51Z`).
+- Status refresh found all four expected runners still alive. BTC15M q250 and
+  q1000 had `0` paper fills since the freeze. BTC1H high-conf80 entry70
+  no-chase had `1` new paper fill since the freeze, but it was still active
+  and had `0` official-settled post-freeze rows. BTC1H all-time official
+  finalized rows remain `5`, official PnL `+$1.52`, proxy PnL `+$0.52`, with
+  `1` proxy/official mismatch.
+- Readiness still reports `production_ready_count = 0`. Consolidated report
+  still says `NO DEPLOY: readiness production_ready_count is 0.`
+- Regenerated `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T04:47:04Z`, after the status refresh. It now includes
+  signal-health columns and the new BTC1H post-freeze paper row:
+  `broad_q_families = KILL_FOR_DEPLOYMENT`,
+  `q250_firstskip_qty500 = CONTINUE_FORWARD_ONLY`,
+  `q1000_yes = CONTINUE_FORWARD_ONLY_SPARSE`, and
+  `btc1h_high_conf80_entry70_no_chase =
+  OBSERVE_ONLY_RESTART_WITH_PERMISSION`.
+- Patched `scripts\build_btc_kill_continue_report.py` and
+  `scripts\build_gpt_pro_strategy_packet.py` so future control tables and GPT
+  Pro packets include BTC15M shadow signal-health evidence.
+- Built updated GPT Pro packet:
+  `gpt_pro_packets\strategy_advisor_20260517_224808`, created
+  `2026-05-18T04:48:10Z`. It includes the latest forward evidence,
+  kill-or-continue control table, settlement-basis watch, and BTC15M
+  signal-health diagnostic. Chrome extension automation was available on the
+  `Sami` profile, and the packet was submitted to ChatGPT Pro as pasted
+  markdown attachment in conversation
+  `https://chatgpt.com/c/6a0a9a67-6588-8326-97bd-ab32cbf91597`.
+- Saved the actual GPT Pro response at
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260517_225620.md`. The
+  attempted save immediately before it,
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260517_225525.md`, is a
+  prompt echo caused by the Chrome/browser clipboard being separate from the
+  Windows clipboard; do not treat `225525` as a review.
+- GPT Pro v2 again agreed with the local gate: no deploy and no one-contract
+  live canary. It ranked q250 first-skip as the best research path, q1000 YES
+  as the cleanest sparse path, and BTC1H high-conf80 entry70 no-chase as an
+  observe-only slow-burn. It emphasized settlement-basis modeling, q250 NO-side
+  fragility, official-settlement-only scoring, and clean post-freeze collection
+  over threshold search.
+- Followed the GPT Pro v2 action plan by rerunning the exact frozen BTC15M
+  post-freeze replays without parameter changes:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_20260518_041744_codex`
+  and
+  `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_20260518_041744_codex`.
+  Capture end advanced to about `2026-05-18T04:57Z`. q250 scanned `62,900`
+  top rows and q1000 scanned `63,293` top rows; both still had `0` raw F2
+  hits, `0` first signals, `0` closed proxy trades, and `0` official rows.
+- Regenerated `backtest_outputs\btc_kill_continue_latest_codex` again after
+  those post-freeze replays, created `2026-05-18T04:57:41Z`. The research
+  control actions did not change: broad q families killed for deployment,
+  q250 forward-only, q1000 YES forward-only sparse, BTC1H observe-only unless
+  explicitly restarted under clean official-settlement paper rules.
+- Final process check still showed only the four expected Python runners:
+  BTC15M capture PID `1724`, q250 first-skip shadow PID `7052`, q1000 YES
+  shadow PID `24840`, and BTC1H high-conf80 entry70 no-chase shadow PID
+  `16216`.
+- Validation:
+  `python -m py_compile scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_btc15m_settlement_basis_watch.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+
+## 2026-05-17/18 Settlement-basis risk audit and 05:00 UTC refresh
+
+- Refreshed the canonical forward artifacts with the GPT Pro freeze timestamp
+  `2026-05-18T04:17:44Z`:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`
+  (`2026-05-18T04:59:33Z`),
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`
+  (`2026-05-18T04:59:36Z`),
+  `backtest_outputs\deployment_readiness_latest_codex`
+  (`2026-05-18T04:59:39Z`), and
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`
+  (`2026-05-18T04:59:41Z`).
+- Process/status refresh: all four expected runners were still present. BTC15M
+  q250/q1000 shadows were readable and had `0` paper fills since the freeze.
+  q250 had `207,515` signal scans and `0` nonzero-candidate rows; q1000 had
+  `341,662` signal scans and `0` nonzero-candidate rows. BTC1H still had `1`
+  post-freeze paper fill, but `0` official-settled post-freeze rows.
+- Readiness remained `production_ready_count = 0`; the consolidated report
+  remained `NO DEPLOY`.
+- Reran exact frozen BTC15M post-freeze replays without parameter changes:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_20260518_041744_codex`
+  and
+  `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_20260518_041744_codex`.
+  Capture end advanced to `2026-05-18T05:00:00.779996Z`; each replay scanned
+  `67,754` top rows and `67,623` quote rows after metadata, with `0` raw F2
+  hits, `0` first signals, `0` closed proxy trades, and `0` official rows.
+- Reran BTC15M shadow signal health:
+  `backtest_outputs\btc15m_shadow_signal_health_latest_codex`, created
+  `2026-05-18T05:00:15Z`. Since the freeze, q250 had `39,194` signal scans,
+  `0` nonzero-candidate rows, and `0` selected rows; q1000 had `39,056`
+  signal scans, `0` nonzero-candidate rows, and `0` selected rows. Top detail
+  family was still `h02_ttl_outside` for both at about `77.3%`; stale BTC spot
+  detail families were about `10.19%` for q250 and `10.16%` for q1000.
+- Added `scripts\build_btc_settlement_basis_risk_audit.py`, a diagnostic-only
+  deployment-control artifact that combines BTC15M settlement-basis rows and
+  BTC1H official-shadow rows. It reports side-specific basis risk gates using
+  current Pro/local thresholds: enough official rows, mismatch rate `<=2%`,
+  and official-minus-proxy PnL drift no worse than `-$0.02/trade`.
+- Ran the new audit:
+  `backtest_outputs\btc_settlement_basis_risk_audit_latest_codex`, created
+  `2026-05-18T05:02:15Z`. It produced `182` rows and `21` proxy/official
+  mismatch rows. Every candidate-side failed at least one basis gate.
+  Key blocker rows:
+  - `q250_firstskip_qty500` NO: `16` official rows, `3` adverse mismatches,
+    mismatch rate `18.75%`, official-minus-proxy PnL delta `-$0.1875/trade`,
+    abs basis p95 `$24.545`, max abs basis `$31.16`.
+  - `q1000_yes` YES: `8` official rows, `0` mismatches, but fails sample size.
+  - `btc1h_high_conf80_entry70_no_chase_shadow` NO: `5` official rows,
+    mismatch rate `20%`, abs basis p95 about `$100.218`, max abs basis
+    `$111.67`; still too small and not deployment evidence.
+- Patched `scripts\build_btc_kill_continue_report.py` so the kill/continue
+  control table reads `settlement_basis_risk_gates.csv`. Latest output:
+  `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T05:03:04Z`. q250 now explicitly shows failed basis gate reasons:
+  `adverse_proxy_official_mismatches`,
+  `official_minus_proxy_pnl_delta_bad`,
+  `proxy_official_mismatch_rate_high`,
+  `proxy_win_official_loss_flip`, and `too_few_official_rows`.
+  q1000 YES shows `too_few_official_rows`. BTC1H shows
+  `proxy_official_mismatch_rate_high` and `too_few_official_rows`.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc_settlement_basis_risk_audit_` artifacts and prioritize
+  `settlement_basis_risk_gates.csv` /
+  `settlement_basis_risk_by_candidate.csv`.
+- Built a fresh GPT Pro packet after the basis-risk wiring:
+  `gpt_pro_packets\strategy_advisor_20260517_230421`, created
+  `2026-05-18T05:04:21Z`. It was not submitted, because the most recent GPT
+  Pro review already agrees with the current local next step and the new audit
+  confirms the same no-deploy/basis-risk picture rather than changing the
+  high-level research plan.
+- Validation:
+  `python -m py_compile scripts\build_btc_settlement_basis_risk_audit.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. This turn improved the settlement-basis
+  control surface, but the full objective is not complete because no candidate
+  has enough post-freeze official-settled rows, q250 has adverse settlement
+  mismatches, q1000 YES is sparse, and BTC1H remains shadow-only/tiny with a
+  proxy/official mismatch history.
+
+## 2026-05-17/18 Forward consistency audit
+
+- Added `scripts\build_btc_forward_consistency_audit.py`, a deployment-control
+  artifact that checks whether each frozen candidate agrees across live/paper
+  shadow state, official settlement, frozen post-freeze replay, readiness,
+  settlement-basis risk, and signal-health evidence. It does not search
+  thresholds or authorize deployment.
+- Ran:
+  `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+  `2026-05-18T05:12:02Z`. Result: `0/3` candidates were consistent enough for
+  promotion.
+  - `q250_firstskip_qty500`: status
+    `consistent_no_signal_no_promotion`; shadow paper fills since freeze `0`,
+    post-freeze replay raw hits `0`, first signals `0`, official replay rows
+    `0`. This confirms runner/replay consistency, but only because there were
+    no post-freeze signals. It is not edge evidence. It also fails readiness,
+    basis gate, and sample-size gates.
+  - `q1000_yes`: status `consistent_no_signal_no_promotion`; same post-freeze
+    `0` raw hits / `0` first signals / `0` official replay rows. It remains a
+    sparse sentinel, not a deployable strategy.
+  - `btc1h_high_conf80_entry70_no_chase`: status
+    `shadow_official_proxy_mismatch`; since-freeze official rows `1`,
+    official PnL `-$0.70`, official-minus-proxy PnL `-$1.00`, and one
+    proxy/official mismatch. This makes the BTC1H runner-up category weaker,
+    not closer.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so GPT Pro packets include
+  `btc_forward_consistency_audit_` artifacts and prioritize
+  `forward_consistency_summary.csv`.
+- Built a fresh GPT Pro packet with the new audit included:
+  `gpt_pro_packets\strategy_advisor_20260517_231223`, created
+  `2026-05-18T05:12:25Z`. It was later submitted through the Chrome extension
+  after confirming ChatGPT was logged in on a Pro account.
+- Validation:
+  `python -m py_compile scripts\build_btc_forward_consistency_audit.py
+  scripts\build_btc_settlement_basis_risk_audit.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. BTC15M q250/q1000 are live and
+  replay-consistent only in the "no post-freeze signal" sense; BTC1H has a new
+  post-freeze official loss/mismatch. The objective remains open.
+
+## 2026-05-17/18 GPT Pro v3 and basis-danger table
+
+- Confirmed the Chrome extension automation path works on the `Sami` Chrome
+  profile and that ChatGPT is logged in with Pro. Submitted the sanitized
+  packet `gpt_pro_packets\strategy_advisor_20260517_231223` to a new ChatGPT
+  Pro conversation. The paste was accepted as `Pasted markdown(5).md`.
+- Saved the Pro response to
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260517_232103.md`.
+  Pro's verdict matched the local gate: no BTC15M/BTC1H deployment and no
+  one-contract canary. It ranked the paths as q250 first-skip best research
+  lead, q1000 YES cleaner but sparse, and BTC1H observe-only. Local correction:
+  its BTC1H streak text was stale versus the newest official audit; current
+  local truth is `6` official rows all-time and `1` since-freeze row with
+  official PnL `-$0.70` and one proxy/official mismatch.
+- Followed Pro's highest-value next step by adding
+  `scripts\build_btc_basis_danger_table.py`, a diagnostic-only settlement-basis
+  danger table builder. It bins normalized official/proxy rows by side,
+  proxy-distance bucket, decision-distance bucket, TTL, entry price, visible
+  quantity, quote age, BTC spot age, and near-strike status. It does not create
+  thresholds or trading rules.
+- Ran:
+  `backtest_outputs\btc_basis_danger_table_latest_codex`, created
+  `2026-05-18T05:23:25Z`. It used `183` normalized basis-risk rows and found:
+  - `q250_firstskip_qty500` NO: `16` both-result rows, `3` adverse mismatches,
+    mismatch rate `18.75%`, official PnL `+$2.86`, proxy PnL `+$5.86`, and
+    official-minus-proxy drift `-$0.1875/trade`.
+  - `q250_firstskip_qty500` YES: `8` rows, `0` mismatches, but still too sparse.
+  - `q1000_yes` YES: `8` rows, `0` mismatches, official PnL `+$0.90`, still too
+    sparse.
+  - BTC1H NO: `6` rows, `2` proxy/official mismatches, `1` adverse mismatch,
+    mismatch rate `33.33%`; too few rows and not deployment evidence.
+  - High-signal bins again concentrate adverse flips in NO-side rows. This is
+    diagnostic evidence for settlement-basis modeling, not a new filter.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc_basis_danger_table_` artifacts and prioritize
+  `basis_danger_by_candidate.csv` / `basis_danger_bins.csv`.
+- Built another packet with the basis-danger artifact included:
+  `gpt_pro_packets\strategy_advisor_20260517_232339`, created
+  `2026-05-18T05:23:39Z`.
+- Validation:
+  `python -m py_compile scripts\build_btc_basis_danger_table.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_btc_settlement_basis_risk_audit.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. The new work improves the audit and
+  review loop, but the objective remains open until fresh post-freeze,
+  official-settled, execution-realistic live rows exist.
+
+## 2026-05-17/18 Current refresh and frozen opportunity-rate audit
+
+- Refreshed the canonical forward artifacts from the freeze timestamp
+  `2026-05-18T04:17:44Z`:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`
+  (`2026-05-18T05:26:34Z`),
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`
+  (`2026-05-18T05:26:42Z`),
+  `backtest_outputs\deployment_readiness_latest_codex`
+  (`2026-05-18T05:26:48Z`), and
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`
+  (`2026-05-18T05:26:56Z`).
+- Process/status: all four expected runners were still present:
+  BTC15M capture, q250 first-skip shadow, q1000 YES shadow, and BTC1H
+  high-conf80 entry70 no-chase shadow. No processes were killed or restarted.
+- Readiness remained `production_ready_count = 0`. The forward evidence report
+  remained `NO DEPLOY`.
+- BTC1H official-settlement state remained worse than a deployable runner:
+  `6` official rows all-time, official PnL `+$0.82`, but `2`
+  proxy/official mismatches. Since the freeze there is `1` official row with
+  official PnL `-$0.70`, proxy PnL `+$0.30`, and one proxy/official mismatch.
+- Reran the exact frozen BTC15M post-freeze replays without changing
+  thresholds:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_20260518_041744_codex`
+  and
+  `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_20260518_041744_codex`.
+  Capture end advanced to about `2026-05-18T05:27Z`. q250 scanned
+  `122,641` top rows and q1000 scanned `123,269` top rows; both had `0` raw
+  F2 hits, `0` first signals, `0` closed proxy trades, and `0` official rows.
+- Reran BTC15M shadow signal health:
+  `backtest_outputs\btc15m_shadow_signal_health_latest_codex`, created
+  `2026-05-18T05:27:46Z`. Since the freeze, q250 had `71,891` signal scans,
+  `0` nonzero-candidate rows, and `0` selected rows; q1000 had `71,416`
+  signal scans, `0` nonzero-candidate rows, and `0` selected rows. Top detail
+  family was `h02_ttl_outside` for both at about `78.5%`; stale BTC spot
+  detail families were about `10.59%` for q250 and `10.61%` for q1000.
+- Rebuilt the settlement-basis and control artifacts:
+  `backtest_outputs\btc_settlement_basis_risk_audit_latest_codex`
+  (`2026-05-18T05:27:56Z`),
+  `backtest_outputs\btc_kill_continue_latest_codex`
+  (`2026-05-18T05:28:05Z`),
+  `backtest_outputs\btc_forward_consistency_audit_latest_codex`
+  (`2026-05-18T05:28:13Z`), and
+  `backtest_outputs\btc_basis_danger_table_latest_codex`
+  (`2026-05-18T05:28:15Z`). Conclusions did not improve: no candidate passed
+  forward consistency, q250 remains blocked by adverse settlement-basis
+  mismatches, q1000 YES remains too sparse, and BTC1H remains observe-only.
+- Added `scripts\build_btc15m_frozen_opportunity_rate_report.py`, a
+  diagnostic-only sample-accumulation report. It does not tune or promote; it
+  compares the older exact live replay rate against the post-freeze no-signal
+  window.
+- Ran:
+  `backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex`, created
+  `2026-05-18T05:31:00Z`. Key rows:
+  - `q250_firstskip_qty500`: old exact replay window `5.7209` days,
+    `24` REST-official rows, about `4.1951` official rows/day. Post-freeze:
+    `0` raw hits, `0` first signals, `0` official rows. At the old replay
+    rate, reaching `100` post-freeze official rows would take about `23.84`
+    days.
+  - `q1000_yes`: old exact replay window `5.7248` days, `8` REST-official
+    rows, about `1.3974` official rows/day. Post-freeze: `0` raw hits, `0`
+    first signals, `0` official rows. At the old replay rate, reaching `100`
+    post-freeze official rows would take about `71.56` days.
+  These projections are only collection-planning diagnostics, not validation
+  evidence.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc15m_frozen_opportunity_rate_` artifacts and prioritize
+  `frozen_opportunity_rate_summary.csv`.
+- Built a fresh packet with the refreshed audits and opportunity-rate report:
+  `gpt_pro_packets\strategy_advisor_20260517_233115`, created
+  `2026-05-18T05:31:15Z`. It was not submitted because the new artifact does
+  not create a strategic fork; it reinforces the latest Pro/local conclusion.
+- Validation:
+  `python -m py_compile scripts\build_btc15m_frozen_opportunity_rate_report.py
+  scripts\build_btc_basis_danger_table.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_btc_settlement_basis_risk_audit.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. The best honest direction is continued
+  forward collection for q250/q1000, settlement-basis modeling, and BTC1H
+  observe-only unless explicitly restarted under clean official-settlement
+  paper rules.
+
+## 2026-05-17/18 Settlement-basis model feasibility audit
+
+- Followed the GPT Pro recommendation to test whether a decision-time
+  settlement-basis danger model is even supportable from the current official
+  rows, without turning the result into a trading threshold.
+- Added `scripts\build_btc_settlement_basis_model_feasibility.py`. The script
+  normalizes the existing basis-risk rows, de-duplicates overlapping candidate
+  rows by market/side/entry, excludes post-event fields from model features,
+  and runs grouped cross-validation by `market_ticker` for three diagnostic
+  targets: proxy/official mismatch, adverse proxy/official mismatch, and proxy
+  win / official loss.
+- Ran:
+  `backtest_outputs\btc_settlement_basis_model_feasibility_latest_codex`,
+  created `2026-05-18T05:36:23Z`. It used `183` normalized rows and `129`
+  de-duplicated model rows.
+- Decision-time features used were:
+  `family_btc15m`, `side_yes`, `entry_price`, `visible_qty_log1p`,
+  `spread_cents`, `abs_decision_distance_bps`,
+  `signed_decision_distance_bps`, `btc_spot_age_sec`, and `rv_60m`.
+  `ttl_min` and `quote_age_ms` were present in the feature contract but
+  missing for all current rows, so they were reported as unavailable rather
+  than silently imputed as real information. Post-event fields
+  `proxy_distance_usd`, `official_distance_usd`, `basis_usd`, and
+  `abs_basis_usd` were excluded from model features and retained only for
+  diagnostics.
+- Grouped-CV diagnostics were weak:
+  - `proxy_official_mismatch`: `129` samples, `16` positives, OOF AUC
+    `0.5668`, average precision `0.1868`, Brier `0.2285`.
+  - `adverse_proxy_official_mismatch`: `129` samples, `15` positives, OOF AUC
+    `0.4856`, average precision `0.1401`, Brier `0.2423`.
+  - `proxy_win_official_loss`: same sample and positive counts as adverse
+    mismatch, OOF AUC `0.4856`, average precision `0.1401`, Brier `0.2423`.
+- Interpretation: this is a useful negative result. Current data does not
+  support a deployable decision-time settlement-basis guard. Any future basis
+  guard must be pre-registered and validated on fresh post-freeze
+  official-settled live rows before it can affect q250, q1000 YES, or BTC1H.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc_settlement_basis_model_feasibility_` artifacts and prioritize
+  `basis_model_feasibility_summary.csv` /
+  `basis_model_group_summary.csv`.
+- Built a fresh packet with the feasibility audit included:
+  `gpt_pro_packets\strategy_advisor_20260517_233833`, created after the audit.
+  It was not resubmitted because the new evidence reinforces the current
+  local/Pro no-deploy conclusion rather than creating a new strategic fork.
+- Validation:
+  `python -m py_compile scripts\build_btc_settlement_basis_model_feasibility.py
+  scripts\build_btc15m_frozen_opportunity_rate_report.py
+  scripts\build_btc_basis_danger_table.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_btc_settlement_basis_risk_audit.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\backtest_btc15m_f2_live_ws_holdout.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. q250 remains the best research path but
+  is blocked by official-settlement drift, adverse NO-side basis fragility,
+  insufficient post-freeze official rows, and no post-freeze signals. q1000
+  YES remains cleaner but too sparse. BTC1H remains observe-only and weaker
+  after the since-freeze official loss/mismatch.
+
+## 2026-05-17/18 Predexon REST-official coverage audit
+
+- Refreshed live/readiness state from freeze `2026-05-18T04:17:44Z`.
+  All four expected runners were still present: BTC15M capture, BTC15M q250
+  first-skip shadow, BTC15M q1000 YES shadow, and BTC1H high-conf80 entry70
+  no-chase shadow. No process was killed or restarted.
+- Refreshed:
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`
+  (`2026-05-18T05:41:37Z`),
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`
+  (`2026-05-18T05:41:37Z`),
+  `backtest_outputs\deployment_readiness_latest_codex`
+  (`2026-05-18T05:41:47Z`), and
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`
+  (`2026-05-18T05:41:47Z`). Readiness still had
+  `production_ready_count = 0`; the forward evidence report remained
+  `NO DEPLOY`.
+- Current refreshed shadow facts:
+  - BTC15M q250 and q1000 shadows still have `0` paper fills and `0`
+    official-settled rows.
+  - BTC1H has `6` official rows all-time, official PnL `+$0.82`, but `2`
+    proxy/official mismatches. Since freeze there is `1` official row with
+    official PnL `-$0.70`, proxy PnL `+$0.30`, and one proxy/official
+    mismatch.
+- Added `scripts\audit_btc15m_predexon_official_coverage.py`, a
+  diagnostic-only audit that makes REST-official historical coverage explicit
+  for the active BTC15M materialized candidates. It treats REST-official rows
+  as research evidence and uncovered rows as proxy-only stress/coverage
+  warnings, not promotion support.
+- Ran:
+  `backtest_outputs\btc15m_predexon_official_coverage_latest_codex`, created
+  `2026-05-18T05:45:01Z`.
+- Market-result coverage from the prior REST fill:
+  `374` finalized REST markets with results, `506` REST `404_not_found`
+  markets, `191` YES results, and `183` NO results. The missing REST coverage
+  is concentrated in January windows; April/May materialized rows have REST
+  official coverage.
+- Focused candidate coverage:
+  - `q250_firstskip_qty500`: `63` selected historical rows, `57`
+    REST-official rows, coverage `90.48%`. REST-official covered PnL `+$8.72`,
+    proxy-all PnL `+$8.31`. The `6` uncovered proxy-only rows have PnL
+    `-$0.41`, win rate `33.33%`, max DD `-$0.74`, and `2` bad uncovered
+    windows. This does not kill the research lead, but it prevents treating the
+    historical result as fully official-settled evidence.
+  - `q1000_yes`: `33` selected historical rows, `23` REST-official rows,
+    coverage `69.70%`. REST-official covered PnL `+$6.45`, proxy-all PnL
+    `+$7.98`. The `10` uncovered proxy-only rows have PnL `+$1.53`, win rate
+    `50.00%`, max DD `-$0.98`, and `1` bad uncovered window. It remains clean
+    but too sparse and too partially covered for promotion.
+  - Broader q families have worse uncovered proxy stress. For example,
+    `q250_both` has only `48.59%` REST-official coverage and `73` uncovered
+    proxy-only rows with PnL `-$4.49`, reinforcing the kill-for-deployment
+    decision for broad q strategies.
+- Patched `scripts\build_btc_kill_continue_report.py` so the q250/q1000 rows
+  include Predexon REST-official coverage fields:
+  REST-official historical rows, coverage rate, uncovered rows, uncovered
+  proxy PnL, and bad uncovered-window count. Rebuilt
+  `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T05:46:17Z`. It still says:
+  - broad q families: `KILL_FOR_DEPLOYMENT`.
+  - q250 firstskip qty500: `CONTINUE_FORWARD_ONLY`, not deployable.
+  - q1000 YES: `CONTINUE_FORWARD_ONLY_SPARSE`, not deployable.
+  - BTC1H high-conf80 entry70 no-chase: `OBSERVE_ONLY_RESTART_WITH_PERMISSION`.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future Pro packets
+  include `btc15m_predexon_official_coverage_` artifacts and prioritize
+  `predexon_official_coverage_summary.csv`. Built
+  `gpt_pro_packets\strategy_advisor_20260517_234627`; the packet includes the
+  new coverage audit and the updated kill/continue report. It was not
+  resubmitted because this follows Pro's existing January-stress recommendation
+  and reinforces the no-deploy conclusion rather than changing the strategic
+  branch.
+- Validation:
+  `python -m py_compile scripts\audit_btc15m_predexon_official_coverage.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\build_btc_settlement_basis_model_feasibility.py
+  scripts\build_btc15m_frozen_opportunity_rate_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. This audit narrows the honest evidence
+  for q250/q1000: historical Predexon support is partially REST-official, not
+  fully official-settled, and missing January official rows remain stress
+  caveats. The next useful evidence still has to come from fresh post-freeze
+  live websocket rows with official settlement and execution-realistic
+  paper/live agreement.
+
+## 2026-05-17/18 Execution-realism audit
+
+- Refreshed current process and forward state again from freeze
+  `2026-05-18T04:17:44Z`.
+  - All four expected processes were still running: BTC15M capture, BTC15M
+    q250 first-skip shadow, BTC15M q1000 YES shadow, and BTC1H high-conf80
+    entry70 no-chase shadow. No process was killed or restarted.
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T05:49:21Z`, still had `production_ready_count = 0`.
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T05:49:22Z`, still reported `NO DEPLOY`.
+  - BTC15M q250/q1000 shadows still have `0` paper fills and `0`
+    official-settled shadow rows.
+  - BTC1H now has `7` paper-filled rows all-time and `2` paper-filled rows
+    since freeze, but only `6` official-settled rows all-time and `1`
+    official-settled row since freeze. Since-freeze official PnL remains
+    `-$0.70`, with proxy PnL `+$0.30` and one proxy/official mismatch. The
+    newest BTC1H row is active/unfinalized, so it is not promotion evidence.
+- Added `scripts\build_btc_execution_realism_audit.py`, a promotion-control
+  diagnostic that audits whether current evidence rows carry the execution
+  fields required for eventual deployment:
+  - live websocket replay rows: received-time top-book asks/quantities,
+    side-entry consistency, visible quantity, spread, BTC spot freshness,
+    official-settlement fields, and one-trade-per-event behavior.
+  - paper shadow ledger rows: quote age, top visible quantity, quote/signal
+    timestamps, decision-time yes/no book prices, contracts, fees, and
+    official-settlement status.
+- Ran:
+  `backtest_outputs\btc_execution_realism_audit_latest_codex`, created
+  `2026-05-18T05:52:46Z`.
+- BTC15M exact live replay execution-field results:
+  - `q250_firstskip_qty500_live_replay`: `24` rows, `24` official rows,
+    official PnL `+$3.74`, replay field-complete rate `100%`,
+    entry-side-ask match rate `100%`, visible-quantity-side-ask-qty match rate
+    `100%`, visible quantity `>=500` on `100%` of rows, spread `<=2c` on
+    `100%`, BTC spot age within `120s` on `100%`, p95 BTC spot age `13.68s`,
+    max BTC spot age `16.88s`, `0` duplicate event rows. Audit status:
+    `PASS_REPLAY_EXECUTION_FIELDS_NOT_PROMOTION`.
+  - `q1000_yes_live_replay`: `8` rows, `8` official rows, official PnL
+    `+$0.90`, replay field-complete rate `100%`, entry/visible/spread/BTC-age
+    checks all `100%`, min visible quantity `1003.72`, `0` duplicate event
+    rows. Audit status: `PASS_REPLAY_EXECUTION_FIELDS_NOT_PROMOTION`.
+  These are necessary execution-field passes for the old live replay window,
+  not promotion passes, because sample size, post-freeze collection,
+  settlement-basis risk, and live/paper agreement still fail.
+- BTC15M shadow ledger execution-field results:
+  - q250 and q1000 YES paper shadows have `0` filled ledger rows, so ledger
+    execution realism is still unassessed for forward paper fills. Audit status
+    for both: `NO_FILLED_LEDGER_ROWS`.
+- BTC1H shadow ledger execution-field result:
+  - `btc1h_high_conf80_entry70_no_chase_shadow`: `7` paper rows, `6`
+    official rows, `1` pending official row. Required ledger field-complete
+    rate `0%` for the execution-only fields needed for promotion. Missing
+    fields: `quote_age_ms`, `top_visible_qty`, `quote_received_at_ns`,
+    `signal_received_at_ns`, `yes_bid`, `yes_ask`, `no_bid`, and `no_ask`.
+    Audit blockers:
+    `missing_ledger_execution_fields`,
+    `quote_age_missing_or_above_limit`,
+    `top_visible_qty_missing_or_below_contracts`,
+    `entry_not_reconciled_to_side_ask`, and
+    `pending_official_settlement_rows`. Audit status:
+    `FAIL_LEDGER_EXECUTION_FIELDS`.
+  This makes BTC1H strictly not deployable from the current running shadow,
+  independent of PnL.
+- Patched `scripts\build_btc_kill_continue_report.py` so the q250/q1000/BTC1H
+  rows include replay and/or ledger execution-realism status. Latest
+  `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T05:53:59Z`, still says:
+  - broad q families: `KILL_FOR_DEPLOYMENT`.
+  - q250 firstskip qty500: `CONTINUE_FORWARD_ONLY`, with replay execution
+    fields passing but no forward shadow ledger fills.
+  - q1000 YES: `CONTINUE_FORWARD_ONLY_SPARSE`, with replay execution fields
+    passing but no forward shadow ledger fills.
+  - BTC1H high-conf80 entry70 no-chase:
+    `OBSERVE_ONLY_RESTART_WITH_PERMISSION`, with
+    `FAIL_LEDGER_EXECUTION_FIELDS`.
+- Reran `scripts\build_btc_forward_consistency_audit.py` after the refreshed
+  BTC1H shadow state:
+  `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+  `2026-05-18T05:54:49Z`. Result stayed `0/3` candidates consistent enough
+  for promotion. BTC1H now shows `2` shadow paper fills since freeze, `1`
+  official-filled row since freeze, official PnL `-$0.70`, and the same
+  proxy/official mismatch blocker.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future Pro packets
+  include `btc_execution_realism_audit_` artifacts and prioritize
+  `execution_realism_summary.csv`. Built
+  `gpt_pro_packets\strategy_advisor_20260517_235458`, which includes the new
+  execution-realism audit plus refreshed kill/continue and forward-consistency
+  artifacts. It was not submitted because this is a local gate audit that
+  reinforces the existing Pro/local no-deploy conclusion rather than creating a
+  strategic fork.
+- Validation:
+  `python -m py_compile scripts\build_btc_execution_realism_audit.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\check_btc_forward_shadow_status.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. BTC15M old live replay rows look
+  execution-field-consistent, but the frozen paper shadows have no post-freeze
+  fills. BTC1H is weaker: it has a tiny official sample, a since-freeze
+  official loss/mismatch, one pending row, and missing ledger execution fields.
+  No strategy satisfies the deployment objective.
+
+## 2026-05-18 Shadow ledger schema preflight
+
+- Investigated the BTC1H execution-realism blocker from the prior audit. The
+  current source code in `scripts\btc_1hr_research_live.py` already defines
+  `TRADE_REALISM_COLUMNS`, calls `ensure_trade_realism_columns(conn)` from
+  `db_connect`, and `record_trade` writes `available_qty`, `top_visible_qty`,
+  quote/signal timestamps, quote age, strike, TTL, and decision-time yes/no
+  book prices.
+- Read the active SQLite schemas directly, without mutating them. All three
+  current shadow ledgers still have the old `25`-column
+  `research_live_trades` schema:
+  - `.codex_work\btc15m_f2_q250_qty500_firstskip_shadow\btc15m_f2_q250_qty500_firstskip_shadow_trades.db`
+  - `.codex_work\btc15m_f2_q1000_yes_shadow\btc15m_f2_q1000_yes_shadow_trades.db`
+  - `~\.btc_kalshi_bot\btc_1hr_high_conf80_entry70_no_chase_shadow.db`
+- Added `scripts\build_btc_ledger_schema_preflight.py`, a read-only preflight
+  that compares active shadow ledger DB schemas against the required
+  deployment ledger column contract. It does not migrate, kill, or restart
+  processes.
+- Ran:
+  `backtest_outputs\btc_ledger_schema_preflight_latest_codex`, created
+  `2026-05-18T05:59:30Z`.
+- Result:
+  - BTC15M q250 first-skip shadow: DB exists, table exists, `0` rows, schema
+    columns `25`, required base columns present `19/19`, execution-realism
+    columns present `0/12`, missing `12/12`, status
+    `FAIL_REALISM_SCHEMA_RESTART_REQUIRED`.
+  - BTC15M q1000 YES shadow: same `25`-column legacy schema and
+    `FAIL_REALISM_SCHEMA_RESTART_REQUIRED`.
+  - BTC1H high-conf80 entry70 no-chase shadow: DB exists, table exists, `7`
+    rows, `7` paper-filled rows, schema columns `25`, required base columns
+    present `19/19`, execution-realism columns present `0/12`, missing `12/12`,
+    rows with any realism field `0`, status
+    `FAIL_REALISM_SCHEMA_RESTART_REQUIRED`.
+- Missing execution-realism columns for all active shadow ledgers:
+  `available_qty`, `top_visible_qty`, `quote_received_at_ns`,
+  `signal_received_at_ns`, `quote_age_ms`, `edge_threshold_cents`, `strike`,
+  `ttl_min`, `yes_bid`, `yes_ask`, `no_bid`, and `no_ask`.
+- Interpretation: the running shadow processes were started before the current
+  schema migration/write path was active. Until the user explicitly authorizes
+  a controlled restart or migration, future fills from these still-running
+  processes are useful as signal-count diagnostics only; they must not be
+  counted as deployable paper-ledger evidence.
+- Patched `scripts\build_btc_kill_continue_report.py` so q250, q1000 YES, and
+  BTC1H rows include ledger schema status, realism-column counts, and whether a
+  restart/migration is required before fills can count as deployable evidence.
+  Latest `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T06:00:16Z`, shows all three active shadow ledger schemas as
+  `FAIL_REALISM_SCHEMA_RESTART_REQUIRED`.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` so future Pro packets
+  include `btc_ledger_schema_preflight_` artifacts and prioritize
+  `ledger_schema_preflight_summary.csv`. Built
+  `gpt_pro_packets\strategy_advisor_20260518_000024`, which includes the
+  preflight and the updated kill/continue report. It was not submitted because
+  this is a local operational gate clarification, not a new strategic fork.
+- Validation:
+  `python -m py_compile scripts\build_btc_ledger_schema_preflight.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\build_btc_execution_realism_audit.py
+  scripts\build_btc_forward_consistency_audit.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. This preflight raises the standard for
+  the next collection phase: before any fresh paper fills can be promotion
+  evidence, the shadow processes need an explicitly authorized clean
+  restart/migration so ledger rows contain execution-realism fields.
+
+## 2026-05-18 Readiness gate hardening for execution realism and ledger schema
+
+- Patched `scripts\check_btc_deployment_readiness.py` so the main conservative
+  readiness artifact now consumes:
+  - `backtest_outputs\btc_execution_realism_audit_latest_codex\execution_realism_summary.csv`
+  - `backtest_outputs\btc_ledger_schema_preflight_latest_codex\ledger_schema_preflight_summary.csv`
+- The readiness summary now carries execution/schema status columns for the
+  focused frozen candidates and adds hard blockers where appropriate:
+  `replay_execution_realism_not_passing`,
+  `no_filled_ledger_rows_for_execution_realism`,
+  `shadow_ledger_execution_fields_missing`,
+  `shadow_ledger_schema_restart_required`, and missing-audit variants.
+- Reran:
+  `python scripts\check_btc_deployment_readiness.py --out-dir backtest_outputs\deployment_readiness_latest_codex`.
+  Exit code `1` is expected for a no-ready verdict. Latest readiness created
+  `2026-05-18T06:08:06Z` with `production_ready_count = 0`.
+- Focused readiness blockers now include:
+  - BTC15M q250 firstskip qty500:
+    `latest_live_replay_only_not_full_promotion_gate`,
+    `no_filled_ledger_rows_for_execution_realism`,
+    `proxy_official_pnl_disagreement`,
+    `proxy_official_settlement_mismatch`,
+    `shadow_ledger_schema_restart_required`, and
+    `too_few_live_official_trades`.
+  - BTC15M q1000 YES:
+    `latest_live_replay_only_not_full_promotion_gate`,
+    `no_filled_ledger_rows_for_execution_realism`,
+    `shadow_ledger_schema_restart_required`, and
+    `too_few_live_official_trades`.
+  - BTC1H high-conf80 entry70 no-chase:
+    `research_only_extra_entry_gate_requires_forward_shadow`,
+    `shadow_ledger_execution_fields_missing`,
+    `shadow_ledger_schema_restart_required`, and
+    `too_few_postfreeze_shadow_settled`.
+- Reran downstream control artifacts:
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T06:08:24Z`, verdict `NO DEPLOY`.
+  - `backtest_outputs\btc_kill_continue_latest_codex`, created
+    `2026-05-18T06:08:24Z`, still says broad q families
+    `KILL_FOR_DEPLOYMENT`, q250 firstskip qty500
+    `CONTINUE_FORWARD_ONLY`, q1000 YES `CONTINUE_FORWARD_ONLY_SPARSE`, and
+    BTC1H `OBSERVE_ONLY_RESTART_WITH_PERMISSION`.
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T06:08:31Z`, still reports `0/3` candidates consistent enough
+    for promotion.
+- Built a fresh GPT Pro packet with the hardened readiness artifact:
+  `gpt_pro_packets\strategy_advisor_20260518_000905`. It was not submitted in
+  this pass because the new evidence is a local gate-control hardening that
+  reinforces the previous Pro/local no-deploy conclusion rather than opening a
+  new strategic fork.
+- Updated the reusable Codex skill
+  `C:\Users\ahmed\.codex\skills\kalshi-btc-strategy-research` so future BTC
+  research loops run execution-realism, ledger-schema preflight,
+  kill/continue, and forward-consistency checks before treating readiness as
+  current. `quick_validate.py` reports `Skill is valid!`.
+- Validation:
+  `python -m py_compile scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_forward_evidence_report.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_gpt_pro_strategy_packet.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. A candidate can no longer sneak through
+  the main readiness artifact on positive replay/official PnL while its active
+  shadow ledger has no filled rows, no execution-realism columns, or a stale
+  schema requiring restart/migration.
+
+## 2026-05-18 Shadow restart/migration preflight
+
+- Refreshed live process and evidence state without killing or restarting any
+  process. All four expected Python runners were still present:
+  BTC15M capture, BTC15M q250 firstskip shadow, BTC15M q1000 YES shadow, and
+  BTC1H high-conf80 entry70 no-chase shadow.
+- Refreshed artifacts:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T06:13:33Z`.
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+    `2026-05-18T06:13:36Z`.
+  - `backtest_outputs\btc_execution_realism_audit_latest_codex`, created
+    `2026-05-18T06:13:38Z`.
+  - `backtest_outputs\btc_ledger_schema_preflight_latest_codex`, refreshed in
+    the same loop.
+  - `backtest_outputs\deployment_readiness_latest_codex` still reports
+    `production_ready_count = 0`.
+- Refreshed state:
+  - BTC15M q250 and q1000 shadows still have `0` paper-filled rows and `0`
+    official-settled shadow rows.
+  - BTC1H now has `7` paper-filled rows and `7` official-settled rows all-time,
+    official PnL `+$1.11`, win rate `85.71%`, but `2` proxy/official result
+    mismatches.
+  - BTC1H since `2026-05-18T02:42:00Z` now has `4` official rows, official
+    PnL `+$0.21`, proxy PnL `+$1.21`, official-minus-proxy `-$1.00`, and `1`
+    proxy/official result mismatch. This is still too small and too
+    settlement-fragile for promotion.
+- Added `scripts\build_btc_shadow_restart_preflight.py`, a non-destructive
+  restart/migration preflight. It does not touch live DBs or processes. For
+  each active shadow ledger, it:
+  - creates a fresh SQLite DB through the current `db_connect` code path,
+  - backs up the active DB into an output-only copy,
+  - opens the copy through `db_connect` to exercise schema migration,
+  - inserts one smoke `paper_filled` row into the fresh DB and the copied DB,
+  - verifies all execution-realism fields are present and populated on the
+    inserted row.
+- Ran:
+  `backtest_outputs\btc_shadow_restart_preflight_latest_codex`, created
+  `2026-05-18T06:16:17Z`.
+- Result:
+  - BTC15M q250 firstskip shadow: fresh schema `PASS_SCHEMA_READY`, copied
+    active DB before migration `FAIL_REALISM_SCHEMA`, copied DB after
+    migration `PASS_SCHEMA_READY`, insert `PASS_INSERT_REALISM_FIELDS`,
+    restart path `PASS_RESTART_PATH_READY`.
+  - BTC15M q1000 YES shadow: same pass pattern.
+  - BTC1H high-conf80 entry70 no-chase shadow: active copied DB had `7`
+    existing rows and `0` rows with realism fields before migration; copied DB
+    after migration `PASS_SCHEMA_READY`, insert `PASS_INSERT_REALISM_FIELDS`,
+    restart path `PASS_RESTART_PATH_READY`.
+- Interpretation: current code is ready to create/migrate deployable ledger
+  schemas after explicit user authorization, but the currently running shadows
+  still are not deployable evidence because their active DB handles are stale.
+  Rows written before a clean restart/migration remain diagnostics only.
+- Patched `scripts\build_btc_kill_continue_report.py` so q250, q1000 YES, and
+  BTC1H rows include restart-path status. Rebuilt
+  `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T06:18:05Z`; all three focused rows show
+  `restart_path_status = PASS_RESTART_PATH_READY` but
+  `restart_deployable_without_live_restart = False`.
+- Patched `scripts\build_btc_forward_consistency_audit.py` to remove stale
+  wording that described BTC1H since-freeze official PnL as negative. Latest
+  `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+  `2026-05-18T06:18:32Z`, reports `0/3` consistent enough for promotion and
+  correctly describes BTC1H as blocked by tiny official sample,
+  proxy/official mismatch, and failed readiness.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` and the reusable
+  `kalshi-btc-strategy-research` skill so future Pro packets and default
+  research loops include the restart preflight. Built
+  `gpt_pro_packets\strategy_advisor_20260518_001858`; not submitted because
+  the next required action is operational permission for a clean paper-shadow
+  restart/migration, not a new strategic plan.
+- Validation:
+  `python -m py_compile scripts\build_btc_shadow_restart_preflight.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_ledger_schema_preflight.py
+  scripts\build_btc_execution_realism_audit.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning. Skill validation also passed.
+- Current conclusion: still no deploy. The immediate blocker is now narrower
+  and operational: with explicit permission, the next collection phase should
+  restart/migrate the paper shadows so future official-settled fills include
+  execution-realism fields. Without that, q250/q1000 BTC15M cannot accumulate
+  deployable ledger evidence, and BTC1H remains observe-only.
+
+## 2026-05-18 Guarded paper-shadow restart workflow
+
+- Added `scripts\restart_btc_paper_shadows.ps1`, a guarded PowerShell workflow
+  for the eventual user-authorized paper-shadow restart. It is inert by
+  default: running it without `-Execute` writes a restart plan and stops/starts
+  nothing.
+- Scope is intentionally narrow:
+  - targets only `scripts\btc15m_f2_q250_qty500_firstskip_shadow.py`,
+    `scripts\btc15m_f2_q1000_yes_shadow.py`, and
+    `scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py`;
+  - leaves `scripts\btc15m_live_capture.py` untouched;
+  - runs `scripts\build_btc_shadow_restart_preflight.py` before touching
+    processes in execute mode;
+  - archives stale trade DBs by default before restart, so post-restart rows
+    come from a clean deployability ledger;
+  - runs post-restart ledger-schema and shadow-status checks.
+- Execute mode requires both flags:
+  `-Execute -IUnderstandThisRestartsPaperShadows`.
+  This was deliberately not run, because the user has not explicitly
+  authorized stopping/restarting the live paper-shadow processes.
+- Dry-run validation:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1`
+  created
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_002306\restart_plan.json`.
+  The dry run listed the current target PIDs and printed the explicit execute
+  command. It did not stop or start anything.
+- Re-checked process state after the dry run: the same four Python processes
+  remained running:
+  BTC15M capture, BTC15M q250 shadow, BTC15M q1000 YES shadow, and BTC1H
+  high-conf80 entry70 no-chase shadow.
+- Updated the reusable `kalshi-btc-strategy-research` skill and its
+  deployability reference so future sessions use this guarded script instead
+  of ad hoc process management when the user explicitly approves a restart.
+- Validation:
+  `python -m py_compile scripts\build_btc_shadow_restart_preflight.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\check_btc_deployment_readiness.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning. Skill validation also passed.
+- Current conclusion: still no deploy. The restart workflow reduces operational
+  risk for the next collection phase but does not itself create deployable
+  evidence. The next deployability-relevant evidence must be future
+  official-settled paper rows written after an authorized clean restart.
+
+## 2026-05-18 Post-restart collection gate
+
+- Added `scripts\build_btc_post_restart_collection_gate.py`, a promotion-control
+  verifier for the future post-restart collection phase. It does not restart
+  anything and does not search thresholds.
+- Purpose: after an explicit controlled paper-shadow restart, count only rows
+  written after the restart completion timestamp. It requires:
+  - official Kalshi REST settlement (`official_result` present);
+  - enough post-restart official rows (`100` for BTC15M, `50` for BTC1H by
+    default);
+  - positive official PnL;
+  - no pending official-settlement rows in the counted post-restart sample;
+  - populated execution-realism fields (`quote_age_ms`, `top_visible_qty`,
+    quote/signal receive timestamps, and decision-time YES/NO book prices);
+  - quote age within the configured limit (`250ms` default);
+  - top visible quantity covering contracts;
+  - entry matching the decision-time side ask;
+  - one trade per event;
+  - no proxy/official result mismatches.
+- Ran:
+  `backtest_outputs\btc_post_restart_collection_gate_latest_codex`, created
+  `2026-05-18T06:27:46Z`.
+- Current result is intentionally not ready because the controlled restart has
+  not been executed:
+  - BTC15M q250 firstskip: `PENDING_CONTROLLED_RESTART`, `0/100`
+    post-restart official rows.
+  - BTC15M q1000 YES: `PENDING_CONTROLLED_RESTART`, `0/100`
+    post-restart official rows.
+  - BTC1H high-conf80 entry70 no-chase: `PENDING_CONTROLLED_RESTART`, `0/50`
+    post-restart official rows.
+- Patched `scripts\check_btc_deployment_readiness.py` so the main readiness
+  artifact now consumes
+  `btc_post_restart_collection_gate_latest_codex\post_restart_collection_gate_summary.csv`.
+  Focused q250/q1000/BTC1H rows now include
+  `post_restart_collection_gate_status = PENDING_CONTROLLED_RESTART`,
+  `post_restart_official_rows = 0`, and failure reason
+  `post_restart_collection_gate_not_ready`.
+- Patched `scripts\build_btc_kill_continue_report.py` so the focused rows
+  include post-restart gate status and post-restart official row counts.
+  Latest `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T06:29:42Z`, still reports no deploy; q250 and q1000 remain
+  forward-only/sparse, BTC1H remains observe-only/restart-with-permission.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` and the reusable
+  `kalshi-btc-strategy-research` skill so future GPT Pro packets/default loops
+  include the post-restart gate. Built
+  `gpt_pro_packets\strategy_advisor_20260518_002943`; not submitted because
+  the blocker is still operational collection, not a new strategic fork.
+- Validation:
+  `python -m py_compile scripts\build_btc_post_restart_collection_gate.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_gpt_pro_strategy_packet.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning. Skill validation also passed.
+- Current conclusion: still no deploy. The readiness gate now has an explicit
+  future-evidence latch: it cannot pass until there is an authorized restart
+  plus enough official-settled post-restart paper rows with execution-realism
+  fields.
+
+## 2026-05-18 BTC15M frozen signal starvation audit
+
+- Added `scripts\build_btc15m_signal_starvation_report.py`, a forward-control
+  artifact for the frozen BTC15M q250/q1000 shadows. It does not search
+  thresholds. It asks whether the currently frozen rules are producing any
+  post-freeze candidates/order decisions that could eventually become
+  official-settled promotion evidence.
+- Ran:
+  `backtest_outputs\btc15m_signal_starvation_latest_codex`, created
+  `2026-05-18T06:39:10Z`, using `since_utc = 2026-05-18T04:17:44Z`.
+- Result:
+  - q250 firstskip qty>=500 shadow: `144,194` signal rows across `11` events,
+    `0` nonzero-candidate rows, `0` selected rows, `0` order-decision rows.
+    Status: `STARVED_NO_POSTFREEZE_CANDIDATES`.
+  - q1000 YES shadow: `143,265` signal rows across `11` events, `0`
+    nonzero-candidate rows, `0` selected rows, `0` order-decision rows.
+    Status: `STARVED_NO_POSTFREEZE_CANDIDATES`.
+  - Both targets are mostly blocked by `h02_ttl_outside` (`~79.2%` of signal
+    scans), then `h02_no_edge` (`~11.4%`), then stale BTC spot (`~9.0%`
+    combined stale skip/none families). TTL-outside rows are mostly below the
+    frozen `10-12m` window, with the rest above it.
+- Interpretation: this is a collection-feasibility blocker, not a deployment
+  blocker by itself and not permission to retune on the same live window. The
+  runners are scanning, but the frozen q250/q1000 policies are not generating
+  any post-freeze candidates to settle. If this persists after an explicitly
+  authorized clean restart/migration, the honest next step is to preregister a
+  new candidate before evaluating future holdout rows.
+- Patched `scripts\build_btc_kill_continue_report.py` so q250/q1000 rows now
+  include signal-starvation status, signal rows, zero-candidate counts, top
+  blocker family, and promotion implication.
+- Patched `scripts\build_gpt_pro_strategy_packet.py` and the reusable
+  `kalshi-btc-strategy-research` skill so future GPT Pro packets/default loops
+  include this starvation artifact.
+- Current conclusion: still no deploy. q250/q1000 remain research-only and
+  currently cannot even accumulate official post-freeze BTC15M promotion rows
+  under the frozen policy.
+
+## 2026-05-18 GPT Pro strategy review and non-disruptive follow-up
+
+- Submitted the sanitized strategy-advisor packet through the user's Chrome
+  ChatGPT Pro session:
+  `gpt_pro_packets\strategy_advisor_20260518_004120`.
+  The prompt/evidence excluded credentials, raw DuckDB files, raw Parquet
+  orderbook data, and full logs.
+- Saved the GPT Pro response:
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_065453Z.md`.
+- GPT Pro agreed with the local readiness verdict:
+  - no BTC15M or BTC1H strategy is deployable now;
+  - no one-contract live canary is justified;
+  - q250 firstskip qty>=500 remains the best BTC15M research lead, but is
+    blocked by NO-side proxy/official basis fragility, no post-freeze fills,
+    stale active ledger schema, and signal starvation;
+  - q1000 YES is cleaner but too sparse;
+  - BTC1H high-conf80 entry70 no-chase is observe-only because sample size is
+    tiny, proxy/official mismatches exist, and current ledger rows lack
+    execution-realism fields.
+- GPT Pro's recommended next disruptive step is the guarded paper-shadow
+  restart:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1 -Execute -IUnderstandThisRestartsPaperShadows`.
+  This was **not run** because stopping/restarting paper-shadow processes still
+  requires explicit user authorization. BTC15M capture was left untouched.
+- Ran the non-disruptive diagnostics GPT Pro highlighted:
+  - `backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex`, created
+    `2026-05-18T06:55:50Z`. q250 and q1000 are both
+    `frozen_rule_inactive_postfreeze`: zero post-freeze raw hits, first
+    signals, and official rows. Old replay-rate projection is roughly `23.84`
+    days for q250 and `71.56` days for q1000 YES to reach `100` official rows,
+    before any settlement-basis gates.
+  - `backtest_outputs\btc_basis_danger_table_latest_codex`, created
+    `2026-05-18T06:55:53Z`. Confirms adverse proxy/official flips concentrate
+    in BTC15M NO-side rows. q250 firstskip qty>=500 NO has `3/16` adverse
+    mismatches (`18.75%`) and official-minus-proxy drift `-$3.00` total
+    (`-$0.1875/trade`). q250 firstskip YES has `0/8` mismatches but is sparse.
+  - `backtest_outputs\btc_settlement_basis_model_feasibility_latest_codex`,
+    created `2026-05-18T06:55:55Z`. The decision-time basis model remains
+    diagnostic-only: `129` de-duplicated rows, OOF ROC AUC `0.5668` for
+    proxy/official mismatch and `0.4856` for adverse/proxy-win-official-loss.
+  - `backtest_outputs\btc15m_predexon_official_coverage_latest_codex`,
+    refreshed after Pro review. q250 firstskip qty>=500 has `63` selected
+    historical rows, `57` REST-official rows (`90.48%` coverage), REST-official
+    PnL `+8.72`, but `6` uncovered proxy-only rows with `-0.41` proxy PnL and
+    `2` bad uncovered windows. q1000 YES has only `23` REST-official historical
+    rows (`69.70%` coverage), so it remains too sparse/partial.
+- Updated the reusable `kalshi-btc-strategy-research` skill and deployability
+  reference so future default loops include signal starvation, frozen
+  opportunity rate, basis danger/model feasibility, and Predexon official
+  coverage diagnostics.
+- Validation:
+  `python -m py_compile scripts\fill_btc15m_predexon_official_results.py
+  scripts\audit_btc15m_materialized_filter_grid.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\build_btc_forward_evidence_report.py
+  scripts\build_btc_execution_realism_audit.py
+  scripts\build_btc_ledger_schema_preflight.py
+  scripts\build_btc_shadow_restart_preflight.py
+  scripts\build_btc_post_restart_collection_gate.py
+  scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\build_btc15m_signal_starvation_report.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_gpt_pro_strategy_packet.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. The next deployability-relevant phase is
+  explicit user-authorized paper-shadow restart/migration followed by fresh
+  post-restart official-settled rows with complete execution-realism fields.
+
+## 2026-05-18 Current refresh and restart authorization packet
+
+- Re-checked current Python processes. The same four relevant processes are
+  running:
+  - BTC15M capture PID `1724`;
+  - BTC15M q250 firstskip shadow PID `7052`;
+  - BTC15M q1000 YES shadow PID `24840`;
+  - BTC1H high-conf80 entry70 no-chase shadow PID `16216`.
+  No process was killed or restarted.
+- Refreshed the conservative control stack at approximately `2026-05-18T07:00Z`:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`:
+    `4/4` targets running. BTC15M q250/q1000 still have `0` paper-filled rows
+    and `0` order-decision rows. BTC1H still has `7` paper-filled rows all-time
+    and `4` since `2026-05-18T02:42:00Z`.
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`:
+    BTC1H all-time official PnL remains `+1.11` over `7` rows, but has `2`
+    proxy/official result mismatches. Since `2026-05-18T02:42:00Z`, BTC1H has
+    `4` official rows, official PnL `+0.21`, proxy PnL `+1.21`, and `1`
+    proxy/official mismatch.
+  - `backtest_outputs\btc_ledger_schema_preflight_latest_codex`:
+    all three shadow ledgers remain `FAIL_REALISM_SCHEMA_RESTART_REQUIRED`
+    with `25` active columns and `0/12` execution-realism columns.
+  - `backtest_outputs\btc_shadow_restart_preflight_latest_codex`:
+    all three restart paths remain `PASS_RESTART_PATH_READY`, but
+    `deployable_without_live_restart = False`.
+  - `backtest_outputs\btc_post_restart_collection_gate_latest_codex`:
+    all focused rows remain `PENDING_CONTROLLED_RESTART`, with `0/100` BTC15M
+    post-restart official rows and `0/50` BTC1H post-restart official rows.
+  - `backtest_outputs\deployment_readiness_latest_codex`:
+    `production_ready_count = 0`. Exit code `1` is expected for this
+    conservative no-ready result.
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`:
+    `0/3` candidates consistent enough for promotion.
+  - `backtest_outputs\btc_kill_continue_latest_codex`:
+    broad q families remain `KILL_FOR_DEPLOYMENT`; q250 remains
+    `CONTINUE_FORWARD_ONLY`; q1000 YES remains
+    `CONTINUE_FORWARD_ONLY_SPARSE`; BTC1H remains
+    `OBSERVE_ONLY_RESTART_WITH_PERMISSION`.
+- Refreshed BTC15M starvation evidence:
+  - q250 firstskip qty>=500: `158,462` signal rows across `12` events,
+    `0` nonzero-candidate rows, `0` selected rows, `0` order-decision rows.
+    Status: `STARVED_NO_POSTFREEZE_CANDIDATES`.
+  - q1000 YES: `157,424` signal rows across `12` events, `0`
+    nonzero-candidate rows, `0` selected rows, `0` order-decision rows.
+    Status: `STARVED_NO_POSTFREEZE_CANDIDATES`.
+  - Latest frozen opportunity report still shows zero post-freeze raw hits,
+    first signals, and official rows for both q250 and q1000.
+- Added `scripts\build_btc_restart_authorization_packet.py`. It is
+  non-disruptive: it reads processes and artifacts, writes an authorization
+  packet, and does not stop, start, archive, migrate, or deploy anything.
+- Ran:
+  `backtest_outputs\btc_restart_authorization_packet_latest_codex`, created
+  `2026-05-18T07:02:34Z`.
+- Result:
+  - all three paper-shadow restart targets are
+    `READY_FOR_USER_AUTHORIZATION`;
+  - targeted PIDs are q250 `7052`, q1000 `24840`, BTC1H `16216`;
+  - BTC15M capture PID `1724` is explicitly recorded as untouched;
+  - all three restart paths are `PASS_RESTART_PATH_READY`;
+  - all three active ledgers still require restart/migration for deployable
+    evidence;
+  - all three post-restart gates remain `PENDING_CONTROLLED_RESTART`.
+- The packet repeats the dry-run command:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1`
+  and the execute command that still requires explicit user authorization:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1 -Execute -IUnderstandThisRestartsPaperShadows`.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` and the reusable
+  `kalshi-btc-strategy-research` skill/reference so future loops include the
+  restart authorization packet.
+- Validation:
+  `python -m py_compile scripts\build_btc_restart_authorization_packet.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\check_btc_deployment_readiness.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. The evidence pipeline is ready for an
+  explicit paper-shadow restart authorization, but deployment remains blocked
+  until future post-restart official-settled rows with complete execution
+  realism actually exist and pass the full readiness/consistency stack.
+
+## 2026-05-18 GPT Pro follow-up: canonical official settlement feature table
+
+- Followed the GPT Pro recommendation to build a canonical official-settlement
+  feature table before changing any strategy logic or restarting paper shadows.
+  Added `scripts\build_btc_official_settlement_feature_table.py`.
+- The artifact is intentionally diagnostic, not a strategy search. It
+  normalizes live websocket replay, paper-shadow official settlement, and
+  Predexon selected historical rows into one source-fidelity table with
+  explicit promotion blockers.
+- Ran:
+  `backtest_outputs\btc_official_settlement_feature_table_latest_codex`,
+  created `2026-05-18T07:15:24Z`.
+- Result:
+  - `786` canonical rows and `0` promotion-usable rows.
+  - Broad BTC15M live replay rows: `145` official rows, official PnL `-5.11`
+    vs proxy PnL `+11.89`, `17` proxy/official mismatches, all adverse.
+  - q250 firstskip exact live replay: `24` official rows, official PnL
+    `+3.74` vs proxy PnL `+6.74`, `3` adverse mismatches, `12.5%` mismatch
+    rate. This keeps q250 firstskip interesting but blocked.
+  - q1000 YES exact live replay: `8` official rows, official PnL `+0.90`,
+    `0` mismatches. Cleaner, but still too sparse and not post-restart paper
+    evidence.
+  - BTC1H shadow official rows: `7` official rows, official PnL `+1.11`,
+    `2` proxy/official mismatches, `1` adverse/proxy-win-official-loss flip,
+    and stale-schema blocker remains.
+  - Predexon selected historical rows: `602` selected rows, `362` with REST
+    official results and `240` missing official results. These remain
+    historical provider-time diagnostics only, not live replay/promotion rows.
+  - All source groups have `0` rows with complete requested decision fields and
+    `0` rows with complete execution-realism fields in this canonical table.
+    The largest blockers are `missing_execution_realism_fields` and
+    `missing_requested_decision_fields` on all `786` rows.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include the canonical table. Rebuilt the packet:
+  `gpt_pro_packets\strategy_advisor_20260518_011625`. It was not resubmitted
+  because the table confirms the existing no-deploy blocker rather than
+  creating a new strategic fork.
+- Updated the reusable `kalshi-btc-strategy-research` skill and deployability
+  reference so future default loops and packets include the canonical
+  official-settlement feature table.
+- Validation:
+  `python -m py_compile scripts\fill_btc15m_predexon_official_results.py
+  scripts\audit_btc15m_materialized_filter_grid.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\build_btc_forward_evidence_report.py
+  scripts\build_btc_execution_realism_audit.py
+  scripts\build_btc_ledger_schema_preflight.py
+  scripts\build_btc_shadow_restart_preflight.py
+  scripts\build_btc_restart_authorization_packet.py
+  scripts\build_btc_post_restart_collection_gate.py
+  scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\build_btc15m_signal_starvation_report.py
+  scripts\build_btc15m_frozen_opportunity_rate_report.py
+  scripts\build_btc_basis_danger_table.py
+  scripts\build_btc_settlement_basis_model_feasibility.py
+  scripts\audit_btc15m_predexon_official_coverage.py
+  scripts\build_btc_official_settlement_feature_table.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_gpt_pro_strategy_packet.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `53/53`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Re-ran `scripts\check_btc_deployment_readiness.py` into
+  `backtest_outputs\deployment_readiness_latest_codex`; expected exit code
+  `1`, `production_ready_count = 0`.
+- Current conclusion: still no deploy and no canary. The canonical table makes
+  the next blocker sharper: no existing row is both official-settled and
+  promotion-usable with complete decision/execution realism. The next
+  deployability-relevant action remains an explicitly user-authorized clean
+  restart/migration of the paper shadows, then fresh official-settled
+  post-restart rows.
+
+## 2026-05-18 BTC15M q250 YES-only next-candidate preregistration
+
+- Continued the GPT Pro direction without restarting anything. The purpose was
+  to turn the side-specific settlement lesson into a frozen future paper-only
+  candidate, not to promote it.
+- Added `scripts\btc15m_f2_q250_qty500_firstskip_yes_shadow.py`, a standby
+  paper-only wrapper for:
+  - H02/F2 q250 first-signal policy;
+  - TTL `10-12m`;
+  - spread `<=2c`;
+  - entry `0.02-0.50`;
+  - side fair probability `>=0.60`;
+  - edge `>=12c`;
+  - base visible quantity `>=250`;
+  - first qualifying signal visible quantity `>=500`;
+  - `BTC15M_H02_ALLOWED_SIDE=yes`;
+  - one contract max;
+  - paper mode only.
+- Added `scripts\build_btc15m_next_forward_candidate_packet.py`, which creates
+  a preregistration/diagnostic packet from the canonical official-settlement
+  feature table. It starts no processes and counts no old row as promotion
+  evidence.
+- Ran:
+  `backtest_outputs\btc15m_next_forward_candidate_packet_latest_codex`.
+- Packet result:
+  - `btc15m_q250_firstskip_qty500_yes_forward` is
+    `PREREGISTER_FOR_FUTURE_PAPER_COLLECTION`;
+  - q250 YES diagnostic support:
+    - Predexon selected rows: `28` diagnostic rows, `24` REST-official rows,
+      official PnL `+4.89`, `0` mismatches;
+    - old exact live websocket replay: `8` official rows, official PnL
+      `+0.88`, `0` mismatches;
+  - q250 NO is explicitly `DO_NOT_START_AS_NEW_FORWARD_CANDIDATE` because old
+    exact live replay has `16` official rows, official PnL `+2.86`, but `3`
+    adverse official/proxy mismatches;
+  - q1000 YES remains `KEEP_EXISTING_FORWARD_ONLY_SPARSE_CONTROL`, with `8`
+    old exact live official rows and `23` Predexon REST-official rows.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include this preregistration packet. Rebuilt
+  `gpt_pro_packets\strategy_advisor_20260518_012348`; not submitted because
+  GPT Pro had already recommended this side-control family and the local
+  packet only made the freeze operationally explicit.
+- Updated the reusable `kalshi-btc-strategy-research` skill/reference so future
+  loops include the next-candidate packet.
+- Validation:
+  `python -m py_compile scripts\btc15m_f2_q250_qty500_firstskip_yes_shadow.py
+  scripts\build_btc15m_next_forward_candidate_packet.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\test_btc15m_shadow_config.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `54/54`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. The q250 YES-only wrapper is now ready
+  for a future explicitly authorized paper-only start/restart, but zero future
+  promotion rows exist for it. Old replay/Predexon rows are diagnostic support
+  only.
+
+## 2026-05-18 guarded paper-shadow start/restart controls and GPT Pro packet
+
+- Re-checked live Python processes before touching the control stack. Active
+  repo-related processes were:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`.
+- Did not stop, start, or restart any live/capture/paper process.
+- Wired the preregistered `q250_firstskip_qty500_yes` paper-only candidate into
+  the guarded evidence/control stack:
+  - `scripts\restart_btc_paper_shadows.ps1`;
+  - `scripts\build_btc_ledger_schema_preflight.py`;
+  - `scripts\build_btc_shadow_restart_preflight.py`;
+  - `scripts\build_btc_restart_authorization_packet.py`;
+  - `scripts\check_btc_forward_shadow_status.py`;
+  - `scripts\check_btc_shadow_official_settlement.py`;
+  - `scripts\build_btc_post_restart_collection_gate.py`;
+  - `scripts\build_btc_execution_realism_audit.py`;
+  - `scripts\check_btc_deployment_readiness.py`;
+  - `scripts\build_btc_kill_continue_report.py`;
+  - `scripts\build_btc_forward_consistency_audit.py`.
+- Ran the paper shadow control script without `-Execute`; dry run only:
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_013039`.
+  It reported the existing q250, q1000 YES, and BTC1H shadow PIDs and the
+  q250 YES-only target as a new start candidate. No process action was taken.
+- Regenerated conservative control artifacts:
+  - `backtest_outputs\deployment_readiness_latest_codex`: expected exit code
+    `1`, `production_ready_count = 0`;
+  - `backtest_outputs\btc_kill_continue_latest_codex`: broad q families remain
+    `KILL_FOR_DEPLOYMENT`; q250 firstskip remains `CONTINUE_FORWARD_ONLY`;
+    q250 YES-only is `PREREGISTERED_PAPER_START_WITH_PERMISSION`;
+    q1000 YES is `CONTINUE_FORWARD_ONLY_SPARSE`; BTC1H remains
+    `OBSERVE_ONLY_RESTART_WITH_PERMISSION`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`:
+    `0 / 4` candidates are consistent enough for promotion. The q250 YES-only
+    row is not running, has no post-freeze replay, and has zero official
+    future rows.
+- Restart authorization packet:
+  `backtest_outputs\btc_restart_authorization_packet_latest_codex`:
+  - q250, q1000 YES, and BTC1H: `READY_FOR_USER_AUTHORIZATION`;
+  - q250 YES-only: `READY_FOR_USER_AUTHORIZATION_TO_START`;
+  - all targets still require explicit user permission;
+  - BTC15M capture remains explicitly untouched.
+- Validation:
+  `python -m py_compile scripts\fill_btc15m_predexon_official_results.py
+  scripts\audit_btc15m_materialized_filter_grid.py
+  scripts\check_btc_deployment_readiness.py
+  scripts\check_btc_shadow_official_settlement.py
+  scripts\build_btc_forward_evidence_report.py
+  scripts\build_btc_execution_realism_audit.py
+  scripts\build_btc_ledger_schema_preflight.py
+  scripts\build_btc_shadow_restart_preflight.py
+  scripts\build_btc_restart_authorization_packet.py
+  scripts\build_btc_post_restart_collection_gate.py
+  scripts\analyze_btc15m_shadow_signal_health.py
+  scripts\build_btc15m_signal_starvation_report.py
+  scripts\build_btc15m_frozen_opportunity_rate_report.py
+  scripts\build_btc15m_next_forward_candidate_packet.py
+  scripts\build_btc_basis_danger_table.py
+  scripts\build_btc_settlement_basis_model_feasibility.py
+  scripts\audit_btc15m_predexon_official_coverage.py
+  scripts\build_btc_official_settlement_feature_table.py
+  scripts\build_btc_kill_continue_report.py
+  scripts\build_btc_forward_consistency_audit.py
+  scripts\build_gpt_pro_strategy_packet.py
+  scripts\btc15m_f2_q250_qty500_firstskip_yes_shadow.py` passed.
+  `python -m unittest scripts.test_btc15m_shadow_config
+  scripts.test_research_live_safety -v` passed `54/54`, with the known logging
+  ResourceWarnings and pandas all-NaN warning.
+- Built and submitted a fresh GPT Pro strategy packet through the Chrome
+  extension using the Pro composer:
+  `gpt_pro_packets\strategy_advisor_20260518_013715`. The packet pasted inline
+  with the generated evidence bundle, excluding credentials, raw DuckDB,
+  raw Parquet, and bulky logs.
+- Saved GPT Pro's response to
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_014532.md`.
+  Pro agreed with the no-deploy verdict:
+  - deployable now: zero;
+  - no one-contract canary is justified;
+  - q250 YES-only is the best near-term BTC15M research path, but has zero
+    future promotion rows;
+  - q1000 YES remains a clean but sparse control;
+  - BTC1H remains observe-only;
+  - the active stale-schema ledgers cannot generate promotion evidence until a
+    clean paper-shadow restart/migration writes complete execution-realism
+    fields.
+- Pro's concrete 24-hour plan is to execute the controlled paper-shadow
+  start/restart workflow for paper shadows only, then collect future
+  official-settled rows without retuning thresholds. This was not executed in
+  this run because explicit user authorization is required before starting or
+  restarting paper shadows.
+- Verified that `scripts\build_btc_post_restart_collection_gate.py` already
+  encodes Pro's main numeric gate shape: BTC15M `100` official post-restart
+  rows, BTC1H `50`, official PnL positive, no pending official rows, no
+  proxy/official mismatches, complete execution-realism fields, `quote_age_ms
+  <= 250`, top visible quantity covering contracts, entry matching the
+  decision-time side ask, and no duplicate event rows.
+- Current conclusion: still no deploy and no canary. The only honest next
+  deployability-relevant data collection step is an explicitly user-authorized
+  paper-only start/restart of the guarded shadows, followed by future
+  official-settled post-restart rows with complete execution-realism fields.
+
+## 2026-05-18 no-restart starvation diagnostics hardening
+
+- Continued without treating the goal-continuation wrapper as authorization to
+  start or restart paper shadows. No process was stopped, started, or
+  restarted.
+- Refreshed active repo-related processes:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`.
+- Hardened future BTC15M H02 diagnostics in `scripts\btc15m_lowdd_live.py`.
+  Future `h02_no_edge` scan details now include:
+  - checked side count;
+  - entry reject count;
+  - quantity reject count;
+  - edge reject count;
+  - allowed side;
+  - side entry/quantity snapshots where available.
+  This is diagnostic metadata only and does not change thresholds. The running
+  shadows will not emit the enhanced details until an explicitly authorized
+  paper restart/start loads the new code.
+- Updated `scripts\build_btc15m_signal_starvation_report.py`:
+  - added the preregistered `q250_firstskip_qty500_yes` target;
+  - reports `NOT_STARTED_MISSING_CAPTURE_DB` for that target until it is
+    explicitly started;
+  - parses future entry/quantity/edge reject units;
+  - parses first-signal visible-quantity skip rows.
+- Updated `scripts\analyze_btc15m_shadow_signal_health.py` to include the
+  q250 YES-only target.
+- Hardened `scripts\check_btc_forward_shadow_status.py` with DuckDB read
+  retries. This fixed transient live DB lock failures for the q250 capture DB
+  in the top-level forward evidence report.
+- Regenerated:
+  - `backtest_outputs\btc15m_shadow_signal_health_latest_codex`, created
+    `2026-05-18T07:52:35Z`;
+  - `backtest_outputs\btc15m_signal_starvation_latest_codex`, final refreshed
+    at `2026-05-18T07:53:22Z`;
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T07:55:25Z`;
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+    `2026-05-18T07:54:12Z`;
+  - `backtest_outputs\btc_execution_realism_audit_latest_codex`, created
+    `2026-05-18T07:54:30Z`;
+  - `backtest_outputs\btc_post_restart_collection_gate_latest_codex`, created
+    `2026-05-18T07:54:30Z`;
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T07:54:30Z`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T07:55:38Z`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T07:55:38Z`;
+  - `backtest_outputs\btc_kill_continue_latest_codex`, created
+    `2026-05-18T07:54:44Z`.
+- Current BTC15M forward starvation result:
+  - q250 firstskip qty500: `203,088` signal scans since freeze, `0` nonzero
+    candidate rows, `0` selected rows, `0` order decisions,
+    `STARVED_NO_POSTFREEZE_CANDIDATES`;
+  - q1000 YES: `202,327` signal scans since freeze, `0` nonzero candidate
+    rows, `0` selected rows, `0` order decisions,
+    `STARVED_NO_POSTFREEZE_CANDIDATES`;
+  - q250 YES-only: `NOT_STARTED_MISSING_CAPTURE_DB`, as expected without
+    explicit paper-only start authorization.
+- Top blocker remains TTL outside the frozen `10-12m` window:
+  - q250 firstskip qty500: `79.699%` of scans, with `122,077` below-window and
+    `39,686` above-window TTL rejects;
+  - q1000 YES: `79.625%` of scans, with `121,703` below-window and `39,303`
+    above-window TTL rejects.
+- Existing rows are from the pre-enhanced-detail logger, so entry/quantity/edge
+  reject units are blank/zero in the current starvation report. Future
+  post-restart rows will carry those sub-reasons.
+- Latest BTC1H official-settlement refresh found `8` paper-filled rows all
+  time, but only `7` official-settled rows. The newest BTC1H row at
+  `2026-05-18T07:45:11Z` is still active/pending official settlement, so it
+  cannot count toward promotion. BTC1H still has stale-schema/missing
+  execution-realism blockers and proxy/official mismatches.
+- Latest conservative status remains:
+  - readiness `production_ready_count = 0`;
+  - forward consistency `0 / 4`;
+  - post-restart collection gate `PENDING_CONTROLLED_RESTART` for all four
+    candidate ledgers;
+  - no deploy and no one-contract canary.
+- Validation:
+  - `python -m py_compile scripts\btc15m_lowdd_live.py
+    scripts\build_btc15m_signal_starvation_report.py
+    scripts\analyze_btc15m_shadow_signal_health.py
+    scripts\check_btc_forward_shadow_status.py
+    scripts\test_btc15m_shadow_config.py` passed.
+  - `python -m unittest scripts.test_btc15m_shadow_config
+    scripts.test_research_live_safety -v` passed `54/54`, with the known
+    logging ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. The work improves the evidence pipeline
+  so that, after explicit user-authorized paper-only restart/start, future
+  no-candidate windows can distinguish TTL starvation from entry-band,
+  quantity, and edge starvation without tuning on the same holdout window.
+
+## 2026-05-18 decision-time settlement-basis guard hardening
+
+- Followed the GPT Pro recommendation to treat official-settlement mismatch as
+  a separate deployment-control problem, not as another threshold-search
+  opportunity.
+- Hardened `scripts\build_btc_settlement_basis_model_feasibility.py`:
+  - added a fail-fast decision-feature leakage check. Any future
+    `DECISION_FEATURES` entry containing post-event/settlement tokens such as
+    `basis`, `official`, `result`, `pnl`, or `settlement` now raises before the
+    artifact is produced;
+  - added `basis_model_feature_safety_audit.csv`, which explicitly marks
+    decision-time model features as allowed and official/proxy outcome fields
+    as `post_event_diagnostic_only`;
+  - added `basis_guard_deployment_verdict.csv`, which keeps
+    `deployable_guard_now = False` unless a pre-registered guard survives fresh
+    forward official-settled evaluation;
+  - added OOF average-precision lift versus the positive-rate baseline, so a
+    weak classifier cannot hide behind raw AP on an imbalanced target.
+- Regenerated
+  `backtest_outputs\btc_settlement_basis_model_feasibility_latest_codex` at
+  `2026-05-18T08:02:47Z`.
+- Latest decision-time-safe basis model verdict:
+  - de-duplicated model rows: `129`;
+  - proxy/official mismatch target: `16` positives, OOF ROC AUC `0.5668`, AP
+    lift `1.5063`;
+  - adverse mismatch / proxy-win-official-loss targets: `15` positives, OOF ROC
+    AUC `0.4856`, AP lift `1.2045`;
+  - all targets fail the guard precheck on sample size, positive count, OOF AUC,
+    AP lift, and missing pre-registered fresh forward evaluation.
+- Deployment state did not improve:
+  - no settlement-basis guard is deployable;
+  - no BTC15M or BTC1H strategy is production-ready;
+  - the official conclusion remains no deploy and no canary.
+- Validation:
+  - `python -m py_compile scripts\build_btc_settlement_basis_model_feasibility.py
+    scripts\test_btc_settlement_basis_model_feasibility.py` passed;
+  - `python -m unittest scripts.test_btc_settlement_basis_model_feasibility -v`
+    passed `3/3`;
+  - `python -m unittest scripts.test_btc15m_shadow_config
+    scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `57/57`,
+    with the known logging ResourceWarnings and pandas all-NaN warning;
+  - `python scripts\check_btc_deployment_readiness.py --out-dir
+    backtest_outputs\deployment_readiness_latest_codex` regenerated readiness
+    at `2026-05-18T08:03:14Z` with `production_ready_count = 0`. The command
+    returned nonzero because the conservative readiness gate found no
+    deployable strategies.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  surface `basis_guard_deployment_verdict.csv` from the settlement-basis
+  feasibility artifact. Rebuilt
+  `gpt_pro_packets\strategy_advisor_20260518_020431`; it was not submitted
+  because the new local verdict confirms the existing no-deploy posture rather
+  than creating a new strategic fork.
+
+## 2026-05-18 forward evidence refresh and BTC1H capture-lock visibility
+
+- Refreshed the read-only forward evidence stack without stopping, starting, or
+  restarting any process.
+- Active repo-related Python processes remained:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`.
+- Current BTC15M shadow status:
+  - q250 firstskip qty500 is running but still has `0` nonzero candidate rows
+    and `0` order decisions post-freeze;
+  - q1000 YES is running but still has `0` nonzero candidate rows and `0`
+    order decisions post-freeze;
+  - q250 YES-only remains not started and has no capture DB.
+- Current BTC1H official-settlement status:
+  - `8` paper-filled rows all-time, all `8` official-settled;
+  - all-time official PnL `+0.44`, win rate `75%`;
+  - since `2026-05-18T02:42:00Z`: `5` official rows, official PnL `-0.46`,
+    win rate `60%`;
+  - `2` all-time official/proxy result mismatches, including `1` since the
+    freeze; this keeps BTC1H observe-only.
+- Regenerated artifacts:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T08:11:03Z`;
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+    `2026-05-18T08:07:32Z`;
+  - `backtest_outputs\btc_execution_realism_audit_latest_codex`, created
+    `2026-05-18T08:08:04Z`;
+  - `backtest_outputs\btc_ledger_schema_preflight_latest_codex`, created
+    `2026-05-18T08:08:02Z`;
+  - `backtest_outputs\btc_shadow_restart_preflight_latest_codex`, created
+    `2026-05-18T08:08:06Z`;
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`, created
+    `2026-05-18T08:08:21Z`;
+  - `backtest_outputs\btc_post_restart_collection_gate_latest_codex`, created
+    `2026-05-18T08:08:20Z`;
+  - `backtest_outputs\btc_settlement_basis_risk_audit_latest_codex`, created
+    `2026-05-18T08:08:05Z`;
+  - `backtest_outputs\btc_basis_danger_table_latest_codex`, created
+    `2026-05-18T08:08:23Z`;
+  - `backtest_outputs\btc_settlement_basis_model_feasibility_latest_codex`,
+    created `2026-05-18T08:08:24Z`;
+  - `backtest_outputs\btc_official_settlement_feature_table_latest_codex`;
+  - `backtest_outputs\btc15m_next_forward_candidate_packet_latest_codex`;
+  - `backtest_outputs\btc15m_predexon_official_coverage_latest_codex`;
+  - `backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex`;
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T08:08:49Z`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, final
+    refreshed at `2026-05-18T08:11:50Z`;
+  - `backtest_outputs\btc_kill_continue_latest_codex`, created
+    `2026-05-18T08:09:00Z`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T08:11:16Z`.
+- Current conservative deployment evidence:
+  - readiness `production_ready_count = 0`;
+  - forward consistency `0 / 4`;
+  - post-restart collection gate remains `PENDING_CONTROLLED_RESTART` for all
+    four candidate ledgers;
+  - q250/q1000 BTC15M forward shadows are runner-health evidence only because
+    they have no post-freeze candidate/fill rows;
+  - BTC1H is worse on the current since-freeze official slice and remains
+    blocked by official/proxy mismatch, stale ledger schema, missing
+    execution-realism fields, and too few rows.
+- Hardened `scripts\check_btc_forward_shadow_status.py`:
+  - if a DuckDB live read fails, it now attempts a snapshot-copy fallback;
+  - status rows now include `capture_read_source`, DB file mtime, DB file size,
+    and snapshot-copy error text.
+- Hardened `scripts\build_btc_forward_evidence_report.py` so the signal
+  diagnostics table surfaces the new capture read-source, mtime, and snapshot
+  failure fields.
+- The BTC1H capture DB remained unreadable during this refresh:
+  - live read failed because PID `16216` held the file;
+  - snapshot copy also failed with Windows `PermissionError(13)`;
+  - the report now records this explicitly with DB mtime
+    `2026-05-18T07:48:16.533247Z` and size `85,471,232` bytes.
+- Updated the GPT Pro packet builder output after the refresh:
+  `gpt_pro_packets\strategy_advisor_20260518_021201`. It was not submitted
+  because the current evidence did not create a new strategic fork; it sharpened
+  the existing no-deploy/no-canary conclusion.
+- Validation:
+  - `python -m py_compile scripts\check_btc_forward_shadow_status.py
+    scripts\build_btc_forward_evidence_report.py
+    scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `python -m unittest scripts.test_btc15m_shadow_config
+    scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `57/57`,
+    with the known logging ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy. The most deployability-relevant next
+  action remains an explicitly user-authorized controlled paper-only
+  restart/start, because active ledgers cannot produce promotion evidence until
+  they write complete execution-realism fields after a clean restart/migration.
+
+## 2026-05-18 restart-controller safety hardening and GPT Pro packet
+
+- Re-checked repo-related Python processes before acting. Active processes were
+  unchanged:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`.
+- No process was stopped, started, archived, migrated, or restarted. All restart
+  work in this entry is dry-run / preflight only.
+- Hardened `scripts\restart_btc_paper_shadows.ps1` before any future user-
+  authorized restart:
+  - added `Test-TargetScriptSafety`;
+  - each target script must exist, end in `_shadow.py`, avoid `*_live.py`,
+    lock paper mode via the expected BTC15M `--mode paper` or BTC1H `--paper`
+    wrapper, and avoid any `--mode live` argv;
+  - dry-run `restart_plan.json` now records `script_safety_pass` and
+    `script_safety_reasons`;
+  - execute mode refuses to proceed if any target fails script safety, before
+    any destructive action.
+- Added `scripts\test_btc_paper_restart_safety.py` to assert:
+  - destructive actions remain behind both `-Execute` and
+    `-IUnderstandThisRestartsPaperShadows`;
+  - targets are shadow wrappers only;
+  - `Start-Process` remains hidden;
+  - dry runs emit safety fields without executing.
+- Updated `scripts\build_btc_restart_authorization_packet.py` so the
+  authorization packet consumes the latest dry-run restart plan and exposes:
+  - `latest_restart_plan_script_safety_pass`;
+  - `latest_restart_dry_run_plan_exists`;
+  - `latest_restart_dry_run_did_not_execute`;
+  - `latest_restart_dry_run_script_safety_passed`.
+- Latest dry-run plan:
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_021641`.
+  It has `execute = False` and all four target rows have
+  `script_safety_pass = True`.
+- Regenerated
+  `backtest_outputs\btc_restart_authorization_packet_latest_codex`, created
+  `2026-05-18T08:17:44Z`. It says all four targets are ready for explicit user
+  authorization, while still requiring explicit approval before execution.
+- Refreshed dependent control artifacts after the safety packet:
+  - `backtest_outputs\btc_post_restart_collection_gate_latest_codex`, created
+    `2026-05-18T08:19:44Z`: all candidates remain
+    `PENDING_CONTROLLED_RESTART`, with `0` post-restart official rows;
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T08:19:44Z`: `production_ready_count = 0`; exit code `1`
+    remains expected because no strategy is deployable;
+  - `backtest_outputs\btc_kill_continue_latest_codex`, created
+    `2026-05-18T08:19:44Z`: broad q families remain
+    `KILL_FOR_DEPLOYMENT`; q250 firstskip remains `CONTINUE_FORWARD_ONLY`;
+    q250 YES-only remains `PREREGISTERED_PAPER_START_WITH_PERMISSION`;
+    q1000 YES remains `CONTINUE_FORWARD_ONLY_SPARSE`; BTC1H remains
+    `OBSERVE_ONLY_RESTART_WITH_PERMISSION`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T08:19:58Z`: `0 / 4` candidates are consistent enough for
+    promotion;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T08:19:58Z`: verdict remains
+    `NO DEPLOY: readiness production_ready_count is 0`.
+- Built and submitted a fresh GPT Pro strategy-advisor packet through the Chrome
+  extension / ChatGPT Pro temporary-chat path:
+  `gpt_pro_packets\strategy_advisor_20260518_021956`. The manifest excluded
+  `credentials.env`, raw DuckDB files, raw Parquet orderbook data, and full
+  logs; a credential-pattern scan of `prompt.md` and `evidence_bundle.md` found
+  no key/secret/token/password/private-key style strings.
+- Validation:
+  - `python -m py_compile scripts\build_btc_restart_authorization_packet.py
+    scripts\test_btc_paper_restart_safety.py
+    scripts\check_btc_forward_shadow_status.py
+    scripts\build_btc_forward_evidence_report.py
+    scripts\build_gpt_pro_strategy_packet.py
+    scripts\build_btc_post_restart_collection_gate.py
+    scripts\build_btc_kill_continue_report.py
+    scripts\build_btc_forward_consistency_audit.py` passed;
+  - `python -m unittest scripts.test_btc_paper_restart_safety
+    scripts.test_btc15m_shadow_config scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `61/61`,
+    with the known logging ResourceWarnings and pandas all-NaN warning.
+- Current conclusion remains unchanged while GPT Pro is running: no deployment,
+  no canary, and no restart/start without explicit user authorization.
+
+## 2026-05-18 GPT Pro response and pre-restart baseline
+
+- Saved the exact GPT Pro response from the Chrome/ChatGPT Pro temporary chat:
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_023800_exact.md`.
+  A stale/transformed clipboard save was created first by
+  `scripts\save_gpt_pro_review.ps1`; it was removed so the review folder keeps
+  the exact extracted response for this packet.
+- GPT Pro agreed with the local gate:
+  - nothing is deployable now;
+  - no live trading, no one-contract canary, and no small-size production test;
+  - readiness remains `production_ready_count = 0`;
+  - forward consistency remains `0 / 4`;
+  - the official-settlement feature table has `787` rows and `0`
+    promotion-usable rows;
+  - all candidates have `0` post-restart official rows because the controlled
+    restart/start has not been executed.
+- GPT Pro ranked the near-term paths:
+  1. `BTC15M q250_firstskip_qty500_yes_forward`: best next research path
+     because it directly avoids the observed q250 NO-side official/proxy flip
+     pattern, but it has `0` promotion-usable rows and is not deployable.
+  2. `BTC15M q250_firstskip_qty500`: continue only as a side/basis
+     decomposition and control path; do not promote raw q250 because the
+     NO-side settlement-basis fragility remains a deployment blocker.
+  3. `BTC15M q1000_yes`: cleaner but sparse control; keep collecting, but do
+     not let it dominate unless q250 YES also fails settlement/execution gates.
+  BTC1H remains observe-only until it has clean-schema forward evidence and no
+  settlement-basis surprises.
+- GPT Pro's 24-hour plan says the next disruptive step is the guarded
+  paper-only restart/start:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1 -Execute -IUnderstandThisRestartsPaperShadows`.
+  This remains blocked pending explicit user authorization.
+- Followed the non-disruptive part of GPT Pro's plan by preserving the current
+  pre-restart evidence baseline:
+  `backtest_outputs\btc_pre_restart_baseline_20260518_023900`.
+  The bundle copied current report/CSV/JSON files from the latest readiness,
+  kill/continue, consistency, signal-health, starvation, settlement-basis,
+  execution-realism, post-restart, authorization, forward-evidence, shadow
+  status, shadow-official, and basis-model artifacts.
+- Baseline bundle details:
+  - `manifest.json` contains `69` copied artifact files;
+  - `README.md` states the bundle is non-disruptive and that no process was
+    stopped, started, archived, migrated, or deployed.
+- Current conclusion after applying GPT Pro's advice: still no deploy. The
+  evidence system is now better preserved and the restart path is more safely
+  gated, but the strategy goal is not complete until fresh post-restart
+  official-settled, execution-realistic rows accumulate and pass the numeric
+  promotion gates.
+
+## 2026-05-18 refreshed Pro-action checklist and current gate state
+
+- Refreshed current process/evidence state without stopping, starting,
+  restarting, archiving, migrating, or deploying anything.
+- Active Python processes remained unchanged:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`.
+- Regenerated the current control stack:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T08:42:12Z`;
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+    `2026-05-18T08:42:06Z`;
+  - `backtest_outputs\btc_execution_realism_audit_latest_codex`, created
+    `2026-05-18T08:42:03Z`;
+  - `backtest_outputs\btc_ledger_schema_preflight_latest_codex`, created
+    `2026-05-18T08:41:59Z`;
+  - `backtest_outputs\btc_shadow_restart_preflight_latest_codex`, created
+    `2026-05-18T08:42:27Z`;
+  - dry-run restart plan
+    `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_024244`,
+    with `execute = False` and all four target scripts passing safety;
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`, created
+    `2026-05-18T08:43:09Z`;
+  - `backtest_outputs\btc_post_restart_collection_gate_latest_codex`, created
+    `2026-05-18T08:42:25Z`;
+  - `backtest_outputs\btc15m_shadow_signal_health_latest_codex`, created
+    `2026-05-18T08:42:30Z`;
+  - `backtest_outputs\btc15m_signal_starvation_latest_codex`, created
+    `2026-05-18T08:42:53Z`;
+  - `backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex`, created
+    `2026-05-18T08:42:47Z`;
+  - `backtest_outputs\btc15m_next_forward_candidate_packet_latest_codex`;
+  - `backtest_outputs\btc_basis_danger_table_latest_codex`, created
+    `2026-05-18T08:43:10Z`;
+  - `backtest_outputs\btc_settlement_basis_model_feasibility_latest_codex`,
+    created `2026-05-18T08:43:13Z`;
+  - `backtest_outputs\btc15m_predexon_official_coverage_latest_codex`;
+  - `backtest_outputs\btc_official_settlement_feature_table_latest_codex`;
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T08:43:25Z`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T08:43:25Z`;
+  - `backtest_outputs\btc_kill_continue_latest_codex`, created
+    `2026-05-18T08:43:25Z`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T08:43:44Z`.
+- Current BTC15M live-shadow state:
+  - q250 firstskip: running, `408,914` total signal scans, `0` candidates,
+    `0` order decisions, `0` fills; post-freeze starvation report has
+    `241,039` signal rows, `0` nonzero candidate rows, and
+    `STARVED_NO_POSTFREEZE_CANDIDATES`;
+  - q1000 YES: running, `542,328` total signal scans, `0` candidates,
+    `0` order decisions, `0` fills; post-freeze starvation report has
+    `240,179` signal rows, `0` nonzero candidate rows, and
+    `STARVED_NO_POSTFREEZE_CANDIDATES`;
+  - q250 YES-only: still not started, missing capture DB, status
+    `NOT_STARTED_MISSING_CAPTURE_DB`.
+- Current BTC1H state:
+  - still `8` all-time official paper rows, official PnL `+0.44`, win rate
+    `75%`;
+  - since `2026-05-18T02:42:00Z`: `5` official rows, official PnL `-0.46`,
+    win rate `60%`, and `1` proxy/official result mismatch;
+  - the capture DB is still unreadable/snapshot-locked while PID `16216` holds
+    it, and the ledger schema is still missing the execution-realism fields.
+- Current deployment-control verdict:
+  - readiness `production_ready_count = 0`;
+  - forward consistency `0 / 4`;
+  - canonical official-settlement feature table has `0` promotion-usable rows;
+  - post-restart collection gate remains `PENDING_CONTROLLED_RESTART` with
+    `0` post-restart official rows for every candidate;
+  - settlement-basis model feasibility still has `0` deployable guards
+    (`model_rows = 131`).
+- Added `scripts\build_btc_gpt_pro_action_status.py`.
+  This control artifact binds GPT Pro's latest recommendations to local
+  evidence and writes:
+  - `gpt_pro_action_checklist.csv`;
+  - `gpt_pro_candidate_status.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Generated
+  `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+  `2026-05-18T08:46:11Z`. It says:
+  - current deployment verdict: `BLOCKS_DEPLOYMENT`;
+  - forward-layer agreement: `BLOCKS_DEPLOYMENT`;
+  - promotion-usable official rows: `BLOCKS_DEPLOYMENT`;
+  - post-restart collection gate: `BLOCKS_DEPLOYMENT`;
+  - settlement-basis guard deployability: `BLOCKS_DEPLOYMENT`;
+  - paper restart authorization path:
+    `READY_FOR_EXPLICIT_USER_AUTHORIZATION`, but `passes_for_deployment =
+    False`.
+- Candidate action statuses from the new artifact:
+  - `q250_firstskip_qty500_yes`: top GPT Pro path, not running, `0`
+    promotion-usable rows, waiting for explicit paper restart/start
+    authorization;
+  - `q250_firstskip_qty500`: running but stale ledger schema, `0`
+    post-restart rows, use only as side/basis decomposition control;
+  - `q1000_yes`: running but stale ledger schema, sparse control only;
+  - `btc1h_high_conf80_entry70_no_chase`: observe-only, stale schema, negative
+    since-freeze official PnL, and proxy/official mismatch.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc_gpt_pro_action_status_` artifacts and prioritize
+  `gpt_pro_action_checklist.csv` / `gpt_pro_candidate_status.csv`. Rebuilt
+  `gpt_pro_packets\strategy_advisor_20260518_024639`; it was not resubmitted
+  because the new artifact confirms the same strategic fork rather than
+  creating a new one.
+- Validation:
+  - `python -m py_compile scripts\build_btc_gpt_pro_action_status.py
+    scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `python -m unittest scripts.test_btc_paper_restart_safety
+    scripts.test_btc15m_shadow_config scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `61/61`,
+    with the known logging ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy and no canary. The exact next
+  deployability-relevant action remains an explicitly user-authorized guarded
+  paper-only restart/start so q250 YES-only, q250 control, q1000 YES, and BTC1H
+  can begin producing countable post-restart official-settled rows with
+  execution-realism fields.
+
+## 2026-05-18 post-restart evidence-clock verifier
+
+- Added `scripts\build_btc_post_restart_verification.py`.
+  This is a read-only post-restart verifier for the immediate period after a
+  user-authorized guarded paper-only restart/start. It does not stop, start,
+  restart, archive, migrate, tune, or deploy anything.
+- The verifier checks whether the evidence machine has actually started:
+  - controlled `restart_result.json` exists and has a completion timestamp;
+  - the restart plan was safety-checked;
+  - `btc15m_live_capture.py` was declared untouched and remains running;
+  - all four target paper shadows are running, including q250 YES-only;
+  - active ledger schemas no longer require restart and have execution-realism
+    columns;
+  - post-restart collection gate rows exist and are official-settled enough for
+    later collection review.
+- Initial run:
+  `backtest_outputs\btc_post_restart_verification_latest_codex`, created
+  `2026-05-18T08:53:03Z`.
+- Current verifier verdict:
+  - `restart_executed = False`;
+  - `evidence_clock_ready = False`;
+  - `restart_result_exists = PENDING_CONTROLLED_RESTART`;
+  - restart plan safety and BTC15M capture checks pass for the current dry-run
+    plan;
+  - all target shadows are not running because q250 YES-only is still not
+    started;
+  - all active ledgers still fail or miss execution-realism schema;
+  - post-restart collection gate remains `NOT_READY`.
+- Fixed an important verifier edge case: PowerShell-generated `restart_plan.json`
+  can carry a UTF-8 BOM, so the verifier now reads JSON with `utf-8-sig`.
+  It also prefers the authorization packet's `latest_restart_plan_dir` instead
+  of picking an arbitrary newest dry-run/test restart directory by mtime.
+- Added `scripts\test_btc_post_restart_verification.py` covering:
+  - BOM-tolerant JSON reads;
+  - authorization-packet restart-plan preference;
+  - explicit `--restart-dir` precedence.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc_post_restart_verification_` artifacts and prioritize
+  `post_restart_verification_checklist.csv` /
+  `post_restart_target_status.csv`.
+- Rebuilt GPT Pro packet
+  `gpt_pro_packets\strategy_advisor_20260518_025341`; it now includes the
+  post-restart verifier artifact. It was not submitted because no new strategic
+  fork emerged: the verifier reinforces the known explicit-authorization
+  blocker.
+- Validation:
+  - `python -m py_compile scripts\build_btc_post_restart_verification.py
+    scripts\test_btc_post_restart_verification.py
+    scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `python -m unittest scripts.test_btc_post_restart_verification -v` passed
+    `3/3`;
+  - `python -m unittest scripts.test_btc_post_restart_verification
+    scripts.test_btc_paper_restart_safety scripts.test_btc15m_shadow_config
+    scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `64/64`,
+    with the known logging ResourceWarnings and pandas all-NaN warning.
+- Current conclusion remains unchanged: no deploy, no canary, and no
+  post-restart evidence clock until the user explicitly authorizes the guarded
+  paper-only restart/start command.
+
+## 2026-05-18 q250 post-freeze official loss and replay-realism correction
+
+- Continued the forward validation without stopping, starting, restarting,
+  archiving, migrating, or deploying anything.
+- Refreshed the live evidence stack. Active processes remained:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`.
+- New q250 raw firstskip forward evidence appeared:
+  - q250 firstskip paper shadow logged `1` post-freeze paper fill on
+    `KXBTC15M-26MAY180500-00`, side `no`, entry `0.46`, fee `0.02`;
+  - Kalshi REST official result is `yes`, so the paper ledger official PnL is
+    `-0.48`;
+  - this row still cannot count as deployable evidence because the active
+    ledger schema is stale and lacks execution-realism fields.
+- Replayed the frozen q250 post-freeze live websocket window and found a replay
+  realism bug:
+  - the replay script had allowed BTC spot ticks up to `120s` old;
+  - the live H02 engine rejects BTC spot older than
+    `BTC15M_H02_BTC_MAX_AGE_SEC`, default `10s`;
+  - the extra replay-only q250 signal at `2026-05-18T05:49:47Z` was rejected
+    by the live shadow as `h02_stale_btc_spot`.
+- Updated `scripts\backtest_btc15m_f2_live_ws_holdout.py`:
+  - added `--max-btc-spot-age-sec`, default `10.0`;
+  - filters replay candidates to causal BTC spot age `0..10s` by default,
+    matching the live H02 engine.
+- Re-ran post-freeze replay with the corrected stale-spot filter:
+  - q250 firstskip: `6` raw NO hits, `1` first signal, `1` closed proxy row,
+    proxy `-0.50` under 2c stress;
+  - REST official fill for that replay row: `1` official row, official PnL
+    `-0.50`, no proxy/official result mismatch;
+  - q1000 YES: `0` raw hits, `0` first signals.
+- Updated `scripts\build_btc_forward_consistency_audit.py`:
+  - compares BTC15M paper-fill count to replay-selected/closed rows separately
+    from official-settled rows;
+  - uses REST-filled replay `summary.csv` when present;
+  - reports q250 as
+    `paper_replay_count_agree_but_not_promotable`, not a count mismatch.
+- Updated `scripts\build_btc_forward_evidence_report.py` so the interpretation
+  no longer says BTC15M has zero post-freeze fills when q250 has a settled
+  diagnostic loss.
+- Added `scripts\test_btc_forward_replay_realism.py` covering:
+  - stale BTC spot ticks are excluded by default in live-WS replay;
+  - forward consistency replay metrics prefer REST-official replay summaries
+    when available.
+- Current refreshed artifacts:
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T09:11:06Z`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T09:13:30Z`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+    `2026-05-18T09:11:13Z`;
+  - `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_20260518_041744_codex`;
+  - `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_20260518_041744_codex`.
+- Current verdict remains `NO DEPLOY`:
+  - readiness `production_ready_count = 0`;
+  - forward consistency `0 / 4`;
+  - q250 raw now has one official post-freeze diagnostic loss;
+  - q250 YES-only remains the top preregistered future paper-only candidate but
+    is not running and has `0` promotion-usable rows;
+  - q1000 YES remains sparse/zero-signal post-freeze;
+  - BTC1H remains observe-only with tiny official sample, negative since-freeze
+    official PnL, proxy/official mismatch, and stale schema.
+- Rebuilt latest GPT Pro packet
+  `gpt_pro_packets\strategy_advisor_20260518_031625` with the updated local
+  evidence and copied its prompt to the Windows clipboard. The Codex in-app
+  Browser is not logged into ChatGPT (`/auth/login`), and no callable logged-in
+  Chrome/Pro surface was available in this session, so this packet was not
+  submitted to GPT Pro.
+- Validation:
+  - `python -m py_compile scripts\backtest_btc15m_f2_live_ws_holdout.py
+    scripts\build_btc_forward_consistency_audit.py
+    scripts\build_btc_forward_evidence_report.py
+    scripts\test_btc_forward_replay_realism.py` passed;
+  - `python -m unittest scripts.test_btc_forward_replay_realism -v` passed
+    `2/2`.
+  - `python -m unittest scripts.test_btc_forward_replay_realism
+    scripts.test_btc_post_restart_verification
+    scripts.test_btc_paper_restart_safety scripts.test_btc15m_shadow_config
+    scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `66/66`,
+    with the known logging ResourceWarnings and pandas all-NaN warning.
+
+## 2026-05-18 q250 YES-only post-freeze replay check
+
+- Continued the forward validation without stopping, starting, restarting,
+  archiving, migrating, or deploying anything.
+- Active processes were re-checked and remained:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`.
+- Confirmed the preregistered q250 YES-only shadow wrapper is paper-only and
+  side-specific:
+  - YES only;
+  - TTL `10..12m`;
+  - spread `<= 2c`;
+  - entry `2..50c`;
+  - side probability `>= 0.60`;
+  - edge `>= 12c`;
+  - base visible quantity `>= 250`;
+  - first-signal visible quantity `>= 500`;
+  - max contracts `1`.
+- Replayed the q250 YES-only frozen post-freeze live websocket window:
+  - artifact:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_20260518_041744_codex`;
+  - capture start `2026-05-18T04:17:44Z`;
+  - capture end `2026-05-18T09:18:51.245645Z`;
+  - `435377` top rows and `25` metadata markets;
+  - `0` YES raw hits, `0` NO raw hits, `0` first signals, `0` closed proxy
+    trades.
+- Updated `scripts\build_btc_forward_consistency_audit.py` so q250 YES-only
+  has an explicit candidate row and reads the q250 YES post-freeze replay
+  directory. It now reports q250 YES as
+  `not_running_or_status_missing` with `0` post-freeze replay rows, rather
+  than leaving the replay path missing.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include q250 YES-only post-freeze live replay artifacts and prioritize
+  `f2_live_ws_summary.csv`.
+- Refreshed control artifacts:
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T09:22:24Z`: `0 / 4` consistent enough for promotion;
+  - q250 raw is
+    `paper_replay_count_agree_but_not_promotable`, with `1` post-freeze
+    official diagnostic loss;
+  - q250 YES-only is not running, has `0` raw hits / first signals / closed
+    replay rows, and is not deployable;
+  - q1000 YES remains zero-signal post-freeze;
+  - BTC1H remains blocked by proxy/official mismatch, negative since-freeze
+    official PnL, tiny sample, and stale execution schema.
+- Refreshed `backtest_outputs\btc_kill_continue_latest_codex`:
+  - q250 YES-only action remains
+    `PREREGISTERED_PAPER_START_WITH_PERMISSION`;
+  - q250 raw remains `CONTINUE_FORWARD_ONLY`;
+  - q1000 YES remains `CONTINUE_FORWARD_ONLY_SPARSE`;
+  - BTC1H remains `OBSERVE_ONLY_RESTART_WITH_PERMISSION`.
+- Refreshed `backtest_outputs\btc_gpt_pro_action_status_latest_codex`:
+  - verdict remains `NO DEPLOY`;
+  - the only operational next path is still explicit user authorization for the
+    guarded paper-only restart/start workflow;
+  - q250 YES-only remains GPT Pro's top research path but has `0`
+    promotion-usable rows and is not running.
+- Important workflow update: the Codex Chrome extension surface is now visible
+  for profile `Sami`, so a fresh GPT Pro packet can be submitted through Chrome
+  instead of relying on the logged-out in-app Browser. The packet still must
+  exclude credentials and raw databases.
+- Validation:
+  - `python -m py_compile scripts\build_btc_forward_consistency_audit.py
+    scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `python -m unittest scripts.test_btc_forward_replay_realism
+    scripts.test_btc_post_restart_verification
+    scripts.test_btc_paper_restart_safety scripts.test_btc15m_shadow_config
+    scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `66/66`,
+    with the known logging ResourceWarnings and pandas all-NaN warning.
+- Current conclusion remains unchanged: no deploy and no canary. q250 YES-only
+  is cleaner conceptually than the NO-heavy q250 raw path, but it is
+  collection-starved. It needs an explicit paper-only start/restart before any
+  future rows can count.
+
+## 2026-05-18 fresh Chrome GPT Pro review loop
+
+- Successfully used the Codex Chrome extension surface for profile `Sami`.
+  ChatGPT was logged in and the composer showed `Pro` selected.
+- Built and submitted packet
+  `gpt_pro_packets\strategy_advisor_20260518_032401` through a new ChatGPT
+  conversation:
+  `https://chatgpt.com/c/6a0adb27-0a90-8325-b861-3b62bc22c7e0`.
+- Packet safety check:
+  - manifest excludes `credentials.env`, raw DuckDB files, raw Parquet
+    orderbook data, and full logs;
+  - evidence bundle is `634049` bytes;
+  - keyword scan found only benign references to credentials/secrets being
+    excluded or absent.
+- Saved the actual Pro response to
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_fresh_chrome_20260518_033054.md`.
+- Fresh GPT Pro verdict:
+  - `NO DEPLOY / NO CANARY`;
+  - q250 YES-only is the highest-probability research path, but still low
+    probability because it is not running, has `0` promotion-usable rows, and
+    produced `0` post-freeze replay hits;
+  - q1000 YES is cleaner but too sparse;
+  - q250 raw should be kept only as side/basis decomposition because the latest
+    post-freeze official row was a `-0.48` NO-side diagnostic loss;
+  - BTC1H is not top-three and remains observe-only because of tiny sample,
+    negative since-freeze official PnL, proxy/official mismatch, stale schema,
+    and missing execution-realism fields.
+- Fresh GPT Pro 24-hour plan agrees with local gates:
+  - preserve the current pre-restart baseline;
+  - execute the guarded paper-only restart/start only after explicit user
+    authorization;
+  - leave `btc15m_live_capture.py` running and untouched;
+  - immediately verify the post-restart evidence clock if a restart is ever
+    authorized;
+  - do not retune thresholds on the first post-restart window.
+- Created non-disruptive fresh baseline bundle
+  `backtest_outputs\btc_pre_restart_baseline_20260518_033100`.
+  It copied `24` current report/review/packet artifacts and did not stop,
+  start, restart, archive, migrate, tune, or deploy anything.
+- Updated `scripts\build_btc_gpt_pro_action_status.py` so its default GPT Pro
+  review is the newest `docs\gpt_pro_reviews\gpt_pro_strategy_advisor*.md`
+  file instead of a hardcoded older review.
+- Refreshed deployment readiness at `2026-05-18T09:33:54Z`; it still reports
+  `production_ready_count = 0`.
+- Refreshed
+  `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+  `2026-05-18T09:34:06Z`. It now references the fresh Chrome Pro review and
+  still says:
+  - current deployment verdict blocks deployment;
+  - forward-layer agreement blocks deployment;
+  - promotion-usable official rows block deployment;
+  - post-restart collection gate blocks deployment;
+  - basis guard deployability blocks deployment;
+  - paper restart path is
+    `READY_FOR_EXPLICIT_USER_AUTHORIZATION`, which authorizes nothing by
+    itself.
+- Validation:
+  - `python -m py_compile scripts\build_btc_gpt_pro_action_status.py` passed;
+  - `python scripts\build_btc_gpt_pro_action_status.py --out-dir
+    backtest_outputs\btc_gpt_pro_action_status_latest_codex` passed.
+  - `python scripts\check_btc_deployment_readiness.py --out-dir
+    backtest_outputs\deployment_readiness_latest_codex` correctly returned
+    the no-production-ready-candidates state.
+- Current conclusion remains unchanged and is now independently reaffirmed:
+  no deploy, no canary, and no process restart without explicit user
+  authorization. The deployability goal is not complete; the next meaningful
+  evidence step is future official-settled, execution-realistic paper rows
+  collected after a controlled paper-only restart/start.
+
+## 2026-05-18 live-WS starvation decomposition and tiny YES forward fills
+
+- Continued the forward validation without stopping, starting, restarting,
+  archiving, migrating, tuning, or deploying anything.
+- Active process check remained unchanged:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`;
+  - q250 YES-only shadow still not running.
+- Added read-only diagnostic
+  `scripts\analyze_btc15m_f2_live_ws_starvation.py`.
+  It applies the frozen q250/q250-YES/q1000-YES rule settings to live
+  websocket capture and decomposes the gates in a fixed order:
+  valid quote, BTC spot freshness, TTL, spread, entry band, visible quantity,
+  side probability, then edge. It does not search or tune thresholds.
+- Generated
+  `backtest_outputs\btc15m_f2_live_ws_starvation_latest_codex`, created
+  `2026-05-18T09:38:27Z`, on capture window
+  `2026-05-18T04:17:44Z` to `2026-05-18T09:38:14.941765Z`.
+- Live-WS starvation decomposition:
+  - q250 raw: `893226` side rows, `66` raw hits, `2` first-signal events,
+    `2` post-first-signal trade events;
+  - q250 YES-only: `446613` side rows, `60` raw hits, `1` first-signal event,
+    `1` post-first-signal trade event;
+  - q1000 YES: `446613` side rows, `60` raw hits, `1` first-signal event,
+    `1` post-first-signal trade event;
+  - top incremental blocker for all three was the TTL window, blocking about
+    `71%` of side rows after quote/BTC-age checks;
+  - after executable-looking gates before probability/edge, q250 YES had
+    `15559` rows across `15` events, but only `1` event reached both
+    probability and edge.
+- Re-ran exact frozen live websocket replays through the fresher capture:
+  - q250 raw:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_latest_codex`;
+  - q250 YES-only:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_latest_codex`;
+  - q1000 YES:
+    `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_latest_codex`.
+- REST-filled official Kalshi settlement for those new replay rows:
+  - q250 raw REST artifact:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_rest_official_latest_codex`;
+  - q250 YES-only REST artifact:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_rest_official_latest_codex`;
+  - q1000 YES REST artifact:
+    `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_rest_official_latest_codex`.
+- New replay/REST official results:
+  - q250 raw: `2` official rows, official PnL `0.00` under 2c stress,
+    official win rate `50%`, `0` proxy/official mismatches;
+  - q250 YES-only: `1` official row, official PnL `+0.50` under 2c stress,
+    official win rate `100%`, `0` proxy/official mismatches;
+  - q1000 YES: `1` official row, official PnL `+0.50` under 2c stress,
+    official win rate `100%`, `0` proxy/official mismatches.
+- The new q250 YES/q1000 YES official row is the same market:
+  `KXBTC15M-26MAY180530-30`, event `KXBTC15M-26MAY180530`, side `yes`,
+  signal `2026-05-18T09:19:48.604537Z`, entry `0.46`, visible quantity
+  `1135`, side fair probability about `0.6057`, fair edge about `12.57c`,
+  official result `yes`, official PnL `+0.50` under 2c stress.
+- Refreshed live shadow status and official settlement:
+  - q250 raw running shadow now has `2` post-freeze paper fills, `2`
+    official-settled rows, official PnL `+0.04`;
+  - q1000 YES running shadow now has `1` post-freeze paper fill, `1`
+    official-settled row, official PnL `+0.52`;
+  - q250 YES-only remains not running and has `0` ledger rows;
+  - BTC1H since-freeze official rows dropped to `3`, official PnL `-1.08`,
+    with `1` proxy/official mismatch.
+- Updated `scripts\build_btc_forward_consistency_audit.py` so a REST official
+  replay-fill directory can recover raw hit / first-signal / proxy counts from
+  the source replay directory recorded in its `run_info.json`.
+- Refreshed
+  `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+  `2026-05-18T09:42:49Z`, using the latest REST-filled replay directories:
+  - consistency still `0 / 4`;
+  - q250 raw and q1000 YES are now
+    `paper_replay_count_agree_but_not_promotable`;
+  - q250 YES-only remains `not_running_or_status_missing`;
+  - BTC1H remains blocked by negative since-freeze official PnL,
+    proxy/official mismatch, stale schema, and too few official rows.
+- Refreshed
+  `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+  `2026-05-18T09:42:40Z`;
+  `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T09:43:16Z`;
+  `backtest_outputs\deployment_readiness_latest_codex`, created
+  `2026-05-18T09:43:02Z`;
+  and `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+  `2026-05-18T09:43:36Z`.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc15m_f2_live_ws_starvation_` artifacts and prioritize
+  `f2_live_ws_starvation_summary.csv`,
+  `f2_live_ws_starvation_gate_counts.csv`, and
+  `f2_live_ws_starvation_near_misses.csv`.
+- Validation:
+  - `python -m py_compile scripts\analyze_btc15m_f2_live_ws_starvation.py
+    scripts\build_btc_forward_consistency_audit.py
+    scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `python -m unittest scripts.test_btc_forward_replay_realism
+    scripts.test_btc_post_restart_verification
+    scripts.test_btc_paper_restart_safety scripts.test_btc15m_shadow_config
+    scripts.test_research_live_safety
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `66/66`,
+    with the known logging ResourceWarnings and pandas all-NaN warning.
+- Current conclusion: still no deploy and no canary. The new YES rows are
+  encouraging diagnostics because replay, REST official settlement, and the
+  currently running q1000 YES / q250 raw ledgers agree. They are still far too
+  small, are from stale-schema active ledgers, and are not post-restart
+  promotion evidence. q250 YES-only remains the preferred clean hypothesis but
+  has not started collecting ledger evidence.
+
+## 2026-05-18 frozen opportunity-rate refresh with q250 YES-only
+
+- Filled the missing full-window q250 YES-only exact live-WS replay artifact:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_latest_codex`.
+  Frozen settings were unchanged: YES only, visible quantity `>=250`, first
+  signal visible quantity `>=500`, spread `<=2c`, TTL `10-12m`, entry
+  `0.02-0.50`, fair probability `>=0.60`, fair edge `>=12c`, BTC spot age
+  `<=10s`.
+- Full-window q250 YES-only replay from
+  `2026-05-12T10:42:45.158640Z` to `2026-05-18T04:17:44Z` produced:
+  - `756` raw hits;
+  - `8` first signals;
+  - `2` first-signal quantity rejects;
+  - `6` closed proxy rows;
+  - proxy 2c PnL `+0.90`, win rate `66.67%`.
+- REST-filled official settlement for that full-window q250 YES-only replay:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_rest_official_latest_codex`.
+  It has `6 / 6` official-filled rows, official 2c PnL `+0.90`,
+  official win rate `66.67%`, and `0` proxy/official mismatches.
+- Updated `scripts\build_btc15m_frozen_opportunity_rate_report.py` so the
+  opportunity-rate report:
+  - accepts replay directories or REST official-fill directories for
+    post-freeze artifacts;
+  - recovers the source replay directory from REST `run_info.json`
+    `input_trades`;
+  - includes q250 YES-only alongside q250 raw and q1000 YES;
+  - reports actual post-freeze official rows/PnL/rates instead of hardcoding
+    post-freeze official rows to `0`;
+  - labels q250 YES-only as simulated replay only when its preregistered paper
+    shadow is not running;
+  - labels running q250 raw and q1000 YES shadows as blocked by stale ledger
+    schemas.
+- Refreshed
+  `backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex`, created
+  `2026-05-18T09:56:16Z`.
+- Refreshed frozen opportunity-rate summary:
+  - q250 raw: prior official rows `24`, prior official PnL `+3.74`;
+    post-freeze official replay rows `2`, post-freeze official PnL `0.00`;
+    running shadow exists but `FAIL_REALISM_SCHEMA_RESTART_REQUIRED` blocks
+    deployable ledger evidence.
+  - q250 YES-only: prior official rows `6`, prior official PnL `+0.90`;
+    post-freeze official replay rows `1`, post-freeze official PnL `+0.50`;
+    preregistered paper shadow is not running and ledger DB is missing, so
+    these rows are not promotion evidence.
+  - q1000 YES: prior official rows `8`, prior official PnL `+0.90`;
+    post-freeze official replay rows `1`, post-freeze official PnL `+0.50`;
+    running shadow exists but `FAIL_REALISM_SCHEMA_RESTART_REQUIRED` blocks
+    deployable ledger evidence.
+- The report's projected days to `100` post-freeze official rows are only
+  collection-planning diagnostics from very small windows. They are not a
+  reason to retune thresholds, promote a candidate, or deploy.
+- Validation:
+  - `python scripts\build_btc15m_frozen_opportunity_rate_report.py --out-dir
+    backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex` passed;
+  - `python -m py_compile scripts\build_btc15m_frozen_opportunity_rate_report.py
+    scripts\backtest_btc15m_f2_live_ws_holdout.py
+    scripts\fill_btc15m_live_ws_official_results.py` passed.
+- Current conclusion remains no deploy and no canary. q250 YES-only is now
+  better represented in the evidence packet, but it still needs explicit
+  paper-only start/restart authorization before any future official-settled
+  ledger rows can count toward promotion.
+
+## 2026-05-18 Predexon REST-official refresh and materialized grid
+
+- Refreshed Predexon materialized trade official settlement:
+  `backtest_outputs\btc15m_predexon_rest_official_latest_codex`, created
+  `2026-05-18T09:59:43Z`.
+- Input was
+  `backtest_outputs\btc15m_f2_combined_predexon_plus_jan29_20260516_164544\combined_predexon_trades.parquet`.
+  It contained `2424` trade rows and `880` unique market tickers.
+- Kalshi REST official coverage remains partial: `374 / 880` unique tickers
+  returned REST official `yes/no` results. Predexon metadata settlement
+  covered all `880` unique tickers and is useful as a sensitivity check, but
+  the grid below intentionally used the requested REST official columns.
+- REST-official strategy-level summary highlights:
+  - `ttl10_12_entry50_q250`: `69` official rows, PnL `+9.66`, win rate
+    `63.77%`, max DD `-1.49`, Sharpe `2.34`;
+  - `ttl10_12_entry50_q500`: `67` official rows, PnL `+9.82`, win rate
+    `64.18%`, max DD `-1.49`, Sharpe `2.41`;
+  - `ttl10_12_entry50_q1000`: `52` official rows, PnL `+8.16`, win rate
+    `65.38%`, max DD `-1.52`, Sharpe `2.31`;
+  - `ttl10_12_entry50_q250_qspeed05`: `63` official rows, PnL `+10.88`,
+    win rate `66.67%`, max DD `-1.89`, Sharpe `2.84`.
+- Reran materialized first-signal grid with REST-official Predexon PnL:
+  `backtest_outputs\btc15m_materialized_filter_grid_pred_official_latest_codex`.
+  Command used
+  `--pred-pnl-col pnl_official_rest_2c --pred-win-col win_pnl_official_rest_2c`.
+- Default-grid top row remains the q250 first-signal visible-quantity branch:
+  `mat_grid_00019`, q250, both sides, fair probability `>=0.60`, edge
+  `>=12c`, entry `<=50c`, visible quantity `>=500`, spread `<=2c`, TTL
+  `10-12m`.
+  It has `57` REST-official Predexon trades, PnL `+8.72`, win rate
+  `64.91%`, max DD `-1.97`, Sharpe `2.33`; live REST-official replay remains
+  `17` trades, PnL `+4.30`, win rate `76.47%`, max DD `-1.58`, Sharpe
+  `2.34`.
+- Reran a lower-sample diagnostic grid:
+  `backtest_outputs\btc15m_materialized_filter_grid_pred_official_min20_latest_codex`.
+  This was not a promotion gate; it exists so the q250 YES + qty>=500 branch
+  is visible rather than hidden by the default `min_pred_trades=30` screen.
+- Exact q250 YES + qty>=500 direct check:
+  - REST-official Predexon: `24` official rows, PnL `+4.89`, win rate
+    `70.83%`, max DD `-1.03`, Sharpe `2.12`;
+  - metadata-settlement sensitivity: `28` rows, PnL `+4.44`, win rate
+    `64.29%`;
+  - older live REST-official replay: `7` official rows, PnL `+1.37`, win
+    rate `71.43%`;
+  - live proxy on the same `7` rows also PnL `+1.37`, win rate `71.43%`.
+- Exact q250 YES + qty>=500 did not pass the normal materialized research gate
+  because it has too few live official trades (`7`, below the default `8` for
+  the grid and far below any deployability threshold). It is directionally
+  positive, not deployable.
+- Built a refreshed sanitized GPT Pro packet:
+  `gpt_pro_packets\strategy_advisor_20260518_040403`. It includes the latest
+  frozen opportunity-rate report, Predexon REST-official fill, min20
+  materialized grid, live-WS starvation report, and current readiness outputs.
+- Refreshed
+  `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+  `2026-05-18T10:05:34Z`. It still says `NO DEPLOY` and
+  `WAITING_FOR_EXPLICIT_PAPER_RESTART_AUTHORIZATION`; this authorizes nothing
+  by itself.
+- Refreshed deployment readiness:
+  `backtest_outputs\deployment_readiness_latest_codex`, created
+  `2026-05-18T10:04:28Z`.
+  It still reports `production_ready_count = 0`.
+- Validation:
+  - `python scripts\fill_btc15m_predexon_official_results.py --trades
+    backtest_outputs\btc15m_f2_combined_predexon_plus_jan29_20260516_164544\combined_predexon_trades.parquet
+    --out-dir backtest_outputs\btc15m_predexon_rest_official_latest_codex
+    --sleep 0.02` passed;
+  - `python scripts\audit_btc15m_materialized_filter_grid.py --predexon-trades
+    backtest_outputs\btc15m_predexon_rest_official_latest_codex\predexon_trades_rest_official.parquet
+    --live-trades
+    backtest_outputs\btc15m_live_ws_rest_official_refresh_20260516_183818\live_ws_trades_rest_official.parquet
+    --out-dir
+    backtest_outputs\btc15m_materialized_filter_grid_pred_official_latest_codex
+    --pred-pnl-col pnl_official_rest_2c --pred-win-col
+    win_pnl_official_rest_2c` passed;
+  - same grid with `--min-pred-trades 20 --top-n 200` passed;
+  - `python -m py_compile scripts\fill_btc15m_predexon_official_results.py
+    scripts\audit_btc15m_materialized_filter_grid.py` passed;
+  - `python scripts\check_btc_deployment_readiness.py --out-dir
+    backtest_outputs\deployment_readiness_latest_codex` returned the expected
+    no-production-ready state.
+- Current conclusion: BTC15M q250/YES evidence improved, but deployability did
+  not. The strongest honest path remains future official-settled,
+  execution-realistic, post-restart paper rows under frozen rules. BTC1H
+  remains a runner-up/observe-only category, not closer to deployment.
+
+## 2026-05-18 control-artifact refresh and stale post-freeze input fix
+
+- Continued read-only validation. No live deployment, canary, process restart,
+  archive, migration, threshold tuning, or paper-shadow start was executed.
+- Process refresh still found `4 / 5` expected Python targets running:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py`, PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py`, PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID `16216`;
+  - q250 YES-only remains not running.
+- Refreshed shadow official settlement at `2026-05-18T10:07:15Z`:
+  - q250 raw shadow: `2` official-filled BTC15M rows since freeze, official
+    PnL `+0.04`, win rate `50%`;
+  - q1000 YES shadow: `1` official-filled BTC15M row since freeze, official
+    PnL `+0.52`, win rate `100%`;
+  - q250 YES-only shadow: `0` ledger rows because the shadow is not running;
+  - BTC1H high-conf80 entry70 no-chase shadow: `8` official-filled rows all
+    time, official PnL `+0.44`, but `5` since-window official rows are
+    negative at `-0.46` with `1` since-window proxy/official mismatch.
+- Refreshed ledger schema preflight at `2026-05-18T10:07:10Z`.
+  Running q250 raw, q1000 YES, and BTC1H ledgers still have old 25-column
+  schemas with `0 / 12` required execution-realism columns populated.
+  q250 YES-only ledger DB is still missing.
+- Refreshed BTC15M signal health/starvation at `2026-05-18T10:09Z`:
+  - q250 raw: `303117` post-freeze signal rows, `2` selected rows/order
+    decisions, top blocker `h02_ttl_outside`, TTL-outside share `75.47%`;
+  - q1000 YES: `302504` post-freeze signal rows, `1` selected row/order
+    decision, top blocker `h02_ttl_outside`, TTL-outside share `77.76%`;
+  - q250 YES-only: `NOT_STARTED_MISSING_CAPTURE_DB`.
+- Fixed stale default inputs in
+  `scripts\build_btc_kill_continue_report.py` and
+  `scripts\build_btc_forward_consistency_audit.py`.
+  Their default post-freeze directories now point to the REST-official
+  `*_latest_codex` artifacts instead of the older replay-only
+  `20260518_041744` artifacts.
+- Updated `scripts\build_btc_kill_continue_report.py` so post-freeze metrics
+  can read either replay directories or REST official-fill directories. It now
+  recovers source replay counts from REST `run_info.json` `input_trades` and
+  uses REST `summary.csv` for official trades/PnL when present.
+- Refreshed `backtest_outputs\btc_kill_continue_latest_codex`, created
+  `2026-05-18T10:10:58Z`. It now correctly reports:
+  - q250 raw: `2` post-freeze official replay rows;
+  - q250 YES-only: `1` post-freeze official replay row, but not running and
+    not promotion evidence;
+  - q1000 YES: `1` post-freeze official replay row;
+  - BTC1H: observe-only restart-with-permission, still blocked.
+- Refreshed `backtest_outputs\btc_forward_consistency_audit_latest_codex`,
+  created `2026-05-18T10:10:58Z`.
+  Consistency remains `0 / 4`:
+  - q250 raw and q1000 YES: replay/paper counts agree, but not promotable;
+  - q250 YES-only: not running/status missing;
+  - BTC1H: official/proxy mismatch and negative since-window official PnL.
+- Refreshed official-settlement feature table at `2026-05-18T10:10:19Z`.
+  Promotion-usable rows remain `0` across the canonical feature table because
+  decision/execution fields and live/paper promotion gates are still missing.
+- Refreshed next-forward candidate packet at
+  `backtest_outputs\btc15m_next_forward_candidate_packet_latest_codex`.
+  q250 YES-only remains
+  `PREREGISTER_FOR_FUTURE_PAPER_COLLECTION`, with `0` promotion-usable rows.
+- Refreshed post-restart collection gate and restart authorization packet at
+  `2026-05-18T10:10Z`.
+  Restart path is ready for explicit user authorization, but
+  `restart_executed = False`; this authorizes nothing by itself.
+- Refreshed deployment readiness at `2026-05-18T10:10:34Z`.
+  `production_ready_count = 0`.
+- Refreshed `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+  `2026-05-18T10:10:58Z`.
+  It still says `NO DEPLOY`; the only operational path it marks ready is
+  explicit user authorization for a guarded paper-only restart/start.
+- Rebuilt sanitized GPT Pro packet:
+  `gpt_pro_packets\strategy_advisor_20260518_041110`.
+  This was packaged locally only; no new GPT Pro submission was necessary for
+  this artifact-refresh step because the blocker is missing forward ledger
+  evidence, not an unresolved planning question.
+- Validation:
+  - `python -m py_compile scripts\build_btc_kill_continue_report.py
+    scripts\build_btc_forward_consistency_audit.py
+    scripts\build_btc_forward_evidence_report.py
+    scripts\build_btc_gpt_pro_action_status.py
+    scripts\build_btc15m_next_forward_candidate_packet.py
+    scripts\build_btc_official_settlement_feature_table.py
+    scripts\check_btc_deployment_readiness.py` passed;
+  - `python scripts\check_btc_deployment_readiness.py --out-dir
+    backtest_outputs\deployment_readiness_latest_codex` returned the expected
+    no-production-ready state.
+- Current conclusion remains unchanged: no deploy, no canary, no live strategy.
+  BTC15M q250 YES-only is still the best clean research direction, but it has
+  not started collecting paper-ledger evidence. BTC1H moved further away from
+  deployability because the refreshed since-window official ledger sample is
+  negative and still proxy/official-fragile.
+
+## 2026-05-18 BTC15M shadow/replay config-equivalence audit
+
+- Added read-only audit
+  `scripts\build_btc15m_shadow_replay_config_audit.py`.
+  It parses the BTC15M paper-shadow wrapper `os.environ.setdefault(...)`
+  values, compares them to frozen live-WS replay `run_info.json` fields, and
+  checks paper-mode/restart-script invariants. It does not start processes,
+  tune thresholds, or authorize deployment.
+- Generated
+  `backtest_outputs\btc15m_shadow_replay_config_audit_latest_codex`, created
+  `2026-05-18T10:15:26Z`.
+- Config-equivalence results:
+  - q250 raw first-signal qty>=500:
+    `19 / 19` checks passed, wrapper policy matches replay, paper mode locked,
+    restart script includes target;
+  - q250 YES-only first-signal qty>=500:
+    `19 / 19` checks passed, wrapper policy matches replay, paper mode locked,
+    restart script includes target;
+  - q1000 YES:
+    `19 / 19` checks passed, wrapper policy matches replay, paper mode locked,
+    restart script includes target.
+- Important interpretation: this only proves a future explicitly authorized
+  paper start/restart would collect the intended frozen policies. It does not
+  make old replay rows, stale-schema ledger rows, or non-running q250 YES-only
+  rows deployable.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include `btc15m_shadow_replay_config_audit_` artifacts and prioritize
+  `shadow_replay_config_summary.csv` / `shadow_replay_config_checks.csv`.
+- Rebuilt sanitized GPT Pro packet:
+  `gpt_pro_packets\strategy_advisor_20260518_041545`.
+- Validation:
+  - `python scripts\build_btc15m_shadow_replay_config_audit.py --out-dir
+    backtest_outputs\btc15m_shadow_replay_config_audit_latest_codex` passed;
+  - `python -m py_compile scripts\build_btc15m_shadow_replay_config_audit.py
+    scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `python -m unittest scripts.test_btc15m_shadow_config
+    scripts.test_btc_paper_restart_safety -v` passed `12/12`, with the known
+    logging ResourceWarnings.
+- Current conclusion remains no deploy. The q250 YES-only forward path is
+  now better operationally specified, but it still has `0` promotion-usable
+  rows until an explicit paper-only start/restart is authorized and future
+  official-settled rows accumulate with execution-realism fields.
+
+## 2026-05-18 extended post-freeze replay and fresh GPT Pro review
+
+- Continued read-only validation. No live deployment, canary, live trading,
+  threshold retuning, process restart, archive, migration, or paper-shadow
+  start was executed.
+- Extended the frozen BTC15M live-WS post-freeze replays from freeze
+  `2026-05-18T04:17:44Z` through the latest available capture at about
+  `2026-05-18T10:18Z`:
+  - q250 raw first-signal qty>=500:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_latest_codex`
+    and REST fill
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_rest_official_latest_codex`;
+  - q250 YES-only first-signal qty>=500:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_latest_codex`
+    and REST fill
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_rest_official_latest_codex`;
+  - q1000 YES:
+    `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_latest_codex`
+    and REST fill
+    `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_rest_official_latest_codex`.
+- Extended post-freeze REST-official results remained tiny:
+  - q250 raw: `2` official rows, official PnL `0.00`, win rate `50%`,
+    `0` proxy/official result mismatches;
+  - q250 YES-only: `1` official row, official PnL `+0.50`, win rate `100%`,
+    `0` proxy/official result mismatches;
+  - q1000 YES: `1` official row, official PnL `+0.50`, win rate `100%`,
+    `0` proxy/official result mismatches.
+  This adds no deployable evidence; it mainly confirms sparse candidate
+  collection under the frozen rules.
+- Refreshed process state at `2026-05-18T10:22:21Z`: `4 / 5` targets were
+  running. `btc15m_live_capture.py`, q250 raw, q1000 YES, and BTC1H
+  high-conf80 entry70 no-chase were running. q250 YES-only was still not
+  running.
+- Refreshed shadow official settlement at `2026-05-18T10:22:18Z`:
+  - q250 raw shadow: `2` official-filled BTC15M rows since freeze, official
+    PnL `+0.04`;
+  - q1000 YES shadow: `1` official-filled BTC15M row since freeze, official
+    PnL `+0.52`;
+  - q250 YES-only shadow: `0` rows because the DB is missing/not running;
+  - BTC1H high-conf80 entry70 no-chase: `8` official-filled rows all time,
+    official PnL `+0.44`; `5` since-window official rows have official PnL
+    `-0.46` with `1` since-window proxy/official mismatch.
+- Refreshed deployment readiness at `2026-05-18T10:22:35Z`.
+  `production_ready_count = 0`. The readiness failure remains expected and
+  correct.
+- Refreshed forward consistency at `2026-05-18T10:22:35Z`.
+  Consistency remains `0 / 4`:
+  - q250 raw and q1000 YES have paper/replay count agreement, but not
+    promotion evidence;
+  - q250 YES-only is not running/status missing;
+  - BTC1H has since-window negative official PnL and proxy/official mismatch.
+- Submitted the rebuilt sanitized GPT Pro packet through Chrome/ChatGPT Pro:
+  `gpt_pro_packets\strategy_advisor_20260518_042259`.
+  Saved the response as
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_043034.md`.
+- Fresh GPT Pro verdict matched the local gate:
+  no live deployment, no canary, and no small-size exception. It ranked the
+  research paths as:
+  1. q250 YES-only first-signal qty>=500 as the best next experiment, but only
+     after controlled paper-only start/restart and only future rows count;
+  2. q1000 YES as the cleaner sparse control;
+  3. q250 raw as side/basis decomposition only, not deployable;
+  4. BTC1H as observe-only until clean-schema official forward rows exist.
+- Refreshed restart-preflight and authorization artifacts at
+  `2026-05-18T10:30Z`:
+  - `backtest_outputs\btc_ledger_schema_preflight_latest_codex` still shows
+    active q250 raw, q1000 YES, and BTC1H ledgers have old 25-column schemas
+    with `0 / 12` execution-realism columns; q250 YES-only DB is missing;
+  - `backtest_outputs\btc_shadow_restart_preflight_latest_codex` says all
+    four paper-shadow restart/start paths pass schema/insert preflight;
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex` says the
+    guarded paper-only restart/start path is ready for explicit user
+    authorization, but did not execute it;
+  - `backtest_outputs\btc_post_restart_collection_gate_latest_codex` remains
+    `PENDING_CONTROLLED_RESTART` with `0` post-restart official rows.
+- Refreshed
+  `backtest_outputs\btc_gpt_pro_action_status_latest_codex` at
+  `2026-05-18T10:31:20Z`. It points to the fresh GPT Pro review and still
+  says `NO DEPLOY`. The only ready operational path is explicit user
+  authorization for the guarded paper-only restart/start; that would collect
+  evidence, not authorize live trading.
+- After recording this ledger entry, rebuilt the sanitized GPT Pro packet again
+  so the latest local handoff includes the new ledger state:
+  `gpt_pro_packets\strategy_advisor_20260518_043234`.
+- Validation:
+  - `python -m py_compile` passed for the relied-on BTC15M/BTC1H official
+    settlement, readiness, restart, action-status, replay/config-audit, and
+    GPT packet scripts;
+  - `python scripts\check_btc_deployment_readiness.py --out-dir
+    backtest_outputs\deployment_readiness_latest_codex` returned the expected
+    no-production-ready state.
+- Current conclusion remains unchanged but sharper: no BTC15M or BTC1H strategy
+  is deployable. The next useful step is not another threshold search; it is a
+  user-authorized paper-only start/restart so q250 YES-only, q1000 YES, q250
+  raw control, and BTC1H observe-only can begin collecting clean-schema,
+  official-settled, execution-realistic forward rows under frozen rules.
+
+## 2026-05-18 short refresh after GPT Pro review
+
+- Continued read-only validation toward the same deployability goal. No live
+  deployment, canary, paper execution, process stop/start/restart, archive, or
+  threshold retuning was executed.
+- Current local time check was `2026-05-18T04:35:40-06:00`
+  (`2026-05-18T10:35:40Z`). Process refresh still found `4 / 5` expected
+  Python targets running:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - q250 raw paper shadow, PID `7052`;
+  - q1000 YES paper shadow, PID `24840`;
+  - BTC1H high-conf80 entry70 no-chase shadow, PID `16216`;
+  - q250 YES-only remains not running.
+- Refreshed shadow official settlement at `2026-05-18T10:35:46Z`.
+  No new official-filled rows appeared since the prior refresh:
+  - q250 raw shadow remains `2` official rows since freeze, official PnL
+    `+0.04`;
+  - q1000 YES remains `1` official row since freeze, official PnL `+0.52`;
+  - q250 YES-only remains `0` rows / missing DB;
+  - BTC1H remains `8` official rows all time, `5` since-window rows with
+    official PnL `-0.46` and `1` since-window proxy/official mismatch.
+- Refreshed active ledger schema preflight at `2026-05-18T10:35:40Z`.
+  q250 raw, q1000 YES, and BTC1H ledgers still have stale 25-column schemas
+  with `0 / 12` required execution-realism columns. q250 YES-only DB is still
+  missing.
+- Refreshed BTC15M signal starvation at `2026-05-18T10:36:17Z`:
+  - q250 raw: `323437` post-freeze signal rows, `2` selected/order rows,
+    top blocker `h02_ttl_outside`, TTL-outside share `75.71%`;
+  - q1000 YES: `322618` post-freeze signal rows, `1` selected/order row,
+    top blocker `h02_ttl_outside`, TTL-outside share `77.84%`;
+  - q250 YES-only: `NOT_STARTED_MISSING_CAPTURE_DB`.
+  This is still collection diagnostics, not promotion evidence.
+- Refreshed basis and settlement diagnostics at `2026-05-18T10:36Z`.
+  The pattern remains: q250/q1000 NO-side rows concentrate adverse
+  proxy/official flips, YES-only rows are cleaner but sparse, and no
+  deployable settlement-basis guard exists (`model_rows = 131`, too few
+  samples/positives, no fresh preregistered guard evaluation).
+- Refreshed deployment readiness at `2026-05-18T10:37:09Z`.
+  `production_ready_count = 0` again, as expected.
+- Refreshed forward evidence and consistency at `2026-05-18T10:37:09Z`.
+  Forward consistency remains `0 / 4`:
+  - q250 raw and q1000 YES have paper/replay count agreement but are not
+    promotable because readiness, basis, sample-size, and stale-schema gates
+    fail;
+  - q250 YES-only is still not running/status missing;
+  - BTC1H remains blocked by negative since-window official PnL and
+    proxy/official mismatch.
+- Ran the guarded paper-shadow restart script in dry-run mode only:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1`.
+  It wrote
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_043744`
+  and explicitly reported: "Dry run only. No processes were stopped or
+  started." All four target scripts passed the dry-run script-safety check.
+- Refreshed restart authorization and GPT Pro action-status artifacts after
+  the dry run:
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`, created
+    `2026-05-18T10:37:53Z`, says the paper-shadow restart path is ready for
+    explicit user authorization but did not execute it;
+  - `backtest_outputs\btc_post_restart_collection_gate_latest_codex`, created
+    `2026-05-18T10:37:52Z`, remains `PENDING_CONTROLLED_RESTART` with `0`
+    post-restart official rows;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+    `2026-05-18T10:38:04Z`, still says `NO DEPLOY` and points at the latest
+    dry-run plan.
+- No new GPT Pro submission was warranted in this refresh. The fresh GPT Pro
+  review from `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_043034.md`
+  already answered the high-level strategy question, and the new evidence did
+  not change the blocker: the system still needs explicit paper-only
+  start/restart authorization before future rows can become promotion-usable.
+- Validation:
+  - `python -m py_compile` passed for the BTC15M/BTC1H official-settlement,
+    readiness, restart, action-status, replay/config-audit, and GPT packet
+    scripts relied on in this refresh;
+  - readiness returned the expected no-production-ready state.
+- Current conclusion remains no deploy. The shortest honest path toward a
+  deployable strategy is still to begin a clean paper-only forward collection
+  window, especially for q250 YES-only, while keeping q250 raw as basis-risk
+  control, q1000 YES as sparse control, and BTC1H observe-only.
+
+## 2026-05-18 resilient live-DuckDB read audit patch
+
+- Continued read-only evidence-quality work. No live deployment, canary,
+  process stop/start/restart, archive, migration, threshold retuning, or paper
+  trade execution was performed.
+- Problem found: `scripts\analyze_btc15m_shadow_signal_health.py` could mark a
+  running BTC15M capture DB unreadable when Windows/duckdb denied a direct
+  read-only open while the live writer had the file handle. This already made
+  q250 raw health weaker than it should be in one refresh, even though
+  `scripts\check_btc_forward_shadow_status.py` could read the same DB via a
+  safe temporary snapshot-copy fallback.
+- Patched `scripts\analyze_btc15m_shadow_signal_health.py`:
+  - try direct `duckdb.connect(..., read_only=True)` first;
+  - if that fails, copy the DB to a temporary directory and open the snapshot;
+  - record `capture_read_source`, `read_error`, and
+    `capture_snapshot_error` so future reports distinguish direct reads from
+    recovered snapshot reads;
+  - clean up temporary copies after the read.
+- Applied the same resilience pattern to
+  `scripts\build_btc15m_signal_starvation_report.py`, because it reads the same
+  live paper-shadow DuckDB captures and should not turn transient file-lock
+  timing into false evidence starvation/unreadability.
+- Validation after patch:
+  - `python -m py_compile scripts\analyze_btc15m_shadow_signal_health.py`
+    passed;
+  - `python -m py_compile scripts\build_btc15m_signal_starvation_report.py`
+    passed;
+  - `python scripts\analyze_btc15m_shadow_signal_health.py --out-dir
+    backtest_outputs\btc15m_shadow_signal_health_latest_codex --since-utc
+    2026-05-18T04:17:44Z` passed and now reads both running BTC15M shadows.
+    q250 raw shows `327109` post-freeze signal rows, `2` selected rows,
+    `2` order decisions, top detail family `h02_ttl_outside`, and
+    q250 YES-only remains `missing_capture_db`;
+  - `python scripts\build_btc15m_signal_starvation_report.py --out-dir
+    backtest_outputs\btc15m_signal_starvation_latest_codex --since-utc
+    2026-05-18T04:17:44Z` passed. q250 raw shows `328073` signal rows,
+    `2` selected/order rows, TTL-outside share `75.9938%`; q1000 YES shows
+    `327314` signal rows, `1` selected/order row, TTL-outside share
+    `78.0987%`; q250 YES-only remains not started.
+- Refreshed dependent artifacts after the patch:
+  - `backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex`, created
+    `2026-05-18T10:42:14Z`;
+  - `backtest_outputs\btc_kill_continue_latest_codex`, created
+    `2026-05-18T10:42:14Z`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T10:42:15Z`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+    `2026-05-18T10:42:15Z`.
+- Substantive verdict did not improve:
+  - forward consistency remains `0 / 4`;
+  - q250 raw and q1000 YES still have only `2` and `1` shadow official rows
+    respectively since freeze, and both are stale-schema diagnostics only;
+  - q250 YES-only is still the top next experiment but not running;
+  - BTC1H remains observe-only with negative since-window official PnL and
+    proxy/official mismatch;
+  - action status remains `NO DEPLOY`.
+- Current conclusion: this patch made the evidence layer more trustworthy but
+  did not make any strategy deployable. The next actual deployability step is
+  still explicit user authorization for the guarded paper-only restart/start,
+  after which only future official-settled rows with complete execution-realism
+  fields can count.
+
+## 2026-05-18 extended post-freeze replay through 10:46 UTC
+
+- Continued read-only BTC15M/BTC1H deployability work. No live deployment,
+  canary, process stop/start/restart, archive, migration, threshold retuning, or
+  paper-shadow execution was performed.
+- Extended frozen BTC15M post-freeze live-websocket replays from freeze
+  `2026-05-18T04:17:44Z` through the latest available BTC15M capture around
+  `2026-05-18T10:46Z`, using official REST settlement fills after replay:
+  - `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_latest_codex`
+    and
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_rest_official_latest_codex`:
+    q250 raw first-signal qty>=500 had `66` raw hits, `2` first signals, `2`
+    official rows, official PnL `0.00`, win rate `50%`, and `0`
+    proxy/official result mismatches;
+  - `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_latest_codex`
+    and
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_rest_official_latest_codex`:
+    q250 YES-only first-signal qty>=500 had `60` raw hits, `1` first signal,
+    `1` official row, official PnL `+0.50`, win rate `100%`, and `0`
+    proxy/official result mismatches;
+  - `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_latest_codex`
+    and
+    `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_rest_official_latest_codex`:
+    q1000 YES had `60` raw hits, `1` first signal, `1` official row,
+    official PnL `+0.50`, win rate `100%`, and `0` proxy/official result
+    mismatches.
+- Important interpretation: the replay extension from roughly `10:18Z` to
+  `10:46Z` added no new candidate trades for the frozen policies. The tiny
+  positive YES-only rows remain collection diagnostics only.
+- Refreshed forward status and official-settlement artifacts after the replay
+  extension:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T10:46:48Z`, found `4 / 5` monitored targets running. q250
+    raw and q1000 YES remained running; q250 YES-only was still not running.
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+    `2026-05-18T10:46:44Z`, found no new official-filled ledger rows. q250
+    raw still had `2` official rows since freeze with official PnL `+0.04`;
+    q1000 YES still had `1` official row with official PnL `+0.52`; BTC1H
+    still had `5` since-window official rows with official PnL `-0.46` and a
+    proxy/official mismatch.
+  - `backtest_outputs\btc15m_frozen_opportunity_rate_latest_codex`, created
+    `2026-05-18T10:46:40Z`, projected about `13.18` days to 100 rows at the
+    q250 raw post-freeze replay rate and about `26.7` days for q250 YES-only
+    or q1000 YES at the observed post-freeze replay rate.
+  - `backtest_outputs\btc_official_settlement_feature_table_latest_codex`
+    still had `0` promotion-usable rows.
+- Refreshed conservative gate artifacts again at `2026-05-18T10:49Z`:
+  - `backtest_outputs\deployment_readiness_latest_codex`:
+    `production_ready_count = 0` with the expected no-production-ready exit
+    state;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`: `NO DEPLOY`;
+  - `backtest_outputs\btc_kill_continue_latest_codex`: broad q-families stay
+    killed for deployment, q250 raw is continue-forward-only as a basis-risk
+    control, q250 YES-only is still preregistered but needs explicit
+    paper-start permission, q1000 YES is a sparse control, and BTC1H remains
+    observe-only;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`: `0 / 4`
+    candidates are consistent enough for promotion;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`: GPT Pro's
+    `NO DEPLOY` recommendation remains blocked locally by readiness,
+    post-restart collection, official-feature, basis, and stale-schema gates.
+- Rebuilt the GPT Pro packet with the refreshed evidence at
+  `gpt_pro_packets\strategy_advisor_20260518_044932`. No immediate second
+  GPT Pro submission was warranted because the latest evidence did not change
+  the strategic blocker already identified by
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_043034.md`: before
+  promotion discussion, we need explicit paper-only restart/start authorization
+  and future official-settled rows with complete execution-realism fields.
+- Validation:
+  - `python -m py_compile` passed for the BTC official-settlement, readiness,
+    restart/preflight, signal-health/starvation, basis, consistency, and GPT
+    packet scripts relied on in this refresh;
+  - readiness returned the expected no-production-ready state.
+- Current conclusion remains no deploy. The shortest honest path is not more
+  threshold search on this same window; it is a controlled paper-only forward
+  collection window, especially q250 YES-only, with q250 raw retained as a
+  basis-risk control, q1000 YES as a sparse control, and BTC1H observe-only.
+
+## 2026-05-18 10:55 UTC no-new-row continuation refresh
+
+- Continued toward BTC15M/BTC1H deployability under the active goal. No live
+  deployment, canary, live trading, paper-shadow execution, process
+  stop/start/restart, archive, migration, or threshold retuning was performed.
+- Re-checked process state at local `2026-05-18T04:52:29-06:00`.
+  The same `4 / 5` Python targets were running:
+  - `btc15m_live_capture.py`, PID `1724`;
+  - q250 raw paper shadow, PID `7052`;
+  - q1000 YES paper shadow, PID `24840`;
+  - BTC1H high-conf80 entry70 no-chase shadow, PID `16216`;
+  - q250 YES-only remained not running / missing capture DB.
+- Refreshed shadow status and official-settlement artifacts at
+  `2026-05-18T10:52Z`. No new official-filled shadow rows appeared:
+  - q250 raw shadow remains `2` official rows since freeze, official PnL
+    `+0.04`;
+  - q1000 YES remains `1` official row since freeze, official PnL `+0.52`;
+  - q250 YES-only remains `0` rows because it is not running;
+  - BTC1H remains `8` official rows all time and `5` since-window official
+    rows with official PnL `-0.46` and `1` since-window proxy/official
+    mismatch.
+- Refreshed active ledger schema, execution-realism, and post-restart gates:
+  - active q250 raw, q1000 YES, and BTC1H ledgers still have old 25-column
+    schemas with `0 / 12` required execution-realism fields;
+  - q250 YES-only DB is still missing;
+  - post-restart collection remains `PENDING_CONTROLLED_RESTART`, restart
+    executed `False`, and `0` post-restart official rows.
+- Refreshed restart preflight and authorization packet at
+  `2026-05-18T10:53Z`. The guarded paper-only restart/start path still passes
+  preflight for all four target shadows and is ready for explicit user
+  authorization, but the packet did not execute anything.
+- Refreshed BTC15M shadow signal-health/starvation diagnostics at
+  `2026-05-18T10:53Z`:
+  - q250 raw: `337811` post-freeze signal rows, `2` nonzero/selected rows,
+    TTL-outside share `76.0629%`, stale BTC signal share `8.3251%`;
+  - q1000 YES: `336956` post-freeze signal rows, `1` nonzero/selected row,
+    TTL-outside share `78.0876%`, stale BTC signal share `8.4156%`;
+  - q250 YES-only: `NOT_STARTED_MISSING_CAPTURE_DB`.
+  This remains a collection feasibility diagnostic, not a search result and
+  not permission to retune on this same live window.
+- Extended frozen post-freeze BTC15M live-WS replay from freeze
+  `2026-05-18T04:17:44Z` through capture end
+  `2026-05-18T10:53:52.585420Z`, then REST-filled official settlement:
+  - q250 raw first-signal qty>=500:
+    `66` raw hits, `2` first signals, `2` official rows, official PnL `0.00`,
+    win rate `50%`, `0` proxy/official mismatches;
+  - q250 YES-only first-signal qty>=500:
+    `60` raw hits, `1` first signal, `1` official row, official PnL `+0.50`,
+    win rate `100%`, `0` proxy/official mismatches;
+  - q1000 YES:
+    `60` raw hits, `1` first signal, `1` official row, official PnL `+0.50`,
+    win rate `100%`, `0` proxy/official mismatches.
+  The replay extension from `10:46Z` to `10:53:52Z` added no new selected
+  candidate rows.
+- Refreshed opportunity-rate diagnostics at `2026-05-18T10:54Z`:
+  - q250 raw projected about `13.48` days to reach 100 official post-freeze
+    replay rows at the current post-freeze rate;
+  - q250 YES-only and q1000 YES projected about `27.23` days to 100 official
+    post-freeze replay rows at the current post-freeze rate.
+  These projections are collection-planning diagnostics only.
+- Refreshed settlement-basis model feasibility at `2026-05-18T10:54Z`.
+  The basis guard remains diagnostic only: `model_rows = 131`, too few samples
+  and positives, weak/insufficient OOF metrics, and no preregistered fresh
+  forward guard evaluation.
+- Refreshed Predexon official coverage at `2026-05-18T10:54Z`.
+  Historical q250/q500/q1000-style rows remain partially REST-official covered,
+  with uncovered proxy-only rows and bad uncovered windows blocking deployment
+  use.
+- Refreshed conservative gates at `2026-05-18T10:55Z`:
+  - `backtest_outputs\deployment_readiness_latest_codex`:
+    `production_ready_count = 0`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`: `NO DEPLOY`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`: `0 / 4`
+    candidates consistent enough for promotion;
+  - `backtest_outputs\btc_kill_continue_latest_codex`: broad q-families killed
+    for deployment, q250 raw continue-forward-only as basis-risk control,
+    q250 YES-only preregistered paper start pending explicit permission,
+    q1000 YES sparse control, BTC1H observe-only;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`: GPT Pro's
+    `NO DEPLOY` and explicit paper-only restart/start recommendation remains
+    blocked locally until future official-settled, execution-realistic rows
+    exist.
+- Rebuilt the GPT Pro packet at
+  `gpt_pro_packets\strategy_advisor_20260518_045510`. A new GPT Pro submission
+  is not warranted yet because the fresh local evidence still matches the
+  saved GPT Pro answer in
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_20260518_043034.md`: no
+  deployment; collect clean post-restart paper-only evidence first.
+- Validation:
+  - `python -m py_compile` passed for the relied-on BTC official-settlement,
+    readiness, restart/preflight, signal-health/starvation, basis, consistency,
+    and GPT packet scripts;
+  - readiness returned the expected no-production-ready state.
+- Current conclusion remains no deploy. The only evidence-changing operational
+  path now is explicit user authorization for the guarded paper-only
+  restart/start. Without that, q250 YES-only cannot collect ledger evidence,
+  and running q250 raw/q1000 YES/BTC1H shadows remain stale-schema diagnostics.
+
+## 2026-05-18 BTC1H capture auditability sidecar patch
+
+- Continued toward BTC15M/BTC1H deployability without live deployment,
+  canary, live trading, paper-shadow execution, process stop/start/restart,
+  archive, migration, or threshold retuning.
+- Problem investigated: the latest forward-status/evidence reports still could
+  not inspect the running BTC1H high-conf80 entry70 no-chase capture DuckDB
+  while PID `16216` held the file. `check_btc_forward_shadow_status.py` already
+  had a snapshot-copy fallback, but both direct DuckDB read and ordinary/shared
+  file copy failed on Windows for
+  `~\.btc_kalshi_bot\btc_1hr_high_conf80_entry70_no_chase_shadow_capture.duckdb`.
+  The capture also had a live `.duckdb.wal` sidecar.
+- Implemented a future-facing lock-free audit sidecar in
+  `scripts\btc_1hr_research_live.py`:
+  - `LiveCaptureWriter` now writes
+    `<capture_db>.status.json` with capture DB path, PID, queue health, dropped
+    counts, rows-by-table, latest received timestamps by table, and
+    signal-scan summary fields;
+  - the sidecar is seeded from the capture DB when the writer starts and is
+    refreshed after flushes and on writer close/failure;
+  - this does not alter strategy thresholds or trading behavior. It only makes
+    future restarted BTC1H capture writers auditable when DuckDB itself is
+    locked to other processes.
+- Updated `scripts\check_btc_forward_shadow_status.py`:
+  - if direct read and snapshot copy both fail, it now falls back to
+    `<capture_db>.status.json` when present;
+  - the fallback populates capture-health rows/latest, top-book rows/latest,
+    signal-scan rows/latest/action/detail/nonzero-candidate rows, and order
+    decision rows;
+  - JSON sidecar loading accepts `utf-8-sig` so PowerShell-created test
+    artifacts with a BOM do not break diagnostics.
+- Added regression coverage in
+  `scripts\test_btc_forward_shadow_status.py` for sidecar parsing and the
+  missing/unreadable DB fallback path.
+- Validation:
+  - `python -m py_compile scripts\btc_1hr_research_live.py
+    scripts\check_btc_forward_shadow_status.py
+    scripts\test_btc_forward_shadow_status.py` passed;
+  - a manual sidecar smoke test printed
+    `sidecar_after_live_lock 7 1 ttl err=`;
+  - `python -m unittest scripts.test_btc_forward_shadow_status
+    scripts.test_btc_paper_restart_safety
+    scripts.test_btc_post_restart_verification -v` passed `8 / 8`;
+  - `python scripts\build_btc_shadow_restart_preflight.py --out-dir
+    backtest_outputs\btc_shadow_restart_preflight_latest_codex` still passed
+    all four target restart paths.
+- Important limitation: the currently running BTC1H shadow was started before
+  this patch, so it still has no sidecar and remains unreadable while its live
+  DuckDB is exclusively locked. The improvement becomes active only after an
+  explicit user-authorized paper-only restart/start.
+- Refreshed conservative artifacts after the patch:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T11:01:16Z`, still found `4 / 5` targets running and q250
+    YES-only not running;
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T11:02:17Z`, still had `production_ready_count = 0`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T11:02:17Z`, remained `NO DEPLOY`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T11:02:17Z`, remained `0 / 4`;
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`, created
+    `2026-05-18T11:02:19Z`, says the guarded paper-only restart/start path is
+    ready for explicit user authorization and points at dry-run plan
+    `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_050154`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, rerun
+    sequentially at `2026-05-18T11:02:44Z`, now points at that same latest
+    dry-run plan and remains `NO DEPLOY`.
+- Rebuilt the GPT Pro packet after the corrected action-status refresh:
+  `gpt_pro_packets\strategy_advisor_20260518_050250`.
+- No new GPT Pro submission was warranted. This was an audit-infrastructure
+  patch and did not change the strategy evidence or local blocker state.
+- Current conclusion remains no deploy. The repo is now better prepared for a
+  clean BTC1H paper evidence clock after explicit restart authorization, but no
+  BTC15M or BTC1H strategy has deployable evidence yet.
+
+## 2026-05-18 post-restart verifier sidecar gate
+
+- Continued evidence-infrastructure work toward BTC15M/BTC1H deployability.
+  No live deployment, canary, live trading, paper-shadow execution, process
+  stop/start/restart, archive, migration, or threshold retuning was performed.
+- Extended the BTC1H sidecar auditability patch into the post-restart verifier:
+  - `scripts\check_btc_forward_shadow_status.py` now exposes
+    `capture_sidecar_path`, `capture_sidecar_mtime_utc`,
+    `capture_sidecar_updated_at_utc`, and `capture_sidecar_error` whenever a
+    sidecar is present, even if the capture DB itself is directly readable;
+  - `scripts\build_btc_post_restart_verification.py` now marks the BTC1H
+    high-conf80 entry70 no-chase shadow as requiring a capture sidecar after
+    restart;
+  - the post-restart verifier now emits a
+    `required_capture_sidecars_ready` checklist row and per-target fields
+    `capture_sidecar_required`, `capture_sidecar_ready`,
+    `capture_sidecar_updated_at_utc`, and `capture_sidecar_error`;
+  - `evidence_clock_ready` now requires the BTC1H sidecar gate in addition to
+    restart execution, BTC15M capture continuity, target process liveness, and
+    active ledger schema readiness.
+- Refreshed `backtest_outputs\btc_post_restart_verification_latest_codex` after
+  rerunning `check_btc_forward_shadow_status.py`:
+  - restart executed remains `False`;
+  - evidence clock ready remains `False`;
+  - q250 YES-only is still not running;
+  - BTC1H sidecar required is `True` and sidecar ready is `False`, expected
+    because the current BTC1H process predates the sidecar writer patch;
+  - active ledger schemas still fail with `0 / 12` execution-realism fields.
+- Refreshed conservative artifacts:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T11:06:14Z`, still found `4 / 5` targets running;
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T11:06:08Z`, still had `production_ready_count = 0`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`, created
+    `2026-05-18T11:06:24Z`, remained `NO DEPLOY`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+    `2026-05-18T11:06:38Z`, still says the only ready operational path is
+    explicit user authorization for the guarded paper-only restart/start.
+- Validation:
+  - `python -m py_compile scripts\btc_1hr_research_live.py
+    scripts\check_btc_forward_shadow_status.py
+    scripts\build_btc_post_restart_verification.py
+    scripts\test_btc_forward_shadow_status.py
+    scripts\test_btc_post_restart_verification.py` passed;
+  - `python -m unittest scripts.test_btc_forward_shadow_status
+    scripts.test_btc_post_restart_verification
+    scripts.test_btc_paper_restart_safety -v` passed `8 / 8`;
+  - readiness returned the expected no-production-ready state.
+- Rebuilt the GPT Pro packet at
+  `gpt_pro_packets\strategy_advisor_20260518_050646`.
+- No new GPT Pro submission was warranted. This patch clarifies the future
+  evidence-clock gate but does not change the strategy ranking or deployment
+  evidence: no BTC15M or BTC1H strategy is deployable yet.
+
+## 2026-05-18 paper-vs-replay row reconciliation gate
+
+- Added a row-level forward reconciliation control artifact:
+  `scripts\build_btc_forward_row_reconciliation.py`.
+  This is a deployment-control check, not a strategy search. It reconciles
+  paper-shadow official rows against causal live-WS replay rows by market,
+  side, occurrence, entry price, official result, actual-fee PnL, and
+  decision-time proximity. It also reports the 2c stressed replay PnL delta
+  separately so stressed replay accounting is not confused with paper ledger
+  actual-fee accounting.
+- Added regression coverage in
+  `scripts\test_btc_forward_row_reconciliation.py` for:
+  - a matching paper/replay row where actual-fee PnL agrees but the extra 2c
+    stress layer differs as expected;
+  - a replay-only q250 YES row with no fresh paper-shadow ledger row, which
+    must block promotion evidence.
+- Refreshed
+  `backtest_outputs\btc_forward_row_reconciliation_latest_codex`, created
+  `2026-05-18T11:16:58Z`:
+  - `q250_firstskip_qty500`: 2 paper rows, 2 replay rows, 2 matched rows,
+    actual-fee official PnL reconciles at `+0.04`, but promotion evidence is
+    blocked by missing paper ledger execution fields and only 2 official rows;
+  - `q1000_yes`: 1 paper row, 1 replay row, 1 matched row, actual-fee official
+    PnL reconciles at `+0.52`, but promotion evidence is blocked by missing
+    paper ledger execution fields and only 1 official row;
+  - `q250_firstskip_qty500_yes`: 0 paper rows, 1 replay row, so the fresh
+    YES-only candidate remains a preregistered paper-start path only, not
+    evidence;
+  - `btc1h_high_conf80_entry70_no_chase`: no causal replay comparator is
+    available for the current since-freeze paper rows.
+- Validation:
+  - `python -m py_compile scripts\build_btc_forward_row_reconciliation.py
+    scripts\test_btc_forward_row_reconciliation.py
+    scripts\build_gpt_pro_strategy_packet.py` passed using a temporary
+    repo-local `PYTHONPYCACHEPREFIX` because the default Windows pycache path
+    hit a transient permission error;
+  - `python -m unittest scripts.test_btc_forward_row_reconciliation -v`
+    passed `2 / 2`.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future Pro packets
+  include the row-reconciliation artifact and summary/details CSVs.
+- Rebuilt the current GPT Pro packet after this update:
+  `gpt_pro_packets\strategy_advisor_20260518_051901`.
+- No live deployment, canary, restart/start/stop, paper-shadow authorization,
+  threshold retuning, or new GPT Pro submission was performed. This closes one
+  auditability gap but does not change the deployment verdict: no BTC15M or
+  BTC1H strategy is deployable yet.
+
+## 2026-05-18 row-reconciliation gate wiring
+
+- Promoted the new paper-vs-live-replay row reconciliation from a standalone
+  diagnostic into the conservative gate stack. No live deployment, canary,
+  process stop/start/restart, paper-shadow authorization, migration, or
+  threshold retuning was performed.
+- Updated `scripts\check_btc_deployment_readiness.py`:
+  - discovers latest `btc_forward_row_reconciliation_*`;
+  - adds row-reconciliation status/pass/promotion-usable/matched-row fields to
+    focused candidate readiness rows;
+  - forces production readiness false when per-row reconciliation is missing,
+    not passing, or not promotion-usable.
+- Updated `scripts\build_btc_forward_consistency_audit.py`:
+  - reads `btc_forward_row_reconciliation_latest_codex`;
+  - includes row-reconciliation fields in `forward_consistency_summary.csv`;
+  - adds explicit blockers such as
+    `paper_replay_row_reconciliation_not_promotion_usable` and
+    `row_reconciliation_no_paper_shadow_rows_since_freeze`.
+- Updated `scripts\build_btc_gpt_pro_action_status.py`:
+  - adds a `paper_replay_row_reconciliation` checklist row;
+  - exposes candidate-level row reconciliation status/blockers;
+  - keeps `deployable_now` false unless the row reconciliation is
+    promotion-usable.
+- Added regression coverage in
+  `scripts\test_btc_readiness_row_reconciliation.py` proving that a focused
+  candidate with matching paper/replay rows is still blocked when the row is
+  not promotion-usable.
+- Validation:
+  - `python -m py_compile scripts\check_btc_deployment_readiness.py
+    scripts\build_btc_gpt_pro_action_status.py
+    scripts\build_btc_forward_consistency_audit.py
+    scripts\test_btc_readiness_row_reconciliation.py
+    scripts\test_btc_forward_row_reconciliation.py
+    scripts\test_btc_forward_replay_realism.py` passed using a temporary
+    repo-local `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_forward_replay_realism -v` passed `5 / 5`.
+- Refreshed artifacts after wiring:
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T11:24:18Z`, still has `production_ready_count = 0` and now
+    points at `row_reconciliation_dir =
+    backtest_outputs\btc_forward_row_reconciliation_latest_codex`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T11:24:52Z`, remains `0 / 4` consistent enough for promotion
+    and now lists row-reconciliation blockers for every focused candidate;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+    `2026-05-18T11:24:54Z`, includes
+    `paper_replay_row_reconciliation = BLOCKS_DEPLOYMENT` with
+    `row_reconciliation_pass=2` but `promotion_usable=0`;
+  - `backtest_outputs\btc_kill_continue_latest_codex`, created
+    `2026-05-18T11:24:50Z`, remains `NO DEPLOY` / research-control only;
+  - latest GPT Pro packet rebuilt at
+    `gpt_pro_packets\strategy_advisor_20260518_052708`.
+- Current evidence:
+  - q250 raw and q1000 YES have row-level paper/replay matches, but neither is
+    promotion-usable because active paper ledgers still lack execution-realism
+    fields and samples are only 2 and 1 official rows respectively;
+  - q250 YES-only still has replay-only evidence but no paper-shadow row;
+  - BTC1H still has no causal replay comparator and remains observe-only.
+- Final read-only refresh after the gate wiring:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T11:26:34Z`, still shows `4 / 5` targets running and q250
+    YES-only not running;
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+    `2026-05-18T11:26:37Z`, still has q250 raw 2 official rows `+0.04`,
+    q1000 YES 1 official row `+0.52`, q250 YES-only 0 rows, and BTC1H
+    since-window official PnL `-0.46` with 1 proxy/official mismatch;
+  - `backtest_outputs\btc_forward_row_reconciliation_latest_codex`, created
+    `2026-05-18T11:26:38Z`, still has `row_reconciliation_pass=2` but
+    `promotion_usable=0`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+    `2026-05-18T11:26:45Z`, keeps `NO DEPLOY`.
+- Conclusion remains unchanged and sharper: aggregate replay/paper count
+  agreement is no longer enough anywhere in the gate stack. No BTC15M or BTC1H
+  strategy is deployable.
+
+## 2026-05-18 BTC1H replay coverage audit
+
+- Added `scripts\build_btc1h_replay_coverage_audit.py`, a read-only coverage
+  diagnostic for BTC1H paper-shadow rows. It does not replay, tune, trade, or
+  promote. It checks whether readable local capture DBs contain both
+  `ws_orderbook_top` and `signal_scan` rows around each BTC1H paper fill, which
+  is the prerequisite for a causal BTC1H paper-vs-replay comparator.
+- Added `scripts\test_btc1h_replay_coverage_audit.py` covering:
+  - a row with readable top-of-book and signal-scan coverage;
+  - a missing-capture row that must not be considered replayable.
+- Ran the audit at
+  `backtest_outputs\btc1h_replay_coverage_audit_latest_codex`, created
+  `2026-05-18T11:35:57Z`:
+  - all BTC1H official paper rows: 8 total, 3 replayable from readable capture,
+    5 blocked by the locked active BTC1H shadow capture DB;
+  - since-freeze rows: 3 total, 0 replayable, 3 blocked by the locked active
+    BTC1H shadow capture DB;
+  - replayable older rows come from `research_live_capture`;
+  - since-freeze rows require a readable sidecar, snapshot, or explicit
+    user-authorized restart/start before row-level BTC1H replay reconciliation
+    can become promotion-grade.
+- Updated `scripts\build_btc_gpt_pro_action_status.py`:
+  - added a `btc1h_replay_coverage` checklist row;
+  - latest action status now reports
+    `since_replayable_rows=0/3`, `locked_blocked_rows=3`, and
+    `coverage_gate_pass=False`.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future GPT Pro packets
+  include the BTC1H replay coverage report and CSVs.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_coverage_audit.py
+    scripts\test_btc1h_replay_coverage_audit.py
+    scripts\build_btc_gpt_pro_action_status.py
+    scripts\build_gpt_pro_strategy_packet.py` passed using temporary
+    repo-local `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc1h_replay_coverage_audit -v` passed
+    `2 / 2`.
+- Refreshed `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+  `2026-05-18T11:37:06Z`, and rebuilt GPT Pro packet
+  `gpt_pro_packets\strategy_advisor_20260518_053742`.
+- No live deployment, canary, process stop/start/restart, migration,
+  paper-shadow authorization, or threshold retuning was performed. BTC1H
+  remains observe-only and is now blocked on a precise replay-coverage gate in
+  addition to negative since-window official PnL, proxy/official mismatch, and
+  stale/missing ledger execution fields.
+
+## 2026-05-18 fresh GPT Pro loop and drawdown sequence gate
+
+- Built and submitted a fresh GPT Pro strategy packet through the Chrome
+  ChatGPT Pro session:
+  `gpt_pro_packets\strategy_advisor_20260518_054359`.
+  The response was saved at
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_fresh_chrome_20260518_054359.md`.
+- GPT Pro's refreshed verdict matched the local gates:
+  - nothing is deployable now: not BTC15M, not BTC1H, not a canary, and not a
+    small-size exception;
+  - top path remains BTC15M q250 YES-only first-signal qty>=500, but it has
+    0 paper rows and is not running;
+  - q1000 YES remains a sparse cleaner YES control;
+  - q250 raw remains a side/basis decomposition control, not a deployable
+    strategy;
+  - BTC1H remains observe-only because since-window official PnL is negative,
+    proxy/official settlement disagrees, and since-freeze replay coverage is
+    blocked.
+- Refreshed local state after the Pro packet:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`, created
+    `2026-05-18T11:43:03Z`, still shows 4/5 targets running:
+    BTC15M capture, q250 raw shadow, q1000 YES shadow, and BTC1H shadow.
+    q250 YES-only is still not running.
+  - `backtest_outputs\btc_shadow_official_settlement_latest_codex`, created
+    `2026-05-18T11:43:00Z`, has q250 raw 2 official rows `+0.04`,
+    q1000 YES 1 official row `+0.52`, q250 YES-only 0 rows, and BTC1H
+    since-window official PnL `-0.46` with 1 proxy/official mismatch. A newer
+    BTC1H row was active/unsettled and did not improve deployability.
+  - `backtest_outputs\deployment_readiness_latest_codex`, created
+    `2026-05-18T11:43:47Z`, still has `production_ready_count = 0`.
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`, created
+    `2026-05-18T11:43:47Z`, remains `0 / 4` consistent enough for promotion.
+- Added `scripts\build_btc_drawdown_sequence_audit.py`, a read-only official
+  PnL path-quality artifact. It emits:
+  - `drawdown_sequence_summary.csv`;
+  - `drawdown_sequence_details.csv`;
+  - row-level official PnL, cumulative PnL, running peak, and drawdown.
+  This closes the Pro-identified gap where summary PnL could hide an ugly
+  return path.
+- Added `scripts\test_btc_drawdown_sequence_audit.py` covering:
+  - cumulative/peak/drawdown sequencing in timestamp order;
+  - blocking the promotion window when a controlled restart has not executed.
+- Refreshed
+  `backtest_outputs\btc_drawdown_sequence_audit_latest_codex`, created
+  `2026-05-18T11:59:31Z`:
+  - all post-restart promotion windows are `PENDING_CONTROLLED_RESTART`;
+  - q250 raw diagnostic rows remain only 2 official rows, `+0.04` PnL;
+  - q1000 YES diagnostic rows remain only 1 official row, `+0.52` PnL;
+  - q250 YES-only has 0 official rows;
+  - BTC1H all-current diagnostic official PnL is `+0.44`, but max drawdown is
+    `-1.08` with 2 proxy/official mismatches, so summary PnL is misleading;
+  - BTC1H since-freeze diagnostic official PnL is `-1.08`, max drawdown
+    `-0.67`, with 1 proxy/official mismatch.
+- Updated `scripts\build_btc_gpt_pro_action_status.py`:
+  - added `official_drawdown_sequence_gate = BLOCKS_DEPLOYMENT`;
+  - latest action status
+    `backtest_outputs\btc_gpt_pro_action_status_latest_codex`, created
+    `2026-05-18T11:59:41Z`, now reports
+    `post_restart_drawdown_gate_pass=0` and all post-restart drawdown scopes as
+    `PENDING_CONTROLLED_RESTART`.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future Pro packets
+  include drawdown sequence summary/details; rebuilt packets at
+  `gpt_pro_packets\strategy_advisor_20260518_055940` and, after this ledger
+  entry, `gpt_pro_packets\strategy_advisor_20260518_060032`.
+- Updated the reusable `kalshi-btc-strategy-research` skill and its
+  deployability reference so future runs include the drawdown sequence audit by
+  default.
+- Validation:
+  - Python compile passed for the new drawdown audit/test plus updated
+    action-status and packet scripts using repo-local `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc_drawdown_sequence_audit
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc1h_replay_coverage_audit
+    scripts.test_btc_paper_restart_safety -v` passed `11 / 11`.
+- No live deployment, canary, live trading, process stop/start/restart,
+  archive, migration, paper-shadow authorization, or threshold retuning was
+  performed. The only operational path now ready is still explicit user
+  authorization for the guarded paper-only restart/start:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1 -Execute -IUnderstandThisRestartsPaperShadows`.
+
+## 2026-05-18 sequential evidence-stack refresh controller
+
+- Current-process audit before this work still found exactly four matching
+  Python processes:
+  - BTC15M capture: `scripts\btc15m_live_capture.py`, PID 1724;
+  - BTC15M q250 raw paper shadow:
+    `scripts\btc15m_f2_q250_qty500_firstskip_shadow.py`, PID 7052;
+  - BTC15M q1000 YES paper shadow:
+    `scripts\btc15m_f2_q1000_yes_shadow.py`, PID 24840;
+  - BTC1H high-conf80 entry70 no-chase paper shadow:
+    `scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID 16216.
+  q250 YES-only is still not running.
+- A parallel manual refresh exposed an evidence-hygiene race: the BTC1H row
+  `KXBTCD-26MAY1808-T77399.99` became REST-official/determined, but
+  `build_btc_execution_realism_audit.py` read
+  `shadow_official_trades.csv` before
+  `check_btc_shadow_official_settlement.py` finished rewriting it. That made
+  execution-realism show the row as pending while the official-settlement
+  summary counted it as official.
+- Added `scripts\refresh_btc_evidence_stack.py`, a read-only sequential
+  controller that runs dependent deployability artifacts in dependency order.
+  It explicitly runs `check_btc_shadow_official_settlement.py` before
+  execution-realism, post-restart collection, drawdown sequence,
+  row-reconciliation, official feature table, readiness, consistency, and GPT
+  Pro action-status builders.
+- Added `scripts\test_btc_evidence_stack_refresh.py` covering:
+  - official settlement runs before every dependent artifact;
+  - readiness exit code `1` is expected only for the readiness step;
+  - the controller uses the current Python executable and can skip packet
+    rebuilds when requested.
+- Ran the sequential controller:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - 18/18 steps passed;
+  - readiness returned exit code `1`, accepted as the expected
+    no-production-ready state;
+  - the run info says this was a sequential read-only refresh and did not
+    start, stop, restart, archive, migrate, trade, deploy, or tune thresholds.
+- The race is now gone in latest artifacts:
+  - `backtest_outputs\btc_execution_realism_audit_latest_codex` now shows
+    BTC1H rows `9`, official rows `9`, official PnL `+0.72`, and pending
+    official rows `0`;
+  - BTC1H still fails execution-realism for the real blocker:
+    missing ledger execution fields, quote age/top visible quantity, and
+    side-ask reconciliation fields.
+- Latest official settlement after ordered refresh:
+  - q250 raw: 2 official rows, official PnL `+0.04`;
+  - q1000 YES: 1 official row, official PnL `+0.52`;
+  - q250 YES-only: 0 official rows and still not running;
+  - BTC1H: 9 official rows all-time, official PnL `+0.72`; since window has
+    6 official rows, official PnL `-0.18`, and still includes a proxy/official
+    mismatch.
+- Latest forward consistency remains `0 / 4`:
+  - q250 raw and q1000 YES have paper/replay count agreement but are not
+    promotion-usable;
+  - q250 YES-only is not running and has no paper-shadow rows;
+  - BTC1H is blocked by proxy/official mismatch and no causal replay
+    comparator for since-freeze rows.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so future Pro packets
+  include the sequential refresh artifact.
+  Latest packet:
+  `gpt_pro_packets\strategy_advisor_20260518_060724`.
+- Updated the reusable `kalshi-btc-strategy-research` skill and its
+  deployability reference to prefer the sequential refresh controller and to
+  warn against parallel refreshes of artifacts that depend on REST-official
+  settlement output.
+- Validation:
+  - Python compile passed for `scripts\refresh_btc_evidence_stack.py`,
+    `scripts\test_btc_evidence_stack_refresh.py`, and
+    `scripts\build_gpt_pro_strategy_packet.py`;
+  - `python -m unittest scripts.test_btc_evidence_stack_refresh
+    scripts.test_btc_drawdown_sequence_audit
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc1h_replay_coverage_audit
+    scripts.test_btc_paper_restart_safety -v` passed `14 / 14`.
+- Deployment conclusion remains unchanged: no BTC15M or BTC1H strategy is
+  deployable; no live deployment, canary, process stop/start/restart, archive,
+  migration, paper-shadow authorization, or threshold retuning was performed.
+
+## 2026-05-18 expanded evidence-stack refresh and current BTC15M/BTC1H state
+
+- Extended `scripts\refresh_btc_evidence_stack.py` from the original core
+  refresh into the full ordered evidence refresh. It now also refreshes BTC15M
+  shadow signal health, signal starvation, frozen opportunity rate, the next
+  forward candidate packet, Predexon official-coverage diagnostics, BTC1H replay
+  coverage, and post-restart verification before rebuilding the GPT Pro packet.
+- Added a narrow output-directory cleanup to the controller so reused
+  `*_latest_codex` folders do not retain stale numbered logs from older,
+  shorter step lists. The cleanup removes only this controller's prior
+  `NN_*.log`, `refresh_steps.json`, `run_info.json`, and `report.md` files.
+- Added/updated regression coverage in `scripts\test_btc_evidence_stack_refresh.py`:
+  - collection diagnostics run before summaries and packet generation;
+  - dependent artifacts still run after REST-official settlement;
+  - reused output directories keep unrelated evidence files while removing old
+    controller metadata/logs.
+- Updated the reusable `kalshi-btc-strategy-research` skill and its
+  deployability reference so future sessions prefer the expanded controller,
+  preserve the 25-step manual dependency order when needed, and remember the
+  current q250 YES-only / q250 raw / q1000 YES / BTC1H roles.
+- Reran the expanded controller:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T12:25:26Z` to `2026-05-18T12:30:24Z`;
+  - 25/25 steps passed;
+  - readiness returned exit code `1`, accepted as the expected
+    no-production-ready state;
+  - latest packet rebuilt at `gpt_pro_packets\strategy_advisor_20260518_063021`;
+  - the output folder now contains only the current 25 numbered step logs plus
+    current metadata/report files.
+- Latest process audit still found exactly four matching Python processes and
+  no q250 YES-only process:
+  - BTC15M capture `scripts\btc15m_live_capture.py`, PID 1724;
+  - BTC15M q250 raw paper shadow
+    `scripts\btc15m_f2_q250_qty500_firstskip_shadow.py`, PID 7052;
+  - BTC15M q1000 YES paper shadow
+    `scripts\btc15m_f2_q1000_yes_shadow.py`, PID 24840;
+  - BTC1H high-conf80 entry70 no-chase paper shadow
+    `scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py`, PID 16216.
+- Latest GPT Pro action-status gates remain hard-blocked:
+  - readiness production-ready count: `0`;
+  - forward consistency count: `0`;
+  - row reconciliation has `2` passing matches but `0` promotion-usable rows;
+  - canonical official feature table has `0` promotion-usable rows;
+  - post-restart collection and drawdown gates are
+    `PENDING_CONTROLLED_RESTART`;
+  - deployable settlement-basis guards: `0`;
+  - BTC1H since-freeze replay coverage: `0 / 4` replayable rows, all 4 blocked
+    by locked capture coverage.
+- BTC15M collection diagnostics:
+  - q250 raw had `405,051` signal rows since the freeze but only `2` selected
+    rows; it is running, but its active ledger schema still lacks execution
+    realism fields, so evidence is not promotion-usable.
+  - q1000 YES had `405,174` signal rows since the freeze but only `1` selected
+    row; it is also running with stale execution-realism schema.
+  - q250 YES-only remains the top next forward candidate, but its capture DB is
+    missing, it is not running, and it has `0` paper-shadow rows.
+  - The dominant BTC15M non-trade reason is still TTL outside the 10-12 minute
+    window, around `76.8%` for q250 raw and `78.4%` for q1000 YES.
+- BTC15M frozen opportunity diagnostics:
+  - q250 raw post-freeze replay has `2` official rows, `0.0` 2c-stressed PnL,
+    and `50%` win rate, but remains `not_usable_ledger_schema_stale`;
+  - q1000 YES post-freeze replay has `1` official row, `+0.50` 2c-stressed PnL,
+    and `100%` win rate, but remains `not_usable_ledger_schema_stale`;
+  - q250 YES-only post-freeze replay has `1` diagnostic official row with
+    `+0.50`, but because the shadow is not running this row is replay-only and
+    cannot count.
+- Predexon official-coverage diagnostics remain research-only:
+  - q250 firstskip qty>=500 has `57 / 63` REST-official rows and official PnL
+    `+8.72`, but is blocked by partial official coverage, uncovered proxy-only
+    rows, negative uncovered proxy PnL, and bad uncovered windows;
+  - q1000 YES has `23 / 33` REST-official rows and official PnL `+6.45`, but is
+    blocked by too few REST-official Predexon rows, partial coverage, proxy-only
+    uncovered rows, and bad uncovered windows.
+- BTC1H remains observe-only:
+  - official settlement summary has `9` official rows all-time with PnL `+0.72`;
+  - since-window BTC1H has `6` official rows with PnL `-0.18` and one
+    proxy/official mismatch;
+  - replay coverage has `3 / 9` replayable rows all-time and `0 / 4` replayable
+    rows since-freeze because the relevant active capture rows are locked.
+- Post-restart verification remains pending:
+  - no authorized controlled restart/start has executed;
+  - q250 raw, q1000 YES, and BTC1H active ledgers still fail the deployable
+    schema check for missing execution-realism columns;
+  - q250 YES-only is missing its DB and is not running;
+  - the guarded restart/start path is ready for explicit user authorization, but
+    this ledger entry and the current goal continuation do not authorize it.
+- Validation:
+  - Python compile passed for `scripts\refresh_btc_evidence_stack.py`,
+    `scripts\test_btc_evidence_stack_refresh.py`,
+    `scripts\build_gpt_pro_strategy_packet.py`,
+    `scripts\build_btc_gpt_pro_action_status.py`,
+    `scripts\build_btc_drawdown_sequence_audit.py`, and
+    `scripts\test_btc_drawdown_sequence_audit.py` using repo-local
+    `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc_evidence_stack_refresh
+    scripts.test_btc_drawdown_sequence_audit
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc1h_replay_coverage_audit
+    scripts.test_btc_paper_restart_safety -v` passed `16 / 16`.
+- Deployment conclusion: still no deployable BTC15M or BTC1H strategy. GPT Pro
+  does not need another submission for this refresh because the expanded
+  evidence stack confirms the same high-level plan: prepare q250 YES-only as the
+  top paper-only forward path only after explicit controlled start/restart
+  authorization, keep q1000 YES as a sparse control, keep q250 raw as a
+  basis/side diagnostic, and leave BTC1H observe-only until replay coverage and
+  official-settlement behavior improve.
+
+## 2026-05-18 wrapper hardening for frozen BTC15M forward paths
+
+- Re-checked process state before this work. The same four Python processes were
+  running: BTC15M capture, q250 raw paper shadow, q1000 YES paper shadow, and
+  BTC1H high-conf80 entry70 no-chase paper shadow. q250 YES-only was still not
+  running. No process was stopped, started, restarted, archived, migrated, or
+  deployed.
+- Reviewed the REST-official Predexon fill/grid artifacts:
+  - `backtest_outputs\btc15m_predexon_rest_official_latest_codex` already
+    contains a REST fill for the combined Predexon materialized rows, with
+    `374` REST-official tickers from `880` unique tickers.
+  - `backtest_outputs\btc15m_materialized_filter_grid_pred_official_latest_codex`
+    still ranks q250 first-signal qty>=500 as research-positive on the
+    REST-official subset: `57` Predexon official rows, `+8.72` PnL, `64.9%`
+    win rate, max drawdown `-1.97`, Sharpe `2.33`; old live official replay
+    has `17` rows, `+4.30`, `76.5%` win rate.
+  - This does not change deployability because official coverage is partial,
+    old live replay was seen before the current freeze, and no future
+    promotion-grade q250 YES-only paper rows exist.
+- Found and fixed a wrapper exactness risk: focused BTC15M frozen wrappers used
+  `os.environ.setdefault(...)`, so a polluted parent shell could silently
+  override preregistered settings. This is unacceptable for future paper-shadow
+  evidence clocks because the row could be collected under a different policy.
+- Hardened the focused paper wrappers to hard-set their frozen environment
+  values before launching `btc15m_lowdd_live.py`:
+  - `scripts\btc15m_f2_q250_qty500_firstskip_yes_shadow.py`
+  - `scripts\btc15m_f2_q250_qty500_firstskip_shadow.py`
+  - `scripts\btc15m_f2_q1000_yes_shadow.py`
+- Added regression coverage in `scripts\test_btc15m_shadow_config.py` proving
+  the q250 YES-only wrapper overrides polluted environment variables and still
+  launches `btc15m_lowdd_live.py` in paper mode with strategy `h02`, allowed
+  side `yes`, base visible quantity `250`, first-signal visible quantity `500`,
+  entry max `0.50`, and one-contract sizing.
+- Reran the full ordered evidence refresh after the wrapper hardening:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T12:40:22Z` to `2026-05-18T12:47:40Z`;
+  - 25/25 steps passed;
+  - readiness returned exit code `1`, still expected for no production-ready
+    candidates;
+  - latest GPT Pro packet rebuilt at
+    `gpt_pro_packets\strategy_advisor_20260518_064736`.
+- Latest gate state after hardening remains:
+  - readiness production-ready count `0`;
+  - forward consistency count `0`;
+  - row reconciliation `2` passing matches but `0` promotion-usable rows;
+  - canonical official feature table `0` promotion-usable rows;
+  - post-restart collection and drawdown gates pending controlled restart;
+  - settlement-basis deployable guards `0`;
+  - BTC1H since-freeze replay coverage `0 / 4`.
+- Latest restart authorization packet still says all four paper-shadow targets
+  are ready for explicit user authorization, including q250 YES-only as
+  `READY_FOR_USER_AUTHORIZATION_TO_START`, but it did not execute anything and
+  still requires explicit user permission.
+- Validation:
+  - Python compile passed for the hardened wrappers, wrapper tests, evidence
+    refresh controller, evidence refresh tests, GPT Pro packet builder, and GPT
+    Pro action-status builder using repo-local `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc15m_shadow_config
+    scripts.test_btc_evidence_stack_refresh
+    scripts.test_btc_drawdown_sequence_audit
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc1h_replay_coverage_audit
+    scripts.test_btc_paper_restart_safety -v` passed `25 / 25`.
+- Deployment conclusion remains unchanged: no BTC15M or BTC1H strategy is
+  deployable. This work only makes the future q250 YES-only / q250 raw / q1000
+  YES paper-shadow evidence clock harder to contaminate once an explicit
+  controlled paper-only start/restart is authorized.
+
+## 2026-05-18 BTC1H replay coverage snapshot fallback audit
+
+- Re-checked process state before this work. The same four Python processes were
+  running: BTC15M capture, q250 raw paper shadow, q1000 YES paper shadow, and
+  BTC1H high-conf80 entry70 no-chase paper shadow. q250 YES-only was still not
+  running. No process was stopped, started, restarted, archived, migrated, or
+  deployed.
+- The current GPT Pro action checklist still had BTC1H blocked by replay
+  coverage: since-freeze replayable rows `0 / 4`, all blocked by locked active
+  capture coverage. After a new BTC1H paper row settled during this work, the
+  blocker became `0 / 5`.
+- Added a conservative snapshot fallback to
+  `scripts\build_btc1h_replay_coverage_audit.py`:
+  - first try live DuckDB read-only access;
+  - if read-only access fails, copy the `.duckdb` file and matching `.wal`
+    into a temporary directory and probe the copied snapshot;
+  - annotate successful snapshot probes with
+    `best_capture_read_source = snapshot_copy_after_live_read_failure`;
+  - keep failed live/snapshot errors in `btc1h_replay_coverage_sources.csv`.
+- Added regression coverage in `scripts\test_btc1h_replay_coverage_audit.py`
+  proving a simulated Windows-style locked capture can become replayable when a
+  snapshot copy is possible. Existing missing-capture and readable-capture tests
+  still pass.
+- Ran the BTC1H coverage audit directly and then through the full evidence
+  refresh. The real active BTC1H capture still did not become usable:
+  - all BTC1H paper rows: `10` rows, `3` replayable, `7` locked-blocked;
+  - since-freeze rows: `5` rows, `0` replayable, `5` locked-blocked;
+  - the active capture error is still the live Python process lock, and the
+    snapshot fallback also fails with Windows `PermissionError 32` while PID
+    `16216` owns the file.
+- Reran the full ordered evidence refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T12:58:38Z` to `2026-05-18T13:04:59Z`;
+  - 25/25 steps passed;
+  - readiness returned exit code `1`, still expected for no production-ready
+    candidates;
+  - latest GPT Pro packet rebuilt at
+    `gpt_pro_packets\strategy_advisor_20260518_070456`.
+- Latest gates remain blocked:
+  - readiness production-ready count `0`;
+  - forward consistency count `0`;
+  - row reconciliation `2` passing matches but `0` promotion-usable rows;
+  - canonical official feature table `0` promotion-usable rows;
+  - post-restart collection and drawdown gates pending controlled restart;
+  - deployable settlement-basis guards `0`;
+  - BTC1H since-freeze replay coverage `0 / 5`.
+- Validation:
+  - Python compile passed for the BTC1H replay coverage audit/test, refresh
+    controller, GPT Pro packet builder, and GPT Pro action-status builder using
+    repo-local `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc1h_replay_coverage_audit
+    scripts.test_btc15m_shadow_config
+    scripts.test_btc_evidence_stack_refresh
+    scripts.test_btc_drawdown_sequence_audit
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc_paper_restart_safety -v` passed `26 / 26`.
+- Deployment conclusion remains unchanged: BTC1H is not closer to promotion from
+  current live state. The snapshot fallback is useful for future readable
+  snapshots, but this active process still requires a status sidecar or an
+  explicit controlled paper-only restart/start before row-level BTC1H replay
+  reconciliation can count.
+
+## 2026-05-18 BTC15M q250 YES-only replay refresh and first-signal semantics audit
+
+- Re-checked process state before and after this work. The same four Python
+  processes were running: BTC15M live capture PID `1724`, q250 first-skip paper
+  shadow PID `7052`, q1000 YES paper shadow PID `24840`, and BTC1H
+  high-conf80 entry70 no-chase paper shadow PID `16216`. q250 YES-only is still
+  not running. No process was stopped, started, restarted, archived, migrated,
+  deployed, or traded.
+- Refreshed the exact frozen BTC15M post-freeze live websocket replays against
+  the active BTC15M capture from freeze `2026-05-18T04:17:44Z` through roughly
+  `2026-05-18T13:17Z`, then REST-filled official Kalshi settlements:
+  - q250 raw first-signal qty>=500:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_latest_codex`
+    and REST fill
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_postfreeze_rest_official_latest_codex`;
+    `66` raw hits, `2` first signals, `2` official rows, official 2c PnL
+    `$0.00`, win rate `50%`, `0` proxy/official mismatches.
+  - q250 YES-only first-signal qty>=500:
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_latest_codex`
+    and REST fill
+    `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_rest_official_latest_codex`;
+    `60` raw hits, `1` first signal, `1` official row, official 2c PnL
+    `+$0.50`, win rate `100%`, `0` proxy/official mismatches.
+  - q1000 YES:
+    `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_latest_codex`
+    and REST fill
+    `backtest_outputs\btc15m_f2_live_ws_q1000_yes_postfreeze_rest_official_latest_codex`;
+    `60` raw hits, `1` first signal, `1` official row, official 2c PnL
+    `+$0.50`, win rate `100%`, `0` proxy/official mismatches.
+- Added `scripts\audit_btc15m_first_signal_side_semantics.py` plus
+  `scripts\test_btc15m_first_signal_side_semantics.py`. This diagnostic checks
+  whether a side-filtered first-signal replay is merely a subset of the global
+  both-side first-signal replay, or whether it creates a newer policy by
+  waiting past an earlier opposite-side global first signal.
+- Current semantics audit artifact:
+  `backtest_outputs\btc15m_first_signal_side_semantics_latest_codex`.
+  Result:
+  - `audit_status = SIDE_FILTER_SUBSET_OF_GLOBAL_FIRST`;
+  - global q250 post-freeze first-signal rows: `2`;
+  - side-filtered q250 YES rows: `1`;
+  - side events agreeing with global first signal: `1`;
+  - side-first extra events: `0`;
+  - global-first opposite-side events: `1`.
+  Interpretation: in the current post-freeze artifact, the q250 YES-only row is
+  not produced by waiting past an earlier NO/global first signal. This removes
+  one policy-continuity worry for this tiny window, but it does not make old
+  replay rows promotion evidence.
+- Wired the semantics audit into:
+  - `scripts\refresh_btc_evidence_stack.py` as step `12 / 26`;
+  - `scripts\build_gpt_pro_strategy_packet.py`, including the summary/detail
+    CSVs in future Pro packets;
+  - the reusable Kalshi BTC skill reference.
+- Reran the full ordered evidence refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T13:21:49Z` to `2026-05-18T13:26:47Z`;
+  - `26 / 26` steps passed;
+  - readiness returned exit code `1`, still expected for
+    `production_ready_count = 0`;
+  - latest GPT Pro packet rebuilt at
+    `gpt_pro_packets\strategy_advisor_20260518_072645`.
+- Latest action-status blockers remain unchanged in substance:
+  - readiness production-ready count `0`;
+  - forward consistency count `0`;
+  - row reconciliation `2` passing matches but `0` promotion-usable rows;
+  - canonical official feature table `0` promotion-usable rows;
+  - post-restart collection and drawdown gates pending controlled restart;
+  - deployable settlement-basis guards `0`;
+  - BTC1H since-freeze replay coverage `0 / 5`, with `5` locked-blocked rows.
+- Validation:
+  - Python compile passed for the new semantics audit/test, evidence refresh
+    controller/test, and GPT Pro packet builder using repo-local
+    `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc15m_first_signal_side_semantics
+    scripts.test_btc1h_replay_coverage_audit
+    scripts.test_btc15m_shadow_config
+    scripts.test_btc_evidence_stack_refresh
+    scripts.test_btc_drawdown_sequence_audit
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc_paper_restart_safety
+    scripts.test_btc_post_restart_verification -v` passed `32 / 32`.
+- Deployment conclusion remains unchanged: no BTC15M or BTC1H strategy is
+  deployable. q250 YES-only remains the best next BTC15M forward paper path,
+  but it is not running and has only `1` post-freeze official replay row in this
+  refreshed window. q250 raw and q1000 YES remain stale-schema controls only.
+
+## 2026-05-18 BTC15M post-freeze replay refresh wired into evidence stack
+
+- Re-checked process state at the start of this work. The same four Python
+  processes were running: BTC15M live capture PID `1724`, q250 first-skip paper
+  shadow PID `7052`, q1000 YES paper shadow PID `24840`, and BTC1H
+  high-conf80 entry70 no-chase paper shadow PID `16216`. q250 YES-only was
+  still not running. No process was stopped, started, restarted, archived,
+  migrated, deployed, or traded.
+- Found and fixed an evidence-stack freshness gap: the full refresh consumed
+  BTC15M post-freeze replay artifacts, but did not regenerate those replay and
+  REST-official artifacts from the current live capture. This made downstream
+  opportunity-rate, side-semantics, kill/continue, and GPT Pro packets capable
+  of lagging the actual BTC15M capture horizon.
+- Added `scripts\refresh_btc15m_postfreeze_replays.py`, a read-only controller
+  that refreshes the three frozen BTC15M post-freeze replay paths and REST-fills
+  official Kalshi settlement:
+  - q250 raw first-signal qty>=500;
+  - q250 YES-only first-signal qty>=500;
+  - q1000 YES.
+  The controller writes
+  `backtest_outputs\btc15m_postfreeze_replay_refresh_latest_codex` and records
+  command lines plus candidate-level replay/REST summaries. It does not start,
+  stop, restart, trade, deploy, or tune thresholds.
+- Hardened `scripts\fill_btc15m_live_ws_official_results.py` so empty replay
+  outputs produce a zero-row summary instead of failing while sorting an empty
+  DataFrame. This matters because sparse frozen BTC15M windows can legitimately
+  produce no trades.
+- Wired the new replay refresh into `scripts\refresh_btc_evidence_stack.py`
+  before BTC15M signal health, starvation, opportunity-rate, side-semantics, and
+  downstream packet/report generation. The evidence-stack refresh now has
+  `27` steps.
+- Reran the full ordered evidence refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T13:40:43Z` to `2026-05-18T13:50:08Z`;
+  - `27 / 27` steps passed;
+  - readiness returned exit code `1`, still expected for
+    `production_ready_count = 0`;
+  - latest GPT Pro packet rebuilt at
+    `gpt_pro_packets\strategy_advisor_20260518_075004`.
+- Fresh post-freeze replay/REST official refresh results:
+  - q250 raw first-signal qty>=500: capture end
+    `2026-05-18T13:41:17.639985Z`, `66` raw hits, `2` first signals, `2` REST
+    official rows, official 2c PnL `$0.00`, official win rate `50%`, `0`
+    proxy/official mismatches.
+  - q250 YES-only: capture end `2026-05-18T13:41:41.061677Z`, `60` raw hits,
+    `1` first signal, `1` REST official row, official 2c PnL `+$0.50`,
+    official win rate `100%`, `0` proxy/official mismatches.
+  - q1000 YES: capture end `2026-05-18T13:42:01.189250Z`, `60` raw hits, `1`
+    first signal, `1` REST official row, official 2c PnL `+$0.50`, official
+    win rate `100%`, `0` proxy/official mismatches.
+- Updated downstream opportunity-rate output now uses the fresh replay horizon:
+  - q250 raw projected days to `100` post-freeze official rows at current
+    post-freeze official rate: `19.18`;
+  - q250 YES-only: `38.77`;
+  - q1000 YES: `38.80`.
+  These projections are collection-planning diagnostics only and remain far too
+  sparse for deployment.
+- Current side-semantics audit remains
+  `SIDE_FILTER_SUBSET_OF_GLOBAL_FIRST`: global first-signal rows `2`,
+  side-filtered q250 YES rows `1`, side-first extra events `0`. This still
+  does not make old replay rows promotion evidence.
+- Current action-status blockers remain deployment-blocking:
+  - readiness production-ready count `0`;
+  - forward consistency count `0`;
+  - row reconciliation `2` passing matches but `0` promotion-usable rows;
+  - canonical official feature table `0` promotion-usable rows;
+  - post-restart collection and drawdown gates pending controlled restart;
+  - deployable settlement-basis guards `0`;
+  - BTC1H since-freeze replay coverage `0 / 5`, with `5` locked-blocked rows.
+- Validation:
+  - Python compile passed for the new replay-refresh controller/test,
+    REST-official fill script, evidence refresh controller/test, first-signal
+    semantics audit/test, and GPT Pro packet builder using repo-local
+    `PYTHONPYCACHEPREFIX`;
+  - `python -m unittest scripts.test_btc15m_postfreeze_replay_refresh
+    scripts.test_btc15m_first_signal_side_semantics
+    scripts.test_btc_evidence_stack_refresh
+    scripts.test_btc1h_replay_coverage_audit
+    scripts.test_btc15m_shadow_config
+    scripts.test_btc_drawdown_sequence_audit
+    scripts.test_btc_forward_row_reconciliation
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc_paper_restart_safety
+    scripts.test_btc_post_restart_verification -v` passed `37 / 37`.
+- Deployment conclusion remains unchanged: no BTC15M or BTC1H strategy is
+  deployable. This work improves evidence freshness and reduces stale-artifact
+  risk, but the actual blockers are still clean forward collection, official
+  settlement, execution-realism fields, post-restart ledger evidence, and BTC1H
+  causal replay coverage.
+
+## 2026-05-18 GPT Pro review plus Predexon official-coverage tightening
+
+- Re-verified that Chrome automation was available through the Sami Chrome
+  profile and that ChatGPT was logged into the Pro account. Submitted the
+  latest strategy-advisor packet through ChatGPT Pro and saved the response at
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_fresh_chrome_20260518_082010.md`.
+  The review again said no deploy, no canary, and no small-size exception:
+  `production_ready_count = 0`, forward consistency `0 / 4`,
+  row-reconciliation `0` promotion-usable rows, post-restart collection and
+  drawdown gates pending, BTC1H replay coverage blocked. Pro ranked the next
+  path as BTC15M q250 YES-only paper collection, q1000 YES as a sparse cleaner
+  control, and q250 raw as settlement-basis research only.
+- Re-ran the full ordered evidence refresh just before the Pro packet:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T13:54:31Z` to `2026-05-18T14:04:33Z`;
+  - `27 / 27` steps passed;
+  - readiness returned exit code `1`, still expected for
+    `production_ready_count = 0`;
+  - latest GPT Pro packet rebuilt at
+    `gpt_pro_packets\strategy_advisor_20260518_080429`.
+- Fresh post-freeze replay/REST official refresh from that run:
+  - q250 raw first-signal qty>=500: capture end
+    `2026-05-18T13:55:07.920273Z`, `66` raw hits, `2` first signals, `2`
+    REST official rows, official 2c PnL `$0.00`, official win rate `50%`,
+    `0` proxy/official mismatches.
+  - q250 YES-only: capture end `2026-05-18T13:55:35.105412Z`, `60` raw hits,
+    `1` first signal, `1` REST official row, official 2c PnL `+$0.50`,
+    official win rate `100%`, `0` proxy/official mismatches.
+  - q1000 YES: capture end `2026-05-18T13:55:58.100082Z`, `60` raw hits, `1`
+    first signal, `1` REST official row, official 2c PnL `+$0.50`, official
+    win rate `100%`, `0` proxy/official mismatches.
+- Followed the Pro recommendation without touching live processes: no process
+  was stopped, started, restarted, archived, migrated, deployed, or traded.
+  The q250 YES-only paper shadow remains not running until explicit user
+  authorization.
+- REST-filled official Kalshi settlement for the materialized Predexon BTC15M
+  trade rows:
+  `python scripts\fill_btc15m_predexon_official_results.py --trades backtest_outputs\btc15m_f2_combined_predexon_plus_jan29_20260516_164544\combined_predexon_trades.parquet --out-dir backtest_outputs\btc15m_predexon_rest_official_latest_codex --sleep 0.02`
+  - input rows: `2,424`;
+  - unique markets: `880`;
+  - REST official results filled: `374`;
+  - metadata results filled: `100,202` market metadata entries available.
+  Official strategy summaries were positive on the filled subset, including
+  q250 (`69` official rows, `+$9.66`, win `63.77%`), q500 (`67`,
+  `+$9.82`, win `64.18%`), q1000 (`52`, `+$8.16`, win `65.38%`), and
+  q250_qspeed05 (`63`, `+$10.88`, win `66.67%`). This is still partial
+  historical coverage, not deployment evidence.
+- Tightened `scripts\audit_btc15m_materialized_filter_grid.py` so official-PnL
+  grid runs now report selected rows, scored rows, missing official rows,
+  official coverage, uncovered proxy PnL, and uncovered proxy bad windows.
+  Incomplete official coverage is now a failure reason by default for official
+  PnL columns. The reusable Kalshi BTC skill reference was updated with this
+  rule.
+- Re-ran the materialized grid on REST-official Predexon columns:
+  `python scripts\audit_btc15m_materialized_filter_grid.py --predexon-trades backtest_outputs\btc15m_predexon_rest_official_latest_codex\predexon_trades_rest_official.parquet --out-dir backtest_outputs\btc15m_materialized_filter_grid_rest_official_latest_codex --pred-pnl-col pnl_official_rest_2c --pred-win-col win_pnl_official_rest_2c --min-pred-trades 30 --min-live-official-trades 8 --top-n 100`
+  - screened rows: `100`;
+  - research_pass: `0`;
+  - deploy_ready: `0`.
+  Key rows:
+  - q250 raw qty>=500: `63` selected Predexon rows, `57` official-scored,
+    `6` missing official, official coverage `90.48%`, official Predexon PnL
+    `+$8.72`, live official rows `17`, live official PnL `+$4.30`, but
+    failure reason `pred_official_coverage_incomplete`.
+  - q250 YES-only: `79` selected, `31` official-scored, `48` missing official,
+    coverage `39.24%`, uncovered proxy PnL `-$2.24`, `2` uncovered proxy bad
+    windows, official Predexon PnL `+$5.36`, live official rows `8`, live
+    official PnL `+$0.85`; failure reasons
+    `pred_official_coverage_incomplete;pred_uncovered_proxy_bad_windows`.
+  - q1000 YES: `33` selected, `23` official-scored, `10` missing official,
+    coverage `69.70%`, uncovered proxy PnL `+$1.53`, official Predexon PnL
+    `+$6.45`, live official rows `7`, live official PnL `+$1.39`; failure
+    reasons `too_few_live_official_trades;pred_official_coverage_incomplete`.
+- Refreshed the canonical Predexon official-coverage audit on the same
+  REST-filled files:
+  `python scripts\audit_btc15m_predexon_official_coverage.py --predexon-trades backtest_outputs\btc15m_predexon_rest_official_latest_codex\predexon_trades_rest_official.parquet --market-results backtest_outputs\btc15m_predexon_rest_official_latest_codex\market_results.csv --out-dir backtest_outputs\btc15m_predexon_official_coverage_latest_codex --min-official-rows 50`
+  The audit agrees that every monitored BTC15M Predexon path is not
+  deployment-usable. q250 firstskip qty>=500 has `63` selected rows, `57`
+  REST-official rows, coverage `90.48%`, official PnL `+$8.72`, but
+  uncovered proxy PnL `-$0.41` and `2` bad uncovered windows. q250 YES has
+  only `31` REST-official rows out of `79`, coverage `39.24%`, uncovered
+  proxy PnL `-$2.24`, and `4` bad uncovered windows. q1000 YES has `23`
+  REST-official rows out of `33`, official PnL `+$6.45`, but is still below
+  the official-row threshold and has partial coverage.
+- Interpretation after this loop: q250 raw still has the strongest combined
+  official-subset/live replay numbers, but it remains settlement-basis research
+  because it includes the historically fragile side mix and lacks complete
+  official coverage. q250 YES-only remains operationally attractive as the next
+  paper-only forward path, but the historical official-coverage audit is now
+  less flattering: most selected Predexon rows are still unfilled by REST
+  official settlement, and the uncovered proxy subset contains bad windows.
+  q1000 YES looks cleaner on the uncovered proxy subset, but it is too sparse.
+- Validation:
+  - `python -m py_compile scripts\audit_btc15m_materialized_filter_grid.py`
+    passed;
+  - both REST official fill and tightened materialized-grid reruns completed
+    successfully.
+- Deployment conclusion remains unchanged: no BTC15M or BTC1H strategy is
+  deployable. The correct next operational move is still an explicitly
+  authorized paper-only controlled start/restart for q250 YES-only/q1000/q250
+  raw/BTC1H followed by fresh clean-schema official-settled row collection and
+  row-level reconciliation. Without that authorization, the highest-value safe
+  work is settlement-basis guard development and continued read-only evidence
+  auditing.
+
+## 2026-05-18 settlement-basis guard candidate diagnostics
+
+- Continued read-only research toward the BTC15M/BTC1H deployment objective.
+  Re-checked process state before acting. The same four Python processes were
+  running: BTC15M live capture PID `1724`, q250 first-skip paper shadow PID
+  `7052`, q1000 YES paper shadow PID `24840`, and BTC1H high-conf80 entry70
+  no-chase paper shadow PID `16216`. q250 YES-only remains not running. No
+  process was stopped, started, restarted, archived, migrated, deployed, or
+  traded.
+- Added `scripts\build_btc_settlement_basis_guard_candidates.py`, a
+  research-only diagnostic that evaluates simple preregisterable
+  settlement-basis veto candidates on already official-scored basis-risk rows.
+  Guard inputs are decision-time-safe side and distance-to-strike fields only:
+  YES-only, minimum side-aligned decision distance in USD/bps, and
+  YES-or-NO-distance guards. Official/proxy outcomes are used only for
+  after-the-fact scoring. The script hard-codes `deployable_guard_now=False`
+  because no guard has fresh preregistered forward evaluation.
+- While testing the guard output, found and fixed a source-labeling bug in
+  `scripts\build_btc_settlement_basis_risk_audit.py`: BTC15M rows coming from
+  `shadow_official_trades.csv` were previously labeled as family `BTC1H`.
+  The loader now infers BTC15M/BTC1H from ledger/event/market tickers. Added
+  `scripts\test_btc_settlement_basis_risk_audit.py` to prevent this regression.
+- Wired the basis-risk audit and new guard-candidate diagnostic into
+  `scripts\refresh_btc_evidence_stack.py` in dependency order:
+  settlement-basis risk audit -> basis danger table -> guard candidates ->
+  basis model feasibility. Also updated the GPT Pro packet builder so future
+  packets include `settlement_basis_guard_summary.csv` and
+  `settlement_basis_guard_promising.csv`.
+- Fixed `scripts\check_btc_deployment_readiness.py` so the materialized grid
+  directory is chosen by latest mtime across the REST-official/pred-official
+  grid prefixes. The readiness artifact now points to the stricter
+  `backtest_outputs\btc15m_materialized_filter_grid_rest_official_latest_codex`
+  grid, preserving failure reasons such as
+  `pred_official_coverage_incomplete`.
+- Reran the ordered evidence stack:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T14:38:15Z` to `2026-05-18T14:49:31Z`;
+  - `29 / 29` steps passed;
+  - readiness returned exit code `1`, still expected for
+    `production_ready_count = 0`.
+- Refreshed readiness and downstream reports after the materialized-grid
+  selection fix. Latest readiness:
+  - `production_ready_count = 0`;
+  - materialized grid input:
+    `backtest_outputs\btc15m_materialized_filter_grid_rest_official_latest_codex`;
+  - focused q250 materialized rows now fail with
+    `pred_official_coverage_incomplete;too_few_live_official_trades;too_few_live_proxy_trades`.
+- Latest post-freeze BTC15M replay refresh:
+  - q250 raw first-signal qty>=500: capture end
+    `2026-05-18T14:38:45.855347Z`, `66` raw hits, `2` first signals, `2`
+    official rows, official 2c PnL `$0.00`, win `50%`, `0` mismatches.
+  - q250 YES-only: capture end `2026-05-18T14:39:10.656854Z`, `60` raw hits,
+    `1` first signal, `1` official row, official 2c PnL `+$0.50`, win
+    `100%`, `0` mismatches.
+  - q1000 YES: capture end `2026-05-18T14:39:30.240521Z`, `60` raw hits, `1`
+    first signal, `1` official row, official 2c PnL `+$0.50`, win `100%`,
+    `0` mismatches.
+- Latest settlement-basis guard candidate artifact:
+  `backtest_outputs\btc_settlement_basis_guard_candidates_latest_codex`.
+  It produced `154` guard/candidate summary rows and `37` research-promising
+  rows, all non-deployable. Useful diagnostic examples:
+  - q250 firstskip qty>=500 `no_guard`: `24` kept rows, official PnL `+$3.74`,
+    but `3` adverse proxy/official flips, so it remains basis-fragile.
+  - q250 firstskip qty>=500 `yes_only`: `8` kept rows, official PnL `+$0.88`,
+    `0` mismatches, but only `8` official rows and no fresh preregistered
+    forward guard evaluation.
+  - q1000 YES `no_guard` / `yes_only`: `8` kept rows, official PnL `+$0.90`,
+    `0` mismatches, but far too sparse.
+  - BTC1H high-conf80 entry70 no-chase has no promising guard in this table;
+    its `no_guard` row still has `10` rows, `2` mismatches, and `1` adverse
+    mismatch.
+- Latest kill/continue and forward-consistency reports remain conservative:
+  q250 firstskip qty>=500 is `CONTINUE_FORWARD_ONLY`, q250 YES-only is
+  `PREREGISTERED_PAPER_START_WITH_PERMISSION`, q1000 YES is
+  `CONTINUE_FORWARD_ONLY_SPARSE`, and BTC1H is
+  `OBSERVE_ONLY_RESTART_WITH_PERMISSION`. Forward consistency remains
+  `0 / 4` promotion-ready.
+- Latest GPT Pro packet rebuilt after the refreshed artifacts:
+  `gpt_pro_packets\strategy_advisor_20260518_085204`.
+- Validation:
+  - `python -m py_compile scripts\build_btc_settlement_basis_risk_audit.py
+    scripts\build_btc_settlement_basis_guard_candidates.py
+    scripts\refresh_btc_evidence_stack.py
+    scripts\build_gpt_pro_strategy_packet.py
+    scripts\check_btc_deployment_readiness.py
+    scripts\test_btc_settlement_basis_risk_audit.py` passed;
+  - `python -m unittest scripts.test_btc_settlement_basis_risk_audit
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `4 / 4`.
+- Deployment conclusion remains unchanged: no BTC15M or BTC1H strategy is
+  deployable. The basis guard diagnostics make q250 raw's NO-side settlement
+  fragility more explicit and make q250/q1000 YES-side guards plausible
+  preregistration ideas, but they do not solve the real blocker: fresh
+  official-settled, clean-schema, row-reconciled forward paper evidence after
+  explicit user-authorized paper-only start/restart.
+
+## 2026-05-18 - GPT Pro loop 2 and basis-guard preregistration packet
+
+- Submitted a refreshed sanitized GPT Pro packet through the Chrome extension
+  after verifying Chrome could open `https://example.com/` and ChatGPT was
+  logged in with `Pro` visible. The packet was submitted as a long pasted-text
+  attachment and saved to
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_chrome_20260518_092045.md`.
+- GPT Pro again gave a hard no-deploy verdict: BTC15M and BTC1H are not
+  deployable, not even as a canary. It ranked the next research paths as:
+  1. q250 firstskip qty>=500 YES-only controlled paper-forward collection;
+  2. q1000 YES as a sparse cleaner control;
+  3. q250 raw as basis/side decomposition only. BTC1H stays observe-only.
+- Updated `scripts\build_btc15m_next_forward_candidate_packet.py` to emit
+  explicit basis-guard freeze specs and diagnostic evidence:
+  - `basis_guard_freeze_specs.csv`
+  - `basis_guard_diagnostic_evidence.csv`
+  The primary future policy is q250 firstskip qty>=500 YES-only. q1000 YES
+  remains an existing sparse control. q1000 aligned-distance and q250
+  YES-or-NO-distance guards are sidecar metrics only, not trading policies.
+- Fixed `scripts\build_gpt_pro_strategy_packet.py` so multi-CSV artifacts from
+  the next-forward packet and settlement-basis guard-candidate packet actually
+  make it into the GPT Pro packet by reference. Latest packet after the full
+  refresh is `gpt_pro_packets\strategy_advisor_20260518_092001`.
+- Ran the ordered evidence stack again:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`
+  - latest run: `2026-05-18T15:13:00Z` to `2026-05-18T15:20:04Z`;
+  - `29 / 29` steps passed;
+  - readiness returned exit code `1`, still expected because
+    `production_ready_count = 0`.
+- Ran a dry-run only restart plan:
+  `powershell -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1`
+  It wrote
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_092129\restart_plan.json`.
+  No processes were stopped or started. All four target wrapper safety checks
+  passed, and the plan still requires explicit user authorization before
+  execution.
+- Refreshed the restart authorization and Pro action-status artifacts after
+  the dry run:
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`
+  - `backtest_outputs\btc_post_restart_verification_latest_codex`
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`
+  Current status remains:
+  - `READY_FOR_EXPLICIT_USER_AUTHORIZATION` for the paper-only restart/start
+    path;
+  - `restart_executed=False`;
+  - q250 YES-only DB missing and not running;
+  - q250 raw, q1000 YES, and BTC1H active ledgers require restart for complete
+    execution-realism schema;
+  - row reconciliation promotion-usable count remains `0`;
+  - BTC1H since-freeze replay coverage remains blocked (`0/7` replayable,
+    `7` locked-blocked rows).
+- Validation:
+  - `python -m py_compile scripts\build_btc15m_next_forward_candidate_packet.py
+    scripts\build_gpt_pro_strategy_packet.py
+    scripts\build_btc_settlement_basis_risk_audit.py
+    scripts\build_btc_settlement_basis_guard_candidates.py
+    scripts\refresh_btc_evidence_stack.py
+    scripts\build_btc_gpt_pro_action_status.py` passed;
+  - `python -m unittest scripts.test_btc_settlement_basis_risk_audit
+    scripts.test_btc_settlement_basis_model_feasibility -v` passed `4 / 4`.
+- Current conclusion: still no deployable strategy. The next honest operational
+  move is explicit user-authorized paper-only restart/start of the four shadow
+  targets so the evidence clock can start with clean execution-realism schemas.
+  Until that happens, q250 YES-only remains the top candidate on paper, not a
+  deployable strategy.
+
+## 2026-05-18 - Fresh capture-sidecar preflight and GPT Pro re-loop
+
+- Tightened the paper-shadow restart preflight so it now proves more than a
+  fresh ledger schema. `scripts\build_btc_shadow_restart_preflight.py` creates
+  a fresh capture DuckDB for each target, writes smoke rows to `capture_health`,
+  `ws_orderbook_top`, and `signal_scan`, and verifies the lock-free
+  `.status.json` sidecar reports nonzero rows and timestamps. Restart readiness
+  now requires `fresh_capture_sidecar_status = PASS_CAPTURE_SIDECAR`.
+- Updated `scripts\build_btc_restart_authorization_packet.py` so authorization
+  summaries include the fresh capture-sidecar requirement, and added
+  `test_restart_preflight_proves_capture_status_sidecar` to
+  `scripts\test_btc_paper_restart_safety.py`.
+- Validation:
+  - `python -m py_compile scripts\build_btc_shadow_restart_preflight.py
+    scripts\build_btc_restart_authorization_packet.py
+    scripts\test_btc_paper_restart_safety.py` passed;
+  - `python -m unittest scripts.test_btc_paper_restart_safety -v` passed
+    `5 / 5`;
+  - the broader compile command for the active BTC evidence stack scripts
+    passed.
+- Refreshed the ordered evidence stack:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`.
+  Latest run: `2026-05-18T15:31:30Z` to `2026-05-18T15:40:24Z`;
+  `29 / 29` steps passed. Readiness returned exit code `1`, accepted by the
+  controller because `production_ready_count = 0`.
+- Current refreshed state remains no-deploy:
+  - readiness `production_ready_count = 0`;
+  - GPT Pro action status says `promotion_usable_rows = 0`,
+    `row_reconciliation_pass_count = 2`, and
+    `row_reconciliation_promotion_usable_count = 0`;
+  - post-restart verification still has `restart_executed=False`;
+  - q250 YES-only is still not running and has no DB;
+  - q250 raw, q1000 YES, and BTC1H active ledgers still have stale
+    25-column schemas missing the 12 execution-realism fields;
+  - BTC1H since-freeze replay coverage remains blocked at `0 / 7` replayable
+    rows with `7` locked-blocked rows.
+- The stricter restart preflight now passes for all four paper targets:
+  q250 raw, q250 YES-only start, q1000 YES, and BTC1H all show
+  `PASS_SCHEMA_READY`, `PASS_INSERT_REALISM_FIELDS`,
+  `PASS_CAPTURE_SIDECAR`, and `PASS_RESTART_PATH_READY`. This reduces restart
+  risk but does not make old/current rows deployable evidence.
+- Latest restart authorization remains paper-only and gated on explicit user
+  authorization:
+  `backtest_outputs\btc_restart_authorization_packet_latest_codex`.
+  The latest dry-run restart plan is
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_092857`;
+  it did not execute.
+- Latest GPT Pro packet rebuilt after the refresh:
+  `gpt_pro_packets\strategy_advisor_20260518_094021`. Chrome extension access
+  was available and ChatGPT showed the `Pro` account. The packet was submitted
+  to a new ChatGPT conversation URL via the normal Chrome window after the
+  extension input channel failed on clipboard/typing. The response was
+  recovered from the Chrome page copy and saved to
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_refresh_sidecar_20260518_095721.md`.
+- GPT Pro's refreshed verdict matched the local gates:
+  - no BTC15M or BTC1H deployment, not even canary;
+  - q250 firstskip qty>=500 YES-only is the top path, but only after explicit
+    controlled paper-only start/restart;
+  - q1000 YES should remain a sparse cleaner control;
+  - q250 raw is basis/side decomposition only because of NO-side
+    proxy/official fragility;
+  - BTC1H is a plumbing/observability path until clean schema, lock-free
+    capture sidecars, and causal replay coverage exist.
+- Current conclusion is unchanged: no BTC15M or BTC1H strategy is deployable.
+  The next honest blocker is not model search; it is explicit paper-only
+  restart/start authorization so the forward evidence clock can start with
+  clean execution-realism schemas and readable capture sidecars.
+
+## 2026-05-18 - Post-restart verifier now requires all target sidecars
+
+- Re-checked Python processes before making changes. Current matching jobs:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PID `16216`.
+  q250 YES-only is still not running.
+- Closed a verifier loophole: the fresh restart preflight already proved all
+  four wrappers can emit a lock-free capture `.status.json`, but
+  `scripts\build_btc_post_restart_verification.py` only required the BTC1H
+  sidecar after restart. It now requires every restarted paper target to have a
+  fresh sidecar with `updated_at_utc >= restart_utc`, no sidecar error, and
+  nonzero `capture_health`, `ws_orderbook_top`, and `signal_scan` row counts
+  before the evidence clock can be marked ready.
+- Added tests in `scripts\test_btc_post_restart_verification.py` for:
+  - sidecar freshness after restart;
+  - rejection of sidecars stale before restart;
+  - rejection of sidecars missing basic table row counts.
+- Validation:
+  - `python -m py_compile scripts\build_btc_post_restart_verification.py
+    scripts\test_btc_post_restart_verification.py` passed;
+  - `python -m unittest scripts.test_btc_post_restart_verification -v` passed
+    `5 / 5`;
+  - `python -m py_compile scripts\build_btc_gpt_pro_action_status.py
+    scripts\build_btc_post_restart_verification.py
+    scripts\test_btc_post_restart_verification.py` passed.
+- Regenerated:
+  - `backtest_outputs\btc_post_restart_verification_latest_codex`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex` using
+    `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_refresh_sidecar_20260518_095721.md`.
+- Current regenerated post-restart verification remains correctly blocked:
+  - `restart_executed=False`;
+  - `evidence_clock_ready=False`;
+  - `required_capture_sidecars_ready=PENDING_OR_FAIL`;
+  - all four targets now show `capture_sidecar_required=True` and
+    `capture_sidecar_ready=False` because no controlled restart/start has
+    executed.
+- Current regenerated GPT Pro action status remains unchanged in substance:
+  `NO DEPLOY`; `production_ready_count=0`; `promotion_usable=0`;
+  q250 YES-only is still waiting for explicit paper restart/start; q250 raw and
+  q1000 YES remain stale-schema controls; BTC1H remains observe-only with
+  `0/7` since-freeze replayable rows.
+
+## 2026-05-18 - Restart process-identity gate added
+
+- Ran the full ordered evidence refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex`.
+  Latest run: `2026-05-18T16:05:38Z` to `2026-05-18T16:16:37Z`;
+  `29 / 29` steps passed. Readiness returned exit code `1`, still expected
+  because `production_ready_count = 0`.
+- Latest compact state after the refresh:
+  - readiness `production_ready_count = 0`;
+  - GPT Pro action status `promotion_usable_rows = 0`;
+  - row reconciliation still has two matched-but-not-promotable BTC15M rows:
+    q250 raw `2` matched rows and q1000 YES `1` matched row, both blocked by
+    stale paper-ledger execution fields and too few official rows;
+  - q250 YES-only still has `0` paper rows and `1` replay-only row, so it is
+    still `REPLAY_ROWS_WITHOUT_PAPER_SHADOW`;
+  - BTC1H remains `NO_CAUSAL_REPLAY_COMPARATOR`.
+- Added process creation timestamps to
+  `scripts\check_btc_forward_shadow_status.py`. The status CSV now includes
+  `process_created_at_utc` alongside each matching PID.
+- Tightened `scripts\build_btc_post_restart_verification.py` again. After an
+  authorized controlled restart, it now requires every target's current PID to
+  match the PID recorded in `restart_result.json` and requires that process to
+  have been created after the restart plan was built. This prevents stale
+  survivor processes from starting the evidence clock.
+- Added tests in `scripts\test_btc_post_restart_verification.py` for the
+  process-identity gate:
+  - pass when current PID matches `restart_result.json`;
+  - fail when the PID differs;
+  - fail when process creation time predates the restart plan.
+- Validation:
+  - `python -m py_compile scripts\check_btc_forward_shadow_status.py
+    scripts\build_btc_post_restart_verification.py
+    scripts\test_btc_post_restart_verification.py
+    scripts\test_btc_forward_shadow_status.py` passed;
+  - `python -m unittest scripts.test_btc_post_restart_verification
+    scripts.test_btc_forward_shadow_status -v` passed `8 / 8`.
+- Regenerated:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`;
+  - `backtest_outputs\btc_post_restart_verification_latest_codex`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`;
+  - `gpt_pro_packets\strategy_advisor_20260518_101938`.
+- Current regenerated post-restart verification remains correctly blocked:
+  - `restart_executed=False`;
+  - `evidence_clock_ready=False`;
+  - `target_process_identity=PENDING_OR_FAIL`;
+  - current stale PIDs were created around `2026-05-18T02:41:59Z`, before the
+    dry-run restart plan, so they cannot be confused with future controlled
+    restart evidence.
+- Current conclusion remains unchanged: no BTC15M or BTC1H strategy is
+  deployable. The best next research path is still explicit paper-only
+  controlled start/restart of q250 YES-only plus controls, then future
+  official-settled, execution-realistic, row-reconciled collection.
+
+## 2026-05-18 - Evidence-clock verifier folded into readiness
+
+- Tightened deployment readiness so the stricter post-restart verifier is now
+  a hard blocker, not just a side report. `scripts\check_btc_deployment_readiness.py`
+  now reads `backtest_outputs\btc_post_restart_verification_latest_codex` and
+  adds blockers such as:
+  - `post_restart_evidence_clock_not_ready`;
+  - `post_restart_controlled_restart_not_executed`;
+  - `post_restart_process_identity_not_ready`;
+  - `post_restart_capture_sidecars_not_ready`;
+  - `post_restart_active_ledger_schemas_not_ready`.
+- Candidate-specific readiness rows also inherit target-level verifier fields
+  from `post_restart_target_status.csv`, including process identity status,
+  capture-sidecar status, active schema status, and evidence-clock status. This
+  prevents stale survivor PIDs, locked/missing sidecars, or stale schemas from
+  being hidden behind favorable replay/settlement summaries.
+- Updated `scripts\build_btc_gpt_pro_action_status.py` so GPT Pro status has an
+  explicit `post_restart_evidence_clock` checklist row and candidate
+  `deployable_now` also requires `post_restart_evidence_clock_ready=True`.
+- Moved `post_restart_verification` earlier in
+  `scripts\refresh_btc_evidence_stack.py`, before `deployment_readiness` and
+  `gpt_pro_action_status`, so the full refresh uses a consistent dependency
+  order.
+- Added regression coverage in
+  `scripts\test_btc_readiness_row_reconciliation.py`: a candidate with good
+  official rows/schema is still blocked if the post-restart evidence clock
+  fails process identity or capture-sidecar freshness.
+- Validation:
+  - `python -m py_compile scripts\check_btc_deployment_readiness.py
+    scripts\build_btc_gpt_pro_action_status.py
+    scripts\refresh_btc_evidence_stack.py
+    scripts\test_btc_readiness_row_reconciliation.py` passed;
+  - `python -m unittest scripts.test_btc_readiness_row_reconciliation -v`
+    passed `2 / 2`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir
+    backtest_outputs\btc_evidence_stack_refresh_latest_codex --skip-packet`
+    passed `28 / 28` from `2026-05-18T16:27:25Z` to
+    `2026-05-18T16:37:56Z`. Readiness return code `1` was expected and counted
+    as pass because no strategy is production-ready.
+- Latest refreshed state:
+  - `deployment_readiness_latest_codex` has `production_ready_count=0` and now
+    records `post_restart_verification_dir`;
+  - `btc_gpt_pro_action_status_latest_codex` has
+    `post_restart_evidence_clock_ready=False`,
+    `post_restart_verification_restart_executed=False`,
+    `promotion_usable_rows=0`, and `row_reconciliation_promotion_usable_count=0`;
+  - process audit still shows only the pre-existing BTC15M capture, q250 raw,
+    q1000 YES, and BTC1H high-conf paper shadows; q250 YES-only is still not
+    running.
+- Conclusion unchanged: no deployment or canary. The repo is now better guarded
+  against an accidental "ready" interpretation before an explicit controlled
+  paper restart/start creates a fresh evidence clock and later official-settled
+  rows.
+
+## 2026-05-18 - Frozen wrapper policy parity gate added
+
+- Added `scripts\audit_btc_frozen_policy_parity.py`, a read-only audit that
+  verifies the active paper-shadow wrapper files still encode the preregistered
+  policy thresholds before future rows can count. It checks:
+  - q250 firstskip qty>=500 both-side control;
+  - q250 firstskip qty>=500 YES-only primary forward policy;
+  - q1000 YES sparse control;
+  - BTC1H high-conf80 entry70 no-chase observe-only control.
+- The audit currently passes all four wrappers:
+  `policy_parity_pass_count=4/4` and `all_policy_parity_pass=True`.
+- Wired the new artifact into the normal evidence stack:
+  - `scripts\refresh_btc_evidence_stack.py` now runs
+    `frozen_policy_parity` after the candidate freeze packet and before
+    deployment readiness;
+  - `scripts\check_btc_deployment_readiness.py` consumes
+    `btc_frozen_policy_parity_latest_codex` and records the parity artifact in
+    `run_info.json`;
+  - `scripts\build_btc_gpt_pro_action_status.py` now has a
+    `frozen_policy_parity` checklist row and requires candidate policy parity
+    for `deployable_now`;
+  - `scripts\build_gpt_pro_strategy_packet.py` now includes the parity audit in
+    GPT Pro evidence packets.
+- Added `scripts\test_btc_frozen_policy_parity.py` with:
+  - a real-wrapper pass test;
+  - a synthetic mismatch test proving a changed threshold is blocked.
+- Validation:
+  - `python -m py_compile scripts\audit_btc_frozen_policy_parity.py
+    scripts\test_btc_frozen_policy_parity.py
+    scripts\check_btc_deployment_readiness.py
+    scripts\build_btc_gpt_pro_action_status.py
+    scripts\refresh_btc_evidence_stack.py
+    scripts\test_btc_evidence_stack_refresh.py
+    scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `python -m unittest scripts.test_btc_frozen_policy_parity
+    scripts.test_btc_readiness_row_reconciliation
+    scripts.test_btc_evidence_stack_refresh -v` passed `9 / 9`;
+  - full refresh
+    `python scripts\refresh_btc_evidence_stack.py --out-dir
+    backtest_outputs\btc_evidence_stack_refresh_latest_codex` passed `30 / 30`
+    from `2026-05-18T16:46:52Z` to `2026-05-18T17:01:56Z`.
+- Latest refreshed state:
+  - deployment readiness still has `production_ready_count=0`;
+  - GPT Pro action status has `all_frozen_policy_parity_pass=True`,
+    `post_restart_evidence_clock_ready=False`, `promotion_usable_rows=0`,
+    and `row_reconciliation_promotion_usable_count=0`;
+  - q250 YES-only remains not running; q250 raw, q1000 YES, and BTC1H remain
+    running but not deployable evidence because the controlled restart/start
+    and post-restart evidence clock have not happened.
+- Latest GPT Pro packet was rebuilt at
+  `gpt_pro_packets\strategy_advisor_20260518_110152` and now includes
+  `backtest_outputs\btc_frozen_policy_parity_latest_codex`.
+- Conclusion unchanged: no BTC15M or BTC1H deployment. This change only closes
+  another future-evidence loophole: a clean post-restart ledger cannot count if
+  the wrapper drifted from the frozen policy.
+
+## 2026-05-18 - q250 YES-only focused replay added to readiness
+
+- Found a visibility gap in deployment readiness: the current top GPT Pro path,
+  `q250_firstskip_qty500_yes`, had its own focused REST-official live replay
+  artifact but was not included as a `latest_live_replay_rest_official` row in
+  `deployment_readiness_latest_codex`.
+- The focused q250 YES-only artifact is:
+  `backtest_outputs\btc15m_f2_live_ws_q250_firstskip_yes_postfreeze_rest_official_latest_codex`.
+  Current summary:
+  - `official_trades = 1`;
+  - `official_pnl = +0.50`;
+  - `official_win_rate = 100%`;
+  - `official_proxy_result_mismatches = 0`.
+- Updated `scripts\build_btc_execution_realism_audit.py` so q250 YES-only
+  replay rows are audited separately as
+  `q250_firstskip_qty500_yes_live_replay`. Current execution audit:
+  - `rows = 1`;
+  - `official_rows = 1`;
+  - `required_field_complete_rate = 1.0`;
+  - `min_recorded_visible_qty = 1135`;
+  - `audit_status = PASS_REPLAY_EXECUTION_FIELDS_NOT_PROMOTION`.
+- Updated `scripts\check_btc_deployment_readiness.py` so the q250 YES-only
+  focused replay directory is included in `latest_live_replay_dirs` and receives
+  replay-execution, row-reconciliation, frozen-policy, and post-restart
+  evidence-clock blockers.
+- Added a regression test in
+  `scripts\test_btc_readiness_row_reconciliation.py`: a q250 YES-only focused
+  replay row remains not production-ready when there is no matching paper shadow
+  row.
+- Validation:
+  - `python -m py_compile scripts\build_btc_execution_realism_audit.py
+    scripts\check_btc_deployment_readiness.py
+    scripts\test_btc_readiness_row_reconciliation.py` passed;
+  - `python -m unittest scripts.test_btc_readiness_row_reconciliation -v`
+    passed `3 / 3`;
+  - regenerated `btc_execution_realism_audit_latest_codex`,
+    `deployment_readiness_latest_codex`,
+    `btc_gpt_pro_action_status_latest_codex`, and GPT Pro packet
+    `gpt_pro_packets\strategy_advisor_20260518_110702`.
+- Latest readiness now has an explicit q250 YES-only focused row:
+  - candidate `q250_firstskip_qty500_yes`;
+  - source `latest_live_replay_rest_official`;
+  - `production_ready = False`;
+  - `live_official_trades = 1`;
+  - `live_official_pnl = +0.50`;
+  - `replay_execution_status = PASS_REPLAY_EXECUTION_FIELDS_NOT_PROMOTION`;
+  - `row_reconciliation_status = REPLAY_ROWS_WITHOUT_PAPER_SHADOW`;
+  - `row_reconciliation_promotion_usable = False`;
+  - `post_restart_verification_evidence_clock_ready = False`.
+- Conclusion unchanged: q250 YES-only remains the best next paper-forward
+  candidate, but its single positive focused replay row is not deployable
+  evidence. It needs explicit controlled paper start/restart, fresh matching
+  paper rows, official settlement, row reconciliation, and enough sample size.
+
+## 2026-05-18 - Refresh dependency order fixed for q250 YES-only replay
+
+- Found and fixed a dependency-order issue introduced by making q250 YES-only a
+  focused readiness row. `scripts\build_btc_execution_realism_audit.py` now
+  consumes the q250 YES-only post-freeze replay artifact, so the sequential
+  refresh must regenerate `btc15m_postfreeze_replay_refresh_latest_codex` before
+  execution-realism/readiness consume replay rows.
+- Updated `scripts\refresh_btc_evidence_stack.py` so the full refresh order is
+  now:
+  - shadow/process status;
+  - REST-official shadow settlement;
+  - BTC15M post-freeze replay/REST-official refresh;
+  - execution-realism audit;
+  - downstream schema, restart, collection, readiness, consistency, action
+    status, and GPT Pro packet artifacts.
+- Updated `scripts\test_btc_evidence_stack_refresh.py` to assert
+  `btc15m_postfreeze_replay_refresh` runs before `execution_realism_audit`.
+- Updated the reusable Kalshi BTC skill and deployability reference so the
+  manual fallback command order matches the controller.
+- Validation:
+  - `python -m py_compile scripts\refresh_btc_evidence_stack.py
+    scripts\test_btc_evidence_stack_refresh.py
+    scripts\build_btc_execution_realism_audit.py
+    scripts\check_btc_deployment_readiness.py
+    scripts\test_btc_readiness_row_reconciliation.py` passed;
+  - `python -m unittest scripts.test_btc_evidence_stack_refresh
+    scripts.test_btc_readiness_row_reconciliation -v` passed `8 / 8`;
+  - full refresh
+    `python scripts\refresh_btc_evidence_stack.py --out-dir
+    backtest_outputs\btc_evidence_stack_refresh_latest_codex` passed `30 / 30`
+    from `2026-05-18T17:10:09Z` to `2026-05-18T17:20:19Z`.
+- Latest refreshed artifacts under the corrected order:
+  - `deployment_readiness_latest_codex` has `production_ready_count=0`;
+  - q250 YES-only focused readiness row remains
+    `production_ready=False`, `live_official_trades=1`,
+    `live_official_pnl=+0.50`,
+    `replay_execution_status=PASS_REPLAY_EXECUTION_FIELDS_NOT_PROMOTION`,
+    `row_reconciliation_status=REPLAY_ROWS_WITHOUT_PAPER_SHADOW`, and
+    `post_restart_verification_evidence_clock_ready=False`;
+  - `btc_gpt_pro_action_status_latest_codex` remains no-deploy with
+    `post_restart_evidence_clock_ready=False`, `promotion_usable_rows=0`, and
+    `row_reconciliation_promotion_usable_count=0`;
+  - latest GPT Pro packet rebuilt at
+    `gpt_pro_packets\strategy_advisor_20260518_112016`.
+- Conclusion unchanged: this was an evidence-integrity fix, not new alpha.
+  q250 YES-only is still the top paper-forward path but remains undeployable
+  until explicit controlled paper start/restart and enough clean future rows.
+
+## 2026-05-18 - Settlement-basis gates folded into deployment readiness
+
+- Ran a fresh read-only evidence refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir
+  backtest_outputs\btc_evidence_stack_refresh_latest_codex`.
+  It passed `30 / 30` from `2026-05-18T17:25:00Z` to
+  `2026-05-18T17:36:09Z`; readiness still correctly returned no deploy with
+  `production_ready_count=0`.
+- Added settlement-basis gate fields to
+  `scripts\check_btc_deployment_readiness.py`. The main readiness table now
+  carries per-row `settlement_basis_gate_status`,
+  `settlement_basis_gate_reasons`, official row count, mismatch rate, adverse
+  mismatches, PnL delta per trade, and basis-size diagnostics from
+  `btc_settlement_basis_risk_audit_latest_codex`.
+- Added a regression test in
+  `scripts\test_btc_readiness_row_reconciliation.py` proving q250
+  first-signal raw replay is blocked when the NO-side official/proxy basis
+  gate fails.
+- Validation:
+  - `python -m py_compile scripts\check_btc_deployment_readiness.py
+    scripts\test_btc_readiness_row_reconciliation.py` passed;
+  - `python -m unittest scripts.test_btc_readiness_row_reconciliation -v`
+    passed `4 / 4`;
+  - regenerated `deployment_readiness_latest_codex`,
+    `btc_forward_evidence_report_latest_codex`,
+    `btc_gpt_pro_action_status_latest_codex`, and GPT Pro packet
+    `gpt_pro_packets\strategy_advisor_20260518_114055`.
+- Current focused readiness facts:
+  - raw `q250_firstskip_qty500`: `24` official replay rows, official PnL
+    `+3.74`, but settlement-basis gate `FAIL` with mismatch rate `18.75%`,
+    `3` adverse mismatches, and PnL delta `-0.1875` per both-result trade;
+  - `q250_firstskip_qty500_yes`: `1` focused replay row, official PnL
+    `+0.50`, basis-clean so far on the broader YES slice but only `8` basis
+    rows and still `REPLAY_ROWS_WITHOUT_PAPER_SHADOW`;
+  - `q1000_yes`: `8` official replay rows, official PnL `+0.90`, basis gate
+    only fails sample size (`too_few_official_rows`);
+  - BTC1H high-conf80 entry70 shadow: `13` all-time official rows, official
+    PnL `+1.92`, but settlement-basis gate `FAIL` with `16.67%` mismatch,
+    no causal replay comparator, and stale ledger execution fields.
+- Conclusion unchanged but sharper: raw q250 remains a basis-risk control, not
+  a deployment path. q250 YES-only is still the top paper-forward candidate,
+  but the next real evidence step is explicit guarded paper-only
+  start/restart, then fresh official-settled row-reconciled rows.
+
+## 2026-05-18 - BTC1H replay coverage audit made sidecar-aware
+
+- Investigated the BTC1H runner-up blocker. Current process state still has
+  `scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py` running, but its
+  active capture DB is locked by the live writer and the already-running
+  process predates lock-free replay sidecars.
+- Updated `scripts\btc_1hr_research_live.py` so future capture writers emit a
+  lock-free `.replay.jsonl` sidecar alongside the DuckDB. The sidecar records
+  replay-relevant `ws_orderbook_top`, `signal_scan`, `order_decision`, and
+  `ws_lifecycle` rows as they are flushed.
+- Updated `scripts\build_btc1h_replay_coverage_audit.py` to:
+  - use the replay sidecar if the active DuckDB is locked;
+  - batch coverage counts by source/table instead of issuing repeated
+    per-trade count queries over large capture DBs;
+  - avoid repeatedly retrying an already-known locked/no-sidecar source.
+- Updated `scripts\check_btc_forward_shadow_status.py` so future status reports
+  expose replay sidecar path, mtime, and row counts from the status sidecar.
+- Validation:
+  - `python -m py_compile scripts\btc_1hr_research_live.py
+    scripts\build_btc1h_replay_coverage_audit.py
+    scripts\check_btc_forward_shadow_status.py
+    scripts\test_btc1h_replay_coverage_audit.py` passed;
+  - `python -m unittest scripts.test_btc1h_replay_coverage_audit -v` passed
+    `4 / 4`;
+  - regenerated `btc1h_replay_coverage_audit_latest_codex`,
+    `btc_forward_shadow_status_latest_codex`,
+    `btc_forward_consistency_audit_latest_codex`,
+    `btc_gpt_pro_action_status_latest_codex`, and GPT Pro packet
+    `gpt_pro_packets\strategy_advisor_20260518_120236`.
+- Current BTC1H evidence remains not deployable:
+  - all rows: `13` paper rows, `3` replayable rows, `10` locked-blocked rows;
+  - since freeze: `8` paper rows, `0` replayable rows, `8` locked-blocked rows;
+  - action status still reports `btc1h_replay_coverage =
+    BLOCKS_BTC1H_PROMOTION`.
+- Conclusion: this is an infrastructure fix for future BTC1H validation, not
+  new alpha. BTC1H remains observe-only until an explicitly authorized
+  clean-schema restart produces a fresh replay sidecar and official-settled
+  paper rows that can be row-reconciled.
+
+## 2026-05-18 - Full refresh verified after BTC1H sidecar-aware audit
+
+- Ran the full read-only controller after the BTC1H replay coverage changes:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir
+  backtest_outputs\btc_evidence_stack_refresh_latest_codex`.
+- Result: passed `30 / 30` from `2026-05-18T18:04:53Z` to
+  `2026-05-18T18:08:09Z`. Readiness exit code `1` remained expected because
+  `production_ready_count=0`.
+- The current q250 YES-only path is structurally ready but not authorized or
+  running:
+  - restart authorization status
+    `READY_FOR_USER_AUTHORIZATION_TO_START`;
+  - restart path `PASS_RESTART_PATH_READY`;
+  - fresh ledger schema `PASS_SCHEMA_READY`;
+  - execution-realism insert preflight `PASS_INSERT_REALISM_FIELDS`;
+  - fresh capture sidecar preflight `PASS_CAPTURE_SIDECAR`;
+  - active ledger status remains `DB_MISSING` because it has not been started.
+- Updated reusable workflow notes in the local Kalshi BTC skill so manual
+  refresh order includes settlement-basis risk and guard-candidate steps, and
+  documented the new BTC1H `.replay.jsonl` sidecar expectation.
+- Conclusion unchanged: no deploy/canary. The honest next evidence step is
+  still explicit guarded paper-only start/restart, after which future q250
+  YES-only rows can be tested for official settlement, execution realism,
+  row reconciliation, drawdown path quality, and sample size.
+
+## 2026-05-18 - GPT Pro Chrome loop and guarded restart dry-run refresh
+
+- Verified the Chrome extension path for the GPT Pro workflow using the `Sami`
+  Chrome profile. ChatGPT was logged in, the composer was available, and the
+  visible model control showed `Pro`.
+- Submitted the latest strategy packet from
+  `gpt_pro_packets\strategy_advisor_20260518_120807` to ChatGPT Pro by pasting
+  the prompt plus inline `evidence_bundle.md`. ChatGPT converted the long paste
+  into a pasted-text attachment and returned a review after `4m 32s`.
+- Saved the exact browser-copied response to
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_chrome_exact_20260518_1222.md`.
+  The review agrees with the local gates:
+  - nothing is deployable now, including canary deployment;
+  - `q250_firstskip_qty500_yes` is the top paper-forward path but has zero
+    promotion-usable rows and is not running;
+  - `q1000_yes` remains only a sparse cleaner control;
+  - raw `q250_firstskip_qty500` is basis/side decomposition research, not a
+    deployable both-side strategy;
+  - BTC1H remains observe-only until clean schema, official rows, and causal
+    replay coverage exist.
+- Ran the guarded paper-shadow restart controller without `-Execute`:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File
+  scripts\restart_btc_paper_shadows.ps1 -StartupWaitSec 1`.
+  It wrote
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_121230\restart_plan.json`
+  and explicitly reported dry run only; no processes were stopped or started.
+- Re-checked matching Python processes after the dry run. The state remained:
+  - `btc15m_live_capture.py` PID `1724`;
+  - q250 raw shadow PID `7052`;
+  - q1000 YES shadow PID `24840`;
+  - BTC1H high-conf80 shadow PID `16216`;
+  - q250 YES-only still not running.
+- Rebuilt
+  `backtest_outputs\btc_restart_authorization_packet_latest_codex` and
+  `backtest_outputs\btc_gpt_pro_action_status_latest_codex`; they now point at
+  the latest dry-run directory and still require explicit user authorization
+  before any paper restart/start command may run.
+- Validation:
+  - `python -m unittest scripts.test_btc15m_shadow_config
+    scripts.test_btc_paper_restart_safety -v` passed `14 / 14`;
+  - `python -m unittest scripts.test_btc_settlement_basis_model_feasibility
+    scripts.test_btc_settlement_basis_risk_audit -v` passed `4 / 4`.
+- Conclusion unchanged: no deploy and no paper restart was executed. The only
+  operational unlock is still explicit authorization for the guarded paper-only
+  restart/start. Without that, the remaining honest work is read-only official
+  settlement, basis-risk, replay, and ledger-validation research.
+
+## 2026-05-18 - Predexon metadata-vs-REST source-fidelity audit added
+
+- Ran the full read-only evidence refresh after adding a Predexon metadata
+  source-fidelity check:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir
+  backtest_outputs\btc_evidence_stack_refresh_latest_codex`.
+  It passed `31 / 31` from `2026-05-18T18:32:40Z` to
+  `2026-05-18T18:36:17Z`; readiness still returned the expected no-deploy
+  exit code with `production_ready_count=0`.
+- Added `scripts\audit_btc15m_predexon_metadata_vs_rest.py` and wired it into
+  `scripts\refresh_btc_evidence_stack.py` plus the GPT Pro packet builder.
+  The artifact is:
+  `backtest_outputs\btc15m_predexon_metadata_vs_rest_latest_codex`.
+- Result: Predexon metadata labels match Kalshi REST official labels on every
+  overlapping row in the current materialized BTC15M Predexon set:
+  - all rows: `1100` REST/metadata overlaps, `0` mismatches;
+  - q250 first-skip qty>=500: `57` overlaps, `0` mismatches;
+  - q250 YES: `31` overlaps, `0` mismatches;
+  - q1000 YES: `23` overlaps, `0` mismatches.
+- Interpretation: full-coverage Predexon metadata can be used as a historical
+  research label when REST 404 leaves old rows uncovered, but metadata-only
+  rows remain research diagnostics. They cannot replace live/paper
+  REST-official settlement, row reconciliation, execution-realism fields, or
+  the post-restart evidence clock for promotion.
+- Validation:
+  - `python -m py_compile scripts\audit_btc15m_predexon_metadata_vs_rest.py
+    scripts\test_btc15m_predexon_metadata_vs_rest.py
+    scripts\refresh_btc_evidence_stack.py scripts\build_gpt_pro_strategy_packet.py`
+    passed;
+  - `python -m unittest scripts.test_btc15m_predexon_metadata_vs_rest -v`
+    passed `2 / 2`.
+- Conclusion unchanged for deployment: no live/canary/paper promotion. This
+  only strengthens the historical-research lane for future frozen candidate
+  screening while preserving the live websocket and official REST gates.
+
+## 2026-05-18 - Metadata-labeled grid and GPT Pro triage artifact
+
+- Re-ran the BTC15M materialized first-signal grid on the REST-filled Predexon
+  parquet with full-coverage Predexon metadata labels:
+  `python scripts\audit_btc15m_materialized_filter_grid.py --predexon-trades
+  backtest_outputs\btc15m_predexon_rest_official_latest_codex\predexon_trades_rest_official.parquet
+  --pred-pnl-col pnl_predexon_metadata_2c --pred-win-col
+  win_pnl_predexon_metadata_2c --min-pred-official-coverage 1.0 --out-dir
+  backtest_outputs\btc15m_materialized_filter_grid_metadata_latest_codex`.
+- Result: metadata labels preserve the same research-only shape as before:
+  - `q250` first-signal qty>=500 both-side remains the strongest historical
+    materialized row: `63` metadata-labeled Predexon trades, PnL `+8.31`,
+    win `61.90%`, max DD `-1.97`, Sharpe `2.09`; live REST-official replay
+    still has only `17` rows in the materialized grid table, PnL `+4.30`,
+    win `76.47%`;
+  - `q1000_yes` remains cleaner but too sparse: `33` metadata-labeled
+    Predexon trades, PnL `+7.98`, win `69.70%`; live REST-official replay
+    has only `7-8` rows depending on artifact cut and cannot pass sample
+    gates;
+  - higher-edge rows are even sparser and remain research-only.
+- Added `scripts\audit_btc_strategy_triage.py`, a read-only GPT-Pro-facing
+  triage builder. It merges the latest readiness, opportunity-rate,
+  metadata-vs-REST, Predexon historical labels, and live REST-official replay
+  into `backtest_outputs\btc_strategy_triage_latest_codex`.
+- Full refresh after wiring the triage builder into
+  `scripts\refresh_btc_evidence_stack.py` passed `32 / 32` from
+  `2026-05-18T18:51:24Z` to `2026-05-18T18:55:44Z`. Readiness still returned
+  the expected no-deploy code with `production_ready_count = 0`.
+- Current triage verdict:
+  - `q250_firstskip_qty500_yes` is the top paper-forward path, but is not
+    running as a clean paper shadow. Evidence: `28` metadata-labeled
+    historical rows, PnL `+4.44`, win `64.29%`; `24` REST-official historical
+    overlap rows, PnL `+4.89`; live official replay `6` rows, PnL `+0.90`;
+    post-freeze official rows `1`, PnL `+0.50`; projected about `60` days to
+    `100` post-freeze official rows at current rate.
+  - `q250_firstskip_qty500` is research-only/basis-decomposition: `63`
+    metadata-labeled historical rows, PnL `+8.31`; `57` REST-overlap rows,
+    PnL `+8.72`; live official replay `24` rows, PnL `+3.74`; but it has
+    `3` official/proxy mismatches, stale ledger schema, no clean
+    post-restart ledger evidence, settlement-basis/NO-side fragility, and was
+    selected after prior live replay.
+  - `q1000_yes` is a sparse control: `33` metadata-labeled historical rows,
+    PnL `+7.98`; `23` REST-overlap rows, PnL `+6.45`; live official replay
+    `8` rows, PnL `+0.90`; post-freeze official rows `1`, PnL `+0.50`; stale
+    ledger schema and sample-size blockers remain.
+  - Broad `q250`/`q500`/`q1000` remain rejected because official REST replay
+    is negative: `-1.16`, `-1.14`, and `-1.31`, respectively.
+  - BTC1H `high_conf_80_entry70_no_chase` remains observe-only: causal replay
+    coverage and clean official-settled ledger evidence are still missing.
+- The refreshed GPT Pro packet is
+  `gpt_pro_packets\strategy_advisor_20260518_125541` and now includes the
+  triage artifact plus metadata-vs-REST source-fidelity evidence.
+- Validation:
+  - `python -m py_compile scripts\audit_btc_strategy_triage.py
+    scripts\refresh_btc_evidence_stack.py scripts\build_gpt_pro_strategy_packet.py`
+    passed;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir
+    backtest_outputs\btc_evidence_stack_refresh_latest_codex` passed `32 / 32`.
+- Conclusion unchanged: no deployment, no canary, no broad q-strategy
+  revival, and no BTC1H promotion. The only honest operational unlock remains
+  explicit guarded paper-only start/restart so future rows can be counted with
+  clean execution-realism fields and official settlement.
+
+## 2026-05-18 - q250 YES first-signal side-semantics audit strengthened
+
+- Updated `scripts\audit_btc15m_first_signal_side_semantics.py` so it no
+  longer checks only the tiny post-freeze replay. It now compares both:
+  - full old q250 first-skip replay vs q250 YES-only replay;
+  - post-freeze q250 first-skip replay vs post-freeze q250 YES-only replay.
+- Added explicit fields for:
+  - side-filter extra events;
+  - target-side global-first rows missing from the side replay;
+  - replay config comparability and missing/mismatched config keys.
+- Result from
+  `backtest_outputs\btc15m_first_signal_side_semantics_latest_codex`:
+  - full old replay: side-filtered q250 YES did not add events or wait past an
+    earlier NO, but it is a strict subset: `24` global first rows, `8` global
+    YES rows, `6` side-filtered YES rows, `2` global YES rows missing from the
+    side replay. The old full comparison is not fully config-comparable because
+    the old global q250 replay run info lacks `max_btc_spot_age_sec`
+    provenance.
+  - post-freeze replay: config-comparable and clean subset: `2` global rows,
+    `1` side-filtered YES row, `0` side-filter extra events, `0` target-side
+    missing rows.
+- The two missing full-old global YES rows are:
+  - `KXBTC15M-26MAY120815`, official/proxy PnL `+0.47`;
+  - `KXBTC15M-26MAY161945`, official/proxy PnL `-0.49`.
+  Net effect is approximately `-0.02`, so this does not rescue or kill q250
+  YES, but it does make the full-old comparison diagnostic rather than a clean
+  apples-to-apples proof.
+- Full read-only refresh after this change passed `32 / 32` from
+  `2026-05-18T19:05:36Z` to `2026-05-18T19:08:18Z`. Readiness still returned
+  the expected no-deploy code with `production_ready_count = 0`.
+- New GPT Pro packet:
+  `gpt_pro_packets\strategy_advisor_20260518_130815`; it includes the
+  strengthened side-semantics report.
+- Validation:
+  - `python -m py_compile scripts\audit_btc15m_first_signal_side_semantics.py
+    scripts\test_btc15m_first_signal_side_semantics.py` passed;
+  - `python -m unittest scripts.test_btc15m_first_signal_side_semantics -v`
+    passed `4 / 4`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir
+    backtest_outputs\btc_evidence_stack_refresh_latest_codex` passed `32 / 32`.
+- Conclusion unchanged: q250 YES-only remains the top paper-forward BTC15M
+  path only after explicit guarded paper-only start/restart. Old full-replay
+  rows remain diagnostic, especially where config provenance is incomplete.
+
+## 2026-05-18 - Full causal replay artifacts replaced stale full-window defaults
+
+- Added and ran `scripts\refresh_btc15m_full_causal_replays.py`, a read-only
+  full-window companion to the post-freeze replay refresher. It rebuilds the
+  q250 first-skip, q250 first-skip YES-only, and q1000 YES live websocket
+  replays with explicit `max_btc_spot_age_sec=10`, then REST-fills official
+  Kalshi settlement.
+- Latest artifact:
+  `backtest_outputs\btc15m_full_causal_replay_refresh_latest_codex`.
+  It completed successfully and produced:
+  - `q250_firstskip_qty500`: `25` official rows, official PnL `+3.18`,
+    win `64.00%`, proxy PnL `+7.18`, `4` proxy/official mismatches, and
+    official-minus-proxy PnL `-4.00`;
+  - `q250_firstskip_qty500_yes`: `7` official rows, official PnL `+1.40`,
+    win `71.43%`, proxy PnL `+1.40`, and `0` proxy/official mismatches;
+  - `q1000_yes`: `7` official rows, official PnL `+1.42`, win `71.43%`,
+    proxy PnL `+1.42`, and `0` proxy/official mismatches.
+- Updated downstream defaults so the full-window reports prefer the new causal
+  full replay artifacts instead of the older full replay with incomplete run
+  provenance:
+  - `build_btc15m_frozen_opportunity_rate_report.py`;
+  - `build_btc15m_shadow_replay_config_audit.py`;
+  - `audit_btc15m_first_signal_side_semantics.py`;
+  - `build_btc_execution_realism_audit.py`;
+  - `analyze_btc15m_latest_live_replay_diagnostics.py`;
+  - `build_btc15m_settlement_basis_watch.py`;
+  - `audit_btc_strategy_triage.py`;
+  - `check_btc_deployment_readiness.py`;
+  - `build_gpt_pro_strategy_packet.py`;
+  - `refresh_btc_evidence_stack.py`.
+- Fixed a config-audit parser blind spot in
+  `scripts\build_btc15m_shadow_replay_config_audit.py`: the audit now reads
+  both `os.environ[...] = ...` assignments and `os.environ.setdefault(...)`.
+  The previous failure was not actual wrapper drift; after the fix, all three
+  BTC15M wrappers match their causal replay configs and the restart script
+  includes the targets.
+- Rebuilt dependent reports without executing any process restart:
+  - `btc15m_shadow_replay_config_audit_latest_codex`: `0` failed config checks
+    for q250 raw, q250 YES, and q1000 YES;
+  - `btc15m_first_signal_side_semantics_latest_codex`: full causal q250 YES is
+    a clean subset of full causal q250 raw (`25` global rows, `7` YES rows,
+    `0` side-filter extra events, `0` missing target-side rows,
+    config-comparable);
+  - `deployment_readiness_latest_codex`: `production_ready_count=0`, with the
+    latest live replay dirs now pointing at the causal REST-official artifacts;
+  - `btc_strategy_triage_latest_codex`: q250 YES remains the top
+    paper-forward path but is not running; q250 raw is still basis
+    decomposition; q1000 YES remains sparse control; BTC1H remains observe-only.
+- Tried to submit the refreshed
+  `gpt_pro_packets\strategy_advisor_20260518_133949` packet through the Chrome
+  extension. Chrome was reachable, logged into the `samisai Pro` account, and
+  the composer showed `Pro`, but the extension pipe broke while pasting the
+  full 1 MB bundle. The in-app browser fallback reached ChatGPT's login page,
+  so no password/account flow was attempted. The packet remains ready for
+  manual Pro paste/upload.
+- Re-read the saved GPT Pro review
+  `docs\gpt_pro_reviews\gpt_pro_strategy_advisor_chrome_exact_20260518_1222.md`.
+  Its core recommendation still agrees with local evidence: no deploy/canary;
+  the next operational unlock is explicit user authorization for the guarded
+  paper-only restart/start so future q250 YES rows can count.
+- Ran the guarded restart controller without `-Execute` only. It wrote
+  `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_134328\restart_plan.json`
+  and reported dry run only; no processes were stopped or started. The dry run
+  includes q250 raw, q250 YES-only, q1000 YES, and BTC1H high-conf80 entry70
+  no-chase, and all script safety checks pass.
+- Current matching Python processes after the dry run are still:
+  `btc15m_live_capture.py` PID `1724`, q250 raw shadow PID `7052`,
+  q1000 YES shadow PID `24840`, and BTC1H high-conf80 shadow PID `16216`.
+  q250 YES-only is still not running.
+- Conclusion unchanged: no deploy and no paper restart was executed. The
+  strongest honest next step is still explicit guarded paper-only
+  start/restart, followed by official-settled row reconciliation on future
+  clean-schema rows. Without that authorization, all current q250 YES and
+  q1000 YES positives remain small-sample research evidence only.
+- Full evidence-stack validation after wiring the causal full-window step into
+  the controller passed `36 / 36` from `2026-05-18T19:45:55Z` to
+  `2026-05-18T20:03:47Z`. The readiness step still returned the expected
+  no-deploy code with `production_ready_count=0`. The refreshed GPT Pro packet
+  is `gpt_pro_packets\strategy_advisor_20260518_140345`.
+
+## 2026-05-18 - Browser-safe GPT Pro packet fallback added
+
+- The full GPT Pro evidence bundle is now about 1 MB, which previously broke
+  the Chrome extension paste pipe. Added a compact inline fallback to
+  `scripts\build_gpt_pro_strategy_packet.py`:
+  - `evidence_bundle_compact.md`: highest-signal artifacts only;
+  - `browser_safe_prompt.md`: the normal review prompt plus compact evidence
+    inline, intended for direct ChatGPT Pro paste when upload automation is
+    unavailable.
+- Added `-CopyBrowserSafe` to `scripts\ask_gpt_pro_strategy.ps1` so the
+  fallback workflow is:
+  `.\scripts\ask_gpt_pro_strategy.ps1 -CopyBrowserSafe -OpenChatGPT`.
+- Updated `docs\gpt_pro_workflow.md` plus local reusable GPT Pro/Kalshi skill
+  notes with the compact fallback.
+- Generated and validated packet
+  `gpt_pro_packets\strategy_advisor_20260518_140901`. Current size check:
+  `browser_safe_prompt.md` is approximately `119k` characters, versus about
+  `1.0M` for the full `evidence_bundle.md`.
+- Also validated the real fallback command
+  `powershell -NoProfile -ExecutionPolicy Bypass -File
+  scripts\ask_gpt_pro_strategy.ps1 -CopyBrowserSafe`, which generated
+  `gpt_pro_packets\strategy_advisor_20260518_140951` and copied the compact
+  prompt without opening or submitting ChatGPT.
+- Retried the Chrome extension after the prior oversized paste failure; the
+  extension still returned a closed native pipe, so no GPT Pro submission was
+  performed from Codex. The in-app browser is not logged into ChatGPT, and no
+  password/account flow was attempted.
+- Validation:
+  - `python -m py_compile scripts\build_gpt_pro_strategy_packet.py` passed;
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File
+    scripts\ask_gpt_pro_strategy.ps1` passed and printed the new
+    browser-safe/compact paths;
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File
+    scripts\ask_gpt_pro_strategy.ps1 -CopyBrowserSafe` passed.
+- Conclusion unchanged: this improves the GPT Pro review loop, not strategy
+  deployability. The current deployment blocker remains explicit paper-only
+  restart/start plus future official-settled, execution-realistic row
+  reconciliation.
+
+## 2026-05-18 - Running-source freshness added to forward status
+
+- Refreshed lightweight forward status and official settlement without
+  restarting any process:
+  - `python scripts\check_btc_forward_shadow_status.py --out-dir
+    backtest_outputs\btc_forward_shadow_status_latest_codex --since-utc
+    2026-05-18T02:42:00+00:00`;
+  - `python scripts\check_btc_shadow_official_settlement.py --out-dir
+    backtest_outputs\btc_shadow_official_settlement_latest_codex --since-utc
+    2026-05-18T02:42:00+00:00`.
+- Current process state remains `4/5` targets running:
+  - BTC15M capture PID `1724`;
+  - q250 raw shadow PID `7052`;
+  - q1000 YES shadow PID `24840`;
+  - BTC1H high-conf80 entry70 shadow PID `16216`;
+  - q250 YES-only still not running.
+- No new BTC15M paper fills appeared in this lightweight refresh. Current
+  stale-schema paper official rows remain:
+  - q250 raw shadow: `2` official rows since freeze, official PnL `+0.04`;
+  - q1000 YES shadow: `1` official row since freeze, official PnL `+0.52`;
+  - q250 YES-only: `0` rows because it is not running.
+- BTC1H official paper rows remain superficially positive but not promotion
+  usable:
+  - all rows: `13` official rows, official PnL `+1.92`, `2` proxy/official
+    mismatches;
+  - since freeze: `10` official rows, official PnL `+1.02`, `1`
+    proxy/official mismatch.
+- Added running-source freshness fields to
+  `scripts\check_btc_forward_shadow_status.py`:
+  - `source_freshness_status`;
+  - `source_latest_path`;
+  - `source_latest_mtime_utc`;
+  - `process_predates_latest_source`.
+- Important result from
+  `backtest_outputs\btc_forward_shadow_status_latest_codex`:
+  - q250 raw shadow is `RUNNING_SOURCE_STALE_RESTART_REQUIRED`;
+  - q1000 YES shadow is `RUNNING_SOURCE_STALE_RESTART_REQUIRED`;
+  - BTC1H high-conf80 shadow is `RUNNING_SOURCE_STALE_RESTART_REQUIRED`,
+    with latest source `scripts\btc_1hr_research_live.py`;
+  - BTC15M capture is `RUNNING_SOURCE_CURRENT`;
+  - q250 YES-only is `NOT_RUNNING_OR_PROCESS_TIME_MISSING`.
+- This clarifies the BTC1H replay-sidecar blocker: the source code now has
+  replay sidecar support, but the active BTC1H process started at
+  `2026-05-18T02:41:59Z`, before the current
+  `scripts\btc_1hr_research_live.py` mtime
+  `2026-05-18T17:45:48Z`. Therefore the currently running BTC1H process cannot
+  be assumed to emit the new sidecar until an explicitly authorized controlled
+  restart.
+- Rebuilt dependent read-only reports:
+  - `btc_post_restart_collection_gate_latest_codex`;
+  - `btc_post_restart_verification_latest_codex`;
+  - `btc1h_replay_coverage_audit_latest_codex`;
+  - `deployment_readiness_latest_codex`;
+  - `btc_forward_evidence_report_latest_codex`;
+  - `btc_forward_consistency_audit_latest_codex`;
+  - `btc_gpt_pro_action_status_latest_codex`;
+  - `gpt_pro_packets\strategy_advisor_20260518_141617`.
+- Latest forward evidence report now exposes `source_freshness_status` in the
+  forward shadow summary. It still says no deploy, with readiness
+  `production_ready_count=0`.
+- Validation:
+  - `python -m py_compile scripts\check_btc_forward_shadow_status.py
+    scripts\test_btc_forward_shadow_status.py
+    scripts\build_btc_forward_evidence_report.py` passed;
+  - `python -m unittest scripts.test_btc_forward_shadow_status -v` passed
+    `3 / 3`.
+- Conclusion unchanged: existing running processes are collection diagnostics
+  only. The fact that they are running does not satisfy the current-code,
+  sidecar, clean-schema, post-restart, row-reconciliation, official-settlement,
+  or sample-size gates.
+
+## 2026-05-18 - Source freshness promoted into readiness/action gates
+
+- Tightened the deployment-control artifacts so running-source freshness is no
+  longer just a status-table diagnostic. It is now a hard blocker in:
+  - `scripts\check_btc_deployment_readiness.py`;
+  - `scripts\build_btc_gpt_pro_action_status.py`;
+  - `scripts\build_btc_forward_consistency_audit.py`;
+  - `scripts\build_btc_kill_continue_report.py`.
+- Refreshed forward status with the stable freeze timestamp:
+  - `python scripts\check_btc_forward_shadow_status.py --out-dir
+    backtest_outputs\btc_forward_shadow_status_latest_codex --since-utc
+    2026-05-18T04:17:44Z`.
+- Latest source-freshness gate outcome:
+  - target shadows source-current: `0 / 4`;
+  - stale or predating latest source: `3`;
+  - not running or missing: `1`;
+  - `running_source_freshness = BLOCKS_DEPLOYMENT`.
+- Current promotion state remains unchanged:
+  - `deployment_readiness_latest_codex` has `production_ready_count = 0`;
+  - `btc_forward_consistency_audit_latest_codex` has
+    `consistent_enough_for_promotion_count = 0 / 4`;
+  - `btc_gpt_pro_action_status_latest_codex` still says `NO DEPLOY`.
+- Ran the guarded paper-shadow restart script without `-Execute` only:
+  - `powershell -ExecutionPolicy Bypass -File
+    scripts\restart_btc_paper_shadows.ps1`;
+  - it wrote
+    `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_142812`
+    and explicitly reported `Dry run only. No processes were stopped or
+    started.`
+- Rebuilt the restart authorization packet:
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`;
+  - all four targets are ready for explicit paper-only authorization, but this
+    still authorizes nothing by itself.
+- Latest GPT Pro packet:
+  - `gpt_pro_packets\strategy_advisor_20260518_142849`;
+  - browser-safe prompt was prepared for fallback/manual ChatGPT Pro submission
+    because callable Chrome automation is not currently available in this
+    session.
+- Conclusion unchanged and stricter: rows from the currently running q250 raw,
+  q1000 YES, and BTC1H shadows cannot count toward promotion because those
+  processes predate their latest source files. q250 YES-only remains the top
+  paper-forward research path, but it is not running and has zero
+  promotion-usable rows. No live deployment and no one-contract canary.
+
+## 2026-05-18 - Freeze timestamp aligned for promotion-facing since counts
+
+- Found and fixed a mixed-window evidence issue: the refresh controller and
+  skill workflow still defaulted `--since-utc` to the paper process-start time
+  `2026-05-18T02:42:00+00:00`, while the frozen promotion window is
+  `2026-05-18T04:17:44Z`.
+- Updated `scripts\refresh_btc_evidence_stack.py` so `DEFAULT_SINCE_UTC`
+  equals `DEFAULT_FREEZE_UTC`, and updated the reusable
+  `kalshi-btc-strategy-research` skill workflow to use
+  `2026-05-18T04:17:44Z` for both forward-shadow status and shadow official
+  settlement refreshes.
+- Refreshed current read-only evidence with the corrected freeze timestamp:
+  - `btc_forward_shadow_status_latest_codex`;
+  - `btc_shadow_official_settlement_latest_codex`;
+  - `btc_post_restart_collection_gate_latest_codex`;
+  - `btc_drawdown_sequence_audit_latest_codex`;
+  - `btc_forward_row_reconciliation_latest_codex`;
+  - `btc_official_settlement_feature_table_latest_codex`;
+  - `btc_settlement_basis_risk_audit_latest_codex`;
+  - `btc1h_replay_coverage_audit_latest_codex`;
+  - `deployment_readiness_latest_codex`;
+  - `btc_forward_evidence_report_latest_codex`;
+  - `btc_strategy_triage_latest_codex`;
+  - `btc_kill_continue_latest_codex`;
+  - `btc_forward_consistency_audit_latest_codex`;
+  - `btc_gpt_pro_action_status_latest_codex`;
+  - `gpt_pro_packets\strategy_advisor_20260518_143556`.
+- Important corrected BTC1H result:
+  - since-freeze BTC1H official rows are now `8`, not the older mixed-window
+    `10`;
+  - official PnL is `+0.40`, proxy PnL is `+1.40`;
+  - there is `1` proxy/official mismatch;
+  - drawdown/PnL ratio is `1.675`, so even the diagnostic path quality is
+    weak.
+- Added a readiness regression test proving that a candidate with otherwise
+  passing execution/schema/reconciliation inputs is still blocked when the
+  running process predates its source file:
+  - `scripts\test_btc_readiness_row_reconciliation.py::test_running_shadow_predating_source_blocks_readiness`.
+- Validated the refresh controller dry-run now emits the freeze timestamp for
+  the first two dependency-order steps:
+  - forward status uses `--since-utc 2026-05-18T04:17:44Z`;
+  - shadow official settlement uses `--since-utc 2026-05-18T04:17:44Z`.
+- Current conclusion remains no deploy:
+  - `production_ready_count = 0`;
+  - `consistent_enough_for_promotion_count = 0 / 4`;
+  - source-current target shadows remain `0 / 4`;
+  - q250 YES-only remains not running;
+  - any paper-only restart/start still requires explicit user authorization.
+
+## 2026-05-18 - Fee realism made explicit and latest Pro packet rebuilt
+
+- Ran the full read-only evidence refresh:
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir
+    backtest_outputs\btc_evidence_stack_refresh_latest_codex`;
+  - all `36 / 36` steps completed, with deployment readiness return code `1`
+    accepted as the expected no-deploy verdict.
+- Re-checked processes before acting. Current matching Python processes remain:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PID `16216`.
+- Strengthened fee/execution evidence:
+  - `scripts\build_btc_execution_realism_audit.py` now reports
+    `fee_present_rate`, `fee_nonnegative_rate`, `fee_mean`, `fee_max`,
+    `actual_fee_official_pnl`, and `stressed_2c_official_pnl`;
+  - negative or missing fees now add a direct `fee_missing_or_negative`
+    blocker;
+  - `scripts\check_btc_deployment_readiness.py` carries fee-realism fields
+    into readiness and labels fee failures separately from missing schema
+    fields;
+  - `scripts\build_btc_kill_continue_report.py` surfaces fee-present and
+    fee-nonnegative rates in the compact handoff table.
+- Added regression coverage:
+  - `scripts\test_btc_execution_realism_audit.py`;
+  - verifies live replay fee fields and actual-fee versus 2c-stressed PnL;
+  - verifies a negative ledger fee fails even when all other execution fields
+    are present;
+  - verifies readiness emits `shadow_ledger_fee_realism_not_passing` rather
+    than a misleading missing-field reason for fee-only failures.
+- Refreshed affected artifacts:
+  - `btc_execution_realism_audit_latest_codex`;
+  - `deployment_readiness_latest_codex`;
+  - `btc_kill_continue_latest_codex`;
+  - `btc_forward_evidence_report_latest_codex`;
+  - `btc_strategy_triage_latest_codex`;
+  - `btc_forward_consistency_audit_latest_codex`;
+  - `btc_restart_authorization_packet_latest_codex`;
+  - `btc_gpt_pro_action_status_latest_codex`.
+- Latest execution-realism result:
+  - causal live replay rows have fee-present and fee-nonnegative rates `1.0`;
+  - q250 firstskip live replay: actual-fee official PnL `+3.68`,
+    stressed-2c official PnL `+3.18`;
+  - q250 YES-only live replay: actual-fee official PnL `+1.54`,
+    stressed-2c official PnL `+1.40`;
+  - q1000 YES live replay: actual-fee official PnL `+1.56`,
+    stressed-2c official PnL `+1.42`;
+  - active paper ledgers still fail because old schemas lack quote age, top
+    visible quantity, quote/signal timestamps, and decision-time book columns.
+- Ran the guarded paper-shadow restart workflow as a dry run only:
+  - `powershell -ExecutionPolicy Bypass -File
+    scripts\restart_btc_paper_shadows.ps1`;
+  - wrote
+    `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_145334`;
+  - confirmed `execute = false`, capture process `btc15m_live_capture.py`
+    would remain untouched, and all four target scripts pass safety checks.
+- Latest action status:
+  - `production_ready_count = 0`;
+  - forward consistency promotion count `0 / 4`;
+  - source-current target shadows `0 / 4`;
+  - post-restart evidence clock is not started;
+  - q250 YES-only remains the top Pro-ranked path, but it is not running and
+    needs explicit user authorization before future rows can count.
+- GPT Pro workflow status:
+  - Chrome extension was discoverable, but tab control failed again with the
+    same native-pipe failure pattern;
+  - the in-app browser opens ChatGPT at `https://chatgpt.com/auth/login`, so
+    it is not logged in;
+  - fallback packet was built and copied with
+    `scripts\ask_gpt_pro_strategy.ps1 -CopyBrowserSafe -OpenChatGPT`;
+  - latest packet:
+    `gpt_pro_packets\strategy_advisor_20260518_145903`.
+- Conclusion unchanged: no BTC15M or BTC1H strategy is deployable. The only
+  operational next step recommended by the current local gates and GPT Pro
+  review is an explicitly authorized paper-only restart/start; without that,
+  continue non-disruptive audit hardening and do not count stale active-ledger
+  rows toward promotion.
+
+## 2026-05-18 - GPT Pro action checklist now exposes fee/FOK realism gate
+
+- Re-checked matching Python processes before this pass. Process state was
+  unchanged:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PID `16216`.
+- Added a standalone deployment-control check to
+  `scripts\build_btc_gpt_pro_action_status.py`:
+  - `fee_top_book_fok_execution_realism`;
+  - consumes `btc_execution_realism_audit_latest_codex`;
+  - reports replay-ready count, ledger-ready count, fee issue rows,
+    top-book/FOK issue rows, and no-filled-ledger rows;
+  - requires fee-present, nonnegative-fee, executable side ask,
+    visible-size/FOK, quote-freshness, and one-trade-per-event evidence in
+    both replay and ledger rows.
+- Added regression coverage in `scripts\test_btc_gpt_pro_action_status.py`:
+  - clean replay plus clean ledger passes the helper;
+  - missing ledger top-visible/FOK fields block the helper;
+  - empty ledger rows are counted as `no_filled_ledger_rows`, not mislabeled
+    as fee failures.
+- Rebuilt:
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`;
+  - `gpt_pro_packets\strategy_advisor_20260518_150444`.
+- Latest action checklist now makes the blocker explicit:
+  - `fee_top_book_fok_execution_realism = BLOCKS_DEPLOYMENT`;
+  - replay-ready rows `3 / 3`;
+  - ledger-ready rows `0 / 4`;
+  - fee issue rows `0`;
+  - top-book/FOK issue rows `3`;
+  - no-filled-ledger rows `1`.
+- Interpretation: live replay evidence currently proves fee and executable
+  top-book realism for the replayed BTC15M rows, but no active paper ledger is
+  deployable evidence. Three running old-schema ledgers lack quote age,
+  visible quantity, and decision-time book fields; q250 YES-only has no filled
+  ledger rows because it has not been started. This keeps the restart/start
+  authorization path as the only honest next operational step, and still
+  authorizes no live deployment.
+
+## 2026-05-18 - q250 YES first-signal side semantics promoted to action gate
+
+- Re-checked process state before this pass. It remained unchanged:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PID `16216`.
+- Inspected `btc15m_first_signal_side_semantics_latest_codex`:
+  - full replay: q250 YES-only side-filtered replay was a subset of global
+    first-signal replay;
+  - post-freeze replay: q250 YES-only side-filtered replay was also a subset;
+  - side-filter extra events `0`;
+  - global target-side events missing from side replay `0`;
+  - global first-signal opposite-side events `19` across the two comparisons.
+- Added a standalone q250 YES side-semantics check to
+  `scripts\build_btc_gpt_pro_action_status.py`:
+  - `q250_yes_first_signal_side_semantics`;
+  - passes only when required q250 YES comparisons are present, config is
+    comparable, and side-filtered first-signal replay adds no events beyond
+    global first-signal replay.
+- Added regression coverage in `scripts\test_btc_gpt_pro_action_status.py`:
+  - clean YES subset semantics pass;
+  - a side-filtered replay that waits past global first signal and adds events
+    blocks q250 YES promotion.
+- Rebuilt:
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`;
+  - `gpt_pro_packets\strategy_advisor_20260518_150855`.
+- Latest action checklist:
+  - `q250_yes_first_signal_side_semantics = REVIEW_REQUIRED`;
+  - `subset_rows_passed = 2 / 2`;
+  - `side_first_extra_events = 0`;
+  - `global_target_side_missing = 0`;
+  - `global_first_opposite_side_events = 19`.
+- Interpretation: this supports q250 YES-only as the top paper-forward path
+  because current side-filtered replay does not create extra hindsight-selected
+  events. It still does not make q250 YES deployable: the shadow is not
+  running, there are no promotion-usable ledger rows, and the paper-only
+  restart/start path still requires explicit user authorization.
+
+## 2026-05-18 - Post-restart verifier aligned with latest dry-run plan
+
+- Re-checked process state before this pass. It remained unchanged:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PID `7052`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PID `16216`.
+- Found an artifact-chain inconsistency:
+  - `btc_restart_authorization_packet_latest_codex` and
+    `btc_gpt_pro_action_status_latest_codex` referenced the latest dry-run
+    restart plan
+    `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_145334`;
+  - `btc_post_restart_verification_latest_codex` still referenced the older
+    dry-run plan
+    `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_142812`.
+- Strengthened `scripts\build_btc_gpt_pro_action_status.py` with a new
+  `post_restart_verifier_alignment` checklist row:
+  - compares the verifier's `restart_dir` to the restart authorization
+    packet's `latest_restart_plan_dir`;
+  - tells future runs to regenerate post-restart verification whenever the dry
+    run or authorization packet changes.
+- Added regression coverage in `scripts\test_btc_gpt_pro_action_status.py`:
+  - `same_path_text` normalizes equivalent restart paths and rejects
+    genuinely different restart plan directories.
+- Rebuilt:
+  - `backtest_outputs\btc_post_restart_verification_latest_codex`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`;
+  - `gpt_pro_packets\strategy_advisor_20260518_151225`.
+- Latest alignment result:
+  - `post_restart_verifier_alignment = REVIEW_REQUIRED`;
+  - verifier restart dir and authorization latest restart plan dir both point
+    to `btc_paper_shadow_controlled_restart_20260518_145334`;
+  - `post_restart_evidence_clock` remains `BLOCKS_DEPLOYMENT` because no
+    controlled restart/start was executed.
+- Conclusion unchanged: this only fixes evidence coherence. There is still no
+  deployable BTC15M or BTC1H strategy, and no stale active paper-ledger row can
+  count toward promotion.
+
+## 2026-05-18 - Process-hygiene blocker added after duplicate/unmanaged shadows appeared
+
+- Re-checked matching Python processes after the latest packet refresh and the
+  process state had changed:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PIDs `7052`, `10524`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PIDs `16216`, `4624`;
+  - unmanaged matching BTC process
+    `btc_1hr_high_conf80_no_chase_shadow.py` PID `10536`.
+- No processes were killed or restarted in this pass.
+- Strengthened `scripts\check_btc_forward_shadow_status.py`:
+  - adds per-target `process_count`, `duplicate_process_count`, and
+    `process_hygiene_status`;
+  - writes `unmanaged_processes.csv`;
+  - records `duplicate_target_process_count`,
+    `duplicate_target_names`, and `unmanaged_matching_process_count` in
+    `run_info.json`.
+- Strengthened `scripts\build_btc_gpt_pro_action_status.py`:
+  - adds a `process_hygiene` checklist row;
+  - blocks deployment evidence when duplicate target PIDs or unmanaged BTC
+    processes are present;
+  - candidate status now prefers current shadow-status PIDs over older restart
+    packet PID strings, so duplicate PIDs are visible in the handoff table.
+- Rebuilt:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`;
+  - `gpt_pro_packets\strategy_advisor_20260518_152356`.
+- GPT Pro workflow follow-up:
+  - Chrome extension discovery found the `Sami` Chrome profile, but tab access
+    failed twice with the same closed native-pipe pattern;
+  - used the resilient browser-safe fallback:
+    `powershell -ExecutionPolicy Bypass -File scripts\ask_gpt_pro_strategy.ps1 -CopyBrowserSafe -OpenChatGPT`;
+  - latest browser-safe packet copied/opened for manual submit:
+    `gpt_pro_packets\strategy_advisor_20260518_152647`.
+- Latest action checklist:
+  - `process_hygiene = BLOCKS_DEPLOYMENT`;
+  - duplicate target processes `2`;
+  - unmanaged matching processes `1`;
+  - duplicate targets
+    `btc15m_q250_qty500_firstskip_shadow;btc1h_high_conf80_entry70_no_chase_shadow`.
+- Validation:
+  - `python -m py_compile scripts\check_btc_forward_shadow_status.py scripts\build_btc_gpt_pro_action_status.py scripts\test_btc_forward_shadow_status.py scripts\test_btc_gpt_pro_action_status.py`;
+  - `python -m unittest scripts.test_btc_forward_shadow_status scripts.test_btc_gpt_pro_action_status scripts.test_btc_execution_realism_audit scripts.test_btc_readiness_row_reconciliation scripts.test_btc_forward_row_reconciliation -v`
+    passed `24 / 24`.
+- Conclusion unchanged but sharper: no BTC15M or BTC1H strategy is deployable.
+  Future rows from the currently messy process set cannot count toward
+  promotion until duplicate/unmanaged processes are resolved under explicit
+  user authorization and the post-restart evidence clock starts cleanly.
+
+## 2026-05-18 - Process hygiene promoted into readiness and consistency gates
+
+- Re-checked matching Python processes. The messy process state persisted:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PIDs `7052`, `10524`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PIDs `16216`, `4624`;
+  - unmanaged matching BTC process
+    `btc_1hr_high_conf80_no_chase_shadow.py` PID `10536`.
+- No processes were killed or restarted.
+- Strengthened `scripts\check_btc_deployment_readiness.py`:
+  - consumes `btc_forward_shadow_status_latest_codex\run_info.json`;
+  - adds global readiness blockers
+    `process_hygiene_duplicate_target_processes` and
+    `process_hygiene_unmanaged_matching_processes`;
+  - adds per-target readiness blocker
+    `target_duplicate_processes_running`;
+  - writes process-hygiene counts into `deployment_readiness_latest_codex`.
+- Strengthened `scripts\build_btc_forward_consistency_audit.py`:
+  - merges process-hygiene fields from authoritative `shadow_status.csv` even
+    when using the forward-evidence summary;
+  - marks q250 raw and BTC1H entry70 agreement as
+    `duplicate_target_processes_running`;
+  - carries unmanaged-process blockers into every candidate row.
+- Strengthened `scripts\build_btc_forward_evidence_report.py`:
+  - shows `pids`, `process_count`, `duplicate_process_count`, and
+    `process_hygiene_status` in the human forward-shadow summary;
+  - includes duplicate/unmanaged counts in the artifact inputs section.
+- Regenerated:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`;
+  - `backtest_outputs\deployment_readiness_latest_codex`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`;
+  - browser-safe GPT Pro packet
+    `gpt_pro_packets\strategy_advisor_20260518_153615`.
+- Latest gate state:
+  - readiness `production_ready_count = 0`;
+  - readiness process-hygiene counts: duplicate target processes `2`,
+    unmanaged matching processes `1`;
+  - forward consistency `consistent_enough_for_promotion_count = 0 / 4`;
+  - q250 raw and BTC1H entry70 are explicitly
+    `duplicate_target_processes_running`;
+  - q1000 YES is one process, but still fails stale-source, unmanaged-process,
+    schema/execution, row-reconciliation, sample-size, and post-restart gates;
+  - q250 YES-only is still not running and remains future paper-only
+    collection, not promotion evidence.
+- Validation:
+  - `python -m py_compile scripts\check_btc_forward_shadow_status.py scripts\check_btc_deployment_readiness.py scripts\build_btc_forward_consistency_audit.py scripts\build_btc_forward_evidence_report.py scripts\build_btc_gpt_pro_action_status.py scripts\test_btc_forward_shadow_status.py scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_forward_consistency_audit.py scripts\test_btc_gpt_pro_action_status.py`;
+  - `python -m unittest scripts.test_btc_forward_shadow_status scripts.test_btc_readiness_row_reconciliation scripts.test_btc_forward_consistency_audit scripts.test_btc_gpt_pro_action_status scripts.test_btc_execution_realism_audit scripts.test_btc_forward_row_reconciliation -v`
+    passed `26 / 26`.
+- Conclusion unchanged: no deploy, no canary. The current process set is not a
+  clean evidence source. The only operational path remains an explicitly
+  authorized guarded paper-only cleanup/restart/start; otherwise continue
+  read-only analysis and wait for a saved GPT Pro review response.
+
+## 2026-05-18 - Restart authorization packet hardened against stale/messy process state
+
+- Re-confirmed the messy process state at 2026-05-18 21:46 UTC:
+  - `btc15m_live_capture.py` PID `1724`;
+  - `btc15m_f2_q250_qty500_firstskip_shadow.py` PIDs `7052`, `10524`;
+  - `btc15m_f2_q1000_yes_shadow.py` PID `24840`;
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow.py` PIDs `16216`, `4624`;
+  - unmanaged matching BTC process
+    `btc_1hr_high_conf80_no_chase_shadow.py` PID `10536`.
+- No processes were killed, restarted, archived, or migrated.
+- Found that the older restart authorization packet was stale relative to the
+  new process state: it still showed one PID for q250 raw and BTC1H entry70
+  and reported `all_ready_for_user_authorization = true`.
+- Hardened `scripts\build_btc_restart_authorization_packet.py`:
+  - reads authoritative `btc_forward_shadow_status_latest_codex\shadow_status.csv`
+    and `run_info.json` instead of relying only on a local process snapshot;
+  - writes per-target `process_count`, `duplicate_process_count`,
+    `process_hygiene_status`, duplicate cleanup flags, and unmanaged process
+    counts;
+  - copies `unmanaged_processes.csv` into the authorization packet;
+  - marks every target
+    `BLOCKED_UNMANAGED_PROCESS_DECISION_REQUIRED` while unmanaged matching
+    BTC processes exist;
+  - sets `all_ready_for_user_authorization = false`,
+    `all_ready_for_clean_restart_authorization = false`,
+    `ready_for_user_authorization_count = 0`, and
+    `unmanaged_process_decision_required = true`.
+- Hardened `scripts\restart_btc_paper_shadows.ps1`:
+  - dry-run plan now records target `process_count`,
+    `duplicate_process_count`, `process_hygiene_status`, and unmanaged
+    matching BTC/Predexon Python processes;
+  - execute path refuses to proceed while unmanaged matching processes remain
+    unless the extra explicit acknowledgement
+    `-IUnderstandUnmanagedBtcProcessesRemain` is supplied;
+  - duplicate target processes are disclosed as cleanup by the guarded restart,
+    not hidden in stale PID strings.
+- Regenerated:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`;
+  - dry-run plan
+    `backtest_outputs\btc_paper_shadow_controlled_restart_20260518_154651`;
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`;
+  - `backtest_outputs\btc_post_restart_verification_latest_codex`;
+  - `backtest_outputs\deployment_readiness_latest_codex`;
+  - `backtest_outputs\btc_forward_evidence_report_latest_codex`;
+  - `backtest_outputs\btc_forward_consistency_audit_latest_codex`;
+  - `backtest_outputs\btc_gpt_pro_action_status_latest_codex`;
+  - browser-safe GPT Pro packet
+    `gpt_pro_packets\strategy_advisor_20260518_154833`.
+- Latest restart authorization state:
+  - duplicate target process count `2`;
+  - unmanaged matching process count `1`;
+  - all four restart/start targets have
+    `authorization_packet_status =
+    BLOCKED_UNMANAGED_PROCESS_DECISION_REQUIRED`;
+  - the guarded execute command is not ready while PID `10536` remains
+    unmanaged.
+- GPT Pro workflow status:
+  - Chrome extension is discoverable on the `Sami` profile, but opening a new
+    ChatGPT tab failed twice with `native pipe is closed`;
+  - Codex in-app browser opened ChatGPT but was not logged in
+    (`https://chatgpt.com/auth/login`);
+  - latest browser-safe packet was copied/opened for manual Pro paste.
+- Validation:
+  - `python -m py_compile scripts\build_btc_restart_authorization_packet.py scripts\test_btc_paper_restart_safety.py`;
+  - `python -m unittest scripts.test_btc_paper_restart_safety -v` passed
+    `7 / 7`;
+  - readiness exit code `1` remains expected because
+    `production_ready_count = 0`.
+- Conclusion unchanged but safer: no deploy, no canary, and not even a clean
+  paper evidence restart/start packet until the unmanaged BTC1H process is
+  explicitly handled. Future rows from the current process set cannot count
+  toward promotion.
+
+## 2026-05-18 - Refreshed replay evidence and added BTC15M candidate-overlap audit
+
+- Ran the sequential evidence refresh. The first attempt exceeded the outer
+  command timeout after completing through the BTC15M shadow replay config
+  audit; the controller process continued briefly and then exited without
+  writing final refresh metadata.
+- Hardened `scripts\refresh_btc_evidence_stack.py` with resume controls:
+  - `--start-at` accepts a 1-based step index or step name;
+  - `--stop-after` bounds a refresh chunk;
+  - resumed logs keep original step numbers and only selected old logs are
+    cleaned.
+- Resumed the refresh from `btc15m_candidate_overlap` through the GPT Pro
+  packet. Latest resumed refresh:
+  `backtest_outputs\btc_evidence_stack_refresh_latest_codex`, created
+  `2026-05-18T22:30:17Z`, `all_ok = true`, steps `33-37` completed in the
+  final tail refresh after triage was updated.
+- Added `scripts\audit_btc15m_candidate_overlap.py` and artifact
+  `backtest_outputs\btc15m_candidate_overlap_latest_codex`.
+- Key overlap result:
+  - full-causal q250 YES-only: `7` official events, official PnL `+1.40`,
+    win rate `71.43%`, `0` proxy/official mismatches;
+  - full-causal q1000 YES: `7` official events, official PnL `+1.42`, win
+    rate `71.43%`, `0` proxy/official mismatches;
+  - q250 YES-only vs q1000 YES official event overlap is `7 / 7` both ways,
+    `overlap_status = identical_official_event_set`;
+  - post-freeze q250 YES-only vs q1000 YES also overlaps `1 / 1` both ways.
+- Interpretation: q1000 YES remains a useful stricter control, but it is not
+  independent confirmation of q250 YES-only on the current live official replay
+  sample. Do not double-count these rows as two separate evidence streams.
+- Updated `scripts\audit_btc_strategy_triage.py`:
+  - consumes `btc15m_candidate_overlap_latest_codex`;
+  - adds overlap fields to `candidate_triage_summary.csv`;
+  - marks q1000 YES with blocker
+    `not_independent_from_q250_yes_current_replay_sample` when current
+    full-causal official rows are identical to q250 YES-only.
+- Updated `scripts\build_gpt_pro_strategy_packet.py` so GPT Pro packets include
+  the overlap summary, pairwise overlap, event-membership table, and compact
+  overlap evidence.
+- Latest live/replay state after refresh:
+  - full-causal q250 firstskip qty>=500: `25` official rows, official PnL
+    `+3.18`, win rate `64%`, but includes `18` NO-side rows and `4`
+    proxy/official mismatches;
+  - full-causal q250 YES-only and q1000 YES remain tiny and non-independent;
+  - post-freeze q250 raw has only `2` official rows and official PnL `0.00`;
+  - post-freeze q250 YES-only and q1000 YES have only `1` official row each,
+    both the same event.
+- Re-checked the existing REST-official Predexon/materialized grid artifacts:
+  - `btc15m_predexon_rest_official_latest_codex` filled `374 / 880` unique
+    tickers from the combined Predexon trade file;
+  - the q250 first-signal qty>=500 materialized row remains positive on scored
+    REST-official Predexon rows (`57 / 63`, official PnL `+8.72`) and live
+    official replay (`17` rows, `+4.30`), but fails because official coverage
+    is incomplete (`6` selected rows missing official REST scores);
+  - q1000 YES also remains positive but incomplete (`23 / 33` scored rows)
+    and now overlaps the same current live official event set as q250 YES-only.
+- Latest gates remain blocked:
+  - `production_ready_count = 0`;
+  - `promotion_usable_rows = 0`;
+  - `process_hygiene_gate_pass = false`;
+  - duplicate target processes `2`;
+  - unmanaged matching process `1`;
+  - `post_restart_evidence_clock_ready = false`;
+  - BTC1H replay coverage still fails with `0 / 8` since-freeze replayable
+    rows.
+- Latest GPT Pro packet with overlap evidence:
+  `gpt_pro_packets\strategy_advisor_20260518_163027`.
+- GPT Pro workflow state:
+  - Chrome extension path can open pages and Chrome ChatGPT is logged in;
+  - in-app Browser ChatGPT is not logged in;
+  - the browser-safe packet pasted as a long text attachment, but ChatGPT
+    reported the Pro model is out of messages until `10:42 PM`, so the prompt
+    was cleared and not submitted to the fallback `Thinking` model;
+  - no new GPT Pro response exists for this overlap-enhanced packet yet.
+- Validation:
+  - `python -m py_compile` passed with `PYTHONPYCACHEPREFIX` redirected to
+    `.codex_work\pycache_compile` after the normal pycache path hit a Windows
+    access-denied rename;
+  - focused unit tests passed `11 / 11`;
+  - broader validation passed `44 / 44` across triage, evidence refresh,
+    overlap, paper-restart safety, forward-shadow status, readiness row
+    reconciliation, consistency/action-status, execution-realism, and row
+    reconciliation tests.
+- Conclusion unchanged: no deploy and no canary. The new evidence makes the
+  ranking more honest: q250 YES-only remains the best paper-forward BTC15M
+  direction, q1000 YES is currently the same official event set rather than
+  independent validation, q250 raw is basis-decomposition research only, and
+  BTC1H remains observe-only.
+
+## 2026-05-18 - Cleaned BTC paper-shadow process set and started post-restart evidence clock
+
+- User explicitly authorized auditing Python processes and stopping unneeded
+  ones while preserving BTC15M/BTC1H websocket replay collection and any needed
+  paper shadows.
+- Process audit before cleanup:
+  - kept BTC15M capture PID `1724`;
+  - duplicate/stale BTC15M q250 firstskip PIDs `7052` and `10524`;
+  - BTC15M q1000 YES PID `24840`;
+  - duplicate/stale BTC1H entry70 no-chase PIDs `16216` and `4624`;
+  - unmanaged secondary BTC1H no-chase PID `10536`.
+- Stopped unmanaged secondary BTC1H no-chase PID `10536` because it was not the
+  frozen runner-up target and blocked clean process hygiene.
+- Ran the guarded paper-only restart workflow:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\restart_btc_paper_shadows.ps1 -Execute -IUnderstandThisRestartsPaperShadows`.
+  The workflow intentionally left BTC15M capture running and restarted/started
+  only the needed paper shadows.
+- Clean post-restart process set:
+  - BTC15M capture: PID `1724`;
+  - BTC15M q250 firstskip qty>=500: PID `6748`;
+  - BTC15M q250 firstskip qty>=500 YES-only: PID `3284`;
+  - BTC15M q1000 YES: PID `17620`;
+  - BTC1H high_conf80 entry70 no-chase: PID `14968`.
+- Latest process hygiene:
+  - running targets `5 / 5`;
+  - duplicate target processes `0`;
+  - unmanaged matching processes `0`;
+  - all target shadows `RUNNING_SOURCE_CURRENT`;
+  - BTC1H replay sidecar exists and is updating.
+- Latest post-restart verification:
+  - `restart_executed = true`;
+  - `evidence_clock_ready = true`;
+  - BTC15M capture untouched and running;
+  - all target process identities match `restart_result.json`;
+  - required capture sidecars ready;
+  - active ledger schemas ready with all execution-realism columns.
+- Latest post-restart collection gate:
+  - `NO_POST_RESTART_ROWS` for all four paper candidates;
+  - BTC15M candidates still need `100` official-settled post-restart rows each;
+  - BTC1H needs `50` official-settled post-restart rows;
+  - deployment readiness remains failing with `production_ready_count = 0`.
+- Fixed verifier edge cases discovered immediately after the clean restart:
+  - `check_btc_shadow_official_settlement.py` now writes headers for empty
+    `shadow_official_trades.csv`;
+  - `build_btc_post_restart_collection_gate.py` now accepts empty trade CSVs
+    and PowerShell UTF-8-BOM restart JSON, and handles empty post-restart
+    trade tables without timezone comparison crashes;
+  - `build_btc_post_restart_verification.py` no longer labels an executed,
+    safety-checked restart plan as missing.
+- Validation:
+  - `python -m py_compile` passed for the touched verifier scripts with
+    `PYTHONPYCACHEPREFIX=.codex_work\pycache_compile`;
+  - `python -m unittest scripts.test_btc_shadow_official_empty_outputs scripts.test_btc_post_restart_verification -v`
+    passed `11 / 11`.
+- Conclusion: collection plumbing is finally in the right state, but there are
+  zero promotion-valid post-restart fills so far. Let the shadows run; only
+  rows after `2026-05-18T16:54:17.2841564-06:00` can count toward future
+  promotion evidence.
+
+## 2026-05-18 - Moved BTC collectors to always-on laptop and fixed capture writer throughput
+
+- User authorized moving the BTC15M/BTC1H websocket capture plus required
+  paper shadows from this laptop to `ClawService@100.92.9.80`, while leaving
+  OpenClaw alone and not deploying live trading.
+- Remote host:
+  - machine/user observed as `DESKTOP-STI60DH\ClawService`;
+  - repo deployed to `C:\Users\ClawService\Kalshi-Trading-Bot`;
+  - Python used for collectors: `C:\Python310\python.exe` with the repo venv
+    site-packages on `PYTHONPATH`;
+  - C: drive checked with `.NET DriveInfo`: `930.91 GB` total, `785.77 GB`
+    free, `NTFS`, so storage is currently adequate for collection.
+- Performance issue found:
+  - the old shared `LiveCaptureWriter` used row-by-row DuckDB `executemany`;
+  - local microbench for 10,000 `ws_orderbook_top` rows took about `54.7s`
+    before the rewrite;
+  - vectorized DuckDB insert through a pandas DataFrame plus batched replay
+    sidecar writes reduced the same local benchmark to about `1.7s`;
+  - this preserves the existing DuckDB/replay-sidecar schema and falls back to
+    `executemany` if the vectorized path fails.
+- Added/updated remote management tooling:
+  - `scripts\deploy_btc_collectors_remote.py`;
+  - `scripts\start_btc_remote_collectors.ps1`;
+  - `scripts\stop_btc_remote_collectors.ps1`;
+  - `scripts\status_btc_remote_collectors.ps1`;
+  - `scripts\audit_btc_runner_performance.py`.
+- Remote clean evidence clock:
+  - stopped the trial remote collectors;
+  - archived trial remote DBs/sidecars under
+    `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\archives\pre_clean_vectorized_20260518_181901`;
+  - confirmed no remaining remote Python collectors before the final clean
+    start;
+  - final clean remote manifest created at `2026-05-19T00:19:19.3575434Z`.
+- Final remote process set after clean start:
+  - BTC15M capture PID `5840`;
+  - BTC15M q250 firstskip qty>=500 PID `5148`;
+  - BTC15M q250 firstskip qty>=500 YES-only PID `7008`;
+  - BTC15M q1000 YES PID `7888`;
+  - BTC1H high_conf80 entry70 no-chase PID `8964`.
+- Final remote performance audit
+  `backtest_outputs\btc_runner_performance_remote_latest_codex`:
+  - running targets `5 / 5`;
+  - total CPU load `64.88%` of one core;
+  - total working set `568.8 MB`;
+  - no dropped capture rows;
+  - sidecar queues were small: BTC15M capture `5`, q250 `33`, q250 YES `3`,
+    q1000 YES `2`, BTC1H `0`;
+  - max queue depths after clean start were all low: `59`, `57`, `50`, `67`,
+    and `11`;
+  - last flush times were roughly `93-250 ms`;
+  - fresh remote stderr logs were all `0` bytes.
+- Final local process cleanup:
+  - stopped local PIDs `1724`, `6748`, `3284`, `17620`, and `14968`;
+  - rechecked local matching Kalshi/BTC/Predexon Python processes and found
+    none remaining.
+- Validation:
+  - `python -m py_compile scripts\btc_1hr_research_live.py scripts\btc15m_live_capture.py scripts\btc15m_lowdd_live.py scripts\audit_btc_runner_performance.py` passed;
+  - `python -m unittest scripts.test_btc15m_shadow_config scripts.test_research_live_safety -v`
+    passed `57 / 57`.
+- Deployment conclusion unchanged:
+  - no strategy is production-ready;
+  - this was an infrastructure/performance migration for paper-only forward
+    evidence collection;
+  - only future official-settled rows from the clean remote run should count
+    toward promotion evidence, and the existing promotion gates still require
+    enough official-settled post-restart BTC15M/BTC1H rows.

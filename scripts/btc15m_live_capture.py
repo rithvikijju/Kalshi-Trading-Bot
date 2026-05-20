@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import queue
 import sys
 import time
@@ -49,6 +50,9 @@ from scripts import btc_1hr_research_live as live  # noqa: E402
 
 SERIES_TICKER = "KXBTC15M"
 DEFAULT_CAPTURE_DB = Path(CFG["db_dir"]).expanduser() / "btc15m_live_capture.duckdb"
+DEFAULT_CAPTURE_WRITER = os.getenv("BTC15M_CAPTURE_WRITER", "readable").strip().lower()
+if DEFAULT_CAPTURE_WRITER not in {"readable", "persistent"}:
+    raise ValueError("BTC15M_CAPTURE_WRITER must be 'readable' or 'persistent'")
 
 
 class ReadableDuckCaptureWriter(live.LiveCaptureWriter):
@@ -247,6 +251,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--duration-sec", type=float, default=0.0, help="Optional finite run length for smoke tests.")
     parser.add_argument("--capture-raw-ws", action="store_true", help="Also store raw snapshot levels/deltas. Usually off to avoid bloat.")
     parser.add_argument("--no-capture", action="store_true", help="Run websocket connections without writing DuckDB rows.")
+    parser.add_argument(
+        "--capture-writer",
+        choices=["readable", "persistent"],
+        default=DEFAULT_CAPTURE_WRITER,
+        help="Use readable fresh-connection DuckDB writes or faster persistent writes.",
+    )
     parser.add_argument("--env", choices=["prod", "demo"], default="prod")
     return parser.parse_args()
 
@@ -280,7 +290,8 @@ def main() -> None:
 
     data_client = live.KalshiApi(env=args.env, require_auth=True)
     update_queue = live.CoalescedUpdateBuffer()
-    recorder = ReadableDuckCaptureWriter(args.capture_db_path, enabled=not args.no_capture, capture_raw_ws=args.capture_raw_ws)
+    writer_cls = live.LiveCaptureWriter if args.capture_writer == "persistent" else ReadableDuckCaptureWriter
+    recorder = writer_cls(args.capture_db_path, enabled=not args.no_capture, capture_raw_ws=args.capture_raw_ws)
     state = live.LiveMarketState()
     kalshi_ws: CaptureKalshiWsClient | None = None
     spot_ws: live.KrakenWsSpot | None = None

@@ -144,6 +144,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-existing", action="store_true", default=True)
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     parser.add_argument("--spot-lookback-days", type=int, default=10)
+    parser.add_argument(
+        "--kalshi-request-interval-sec",
+        type=float,
+        default=KALSHI_REQUEST_INTERVAL_SEC,
+        help="Minimum spacing between Kalshi REST calls across worker threads.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -665,7 +671,9 @@ def write_duckdb(out_dir: Path, tables: dict[str, pd.DataFrame]) -> Path:
 
 
 def main() -> int:
+    global KALSHI_REQUEST_INTERVAL_SEC
     args = parse_args()
+    KALSHI_REQUEST_INTERVAL_SEC = max(0.0, float(args.kalshi_request_interval_sec))
     args.out_dir.mkdir(parents=True, exist_ok=True)
     part_dir = args.out_dir / "kalshi_event_parts"
     cache_dir = args.out_dir / "spot_cache"

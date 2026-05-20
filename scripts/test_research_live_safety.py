@@ -64,6 +64,7 @@ from scripts.btc_1hr_research_live import (
     shadow_portfolio_snapshot,
     update_trade_response,
     utc_now_ns,
+    validate_args,
     is_fok_no_fill_conflict,
 )
 
@@ -304,6 +305,122 @@ class ResearchLiveSafetyTests(unittest.TestCase):
         finally:
             set_signal_strategy("research")
 
+    def test_high_conf_80_requires_eighty_percent_side_probability(self) -> None:
+        close = datetime(2026, 5, 5, 16, 0, tzinfo=timezone.utc)
+        event = {"event_ticker": "KXBTCD-26MAY0512", "close_time": close, "ttl_hours": 0.25}
+        mkt = market("KXBTCD-26MAY0512", close, "T100000.00")
+        quote = BookQuote(mkt["ticker"], 0.49, 10, 0.51, 10, 0.49, 10, 0.50, 10)
+        try:
+            set_signal_strategy("high_conf_80")
+            with patch("scripts.btc_1hr_research_live.edge_uncertainty_cents", return_value=0.0):
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.79, 15.0)):
+                    self.assertIsNone(signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0))
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.80, 15.0)):
+                    yes = signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0)
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.21, 15.0)):
+                    self.assertIsNone(signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0))
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.20, 15.0)):
+                    no = signal_from_book(event, mkt, quote, None, {}, 100000.0, 1, 12.0, 2.0)
+            self.assertIsNotNone(yes)
+            self.assertEqual(yes.side, "yes")
+            self.assertIsNotNone(no)
+            self.assertEqual(no.side, "no")
+        finally:
+            set_signal_strategy("research")
+
+    def test_high_conf_80_no_chase_blocks_chasing_fast_10m_moves(self) -> None:
+        close = datetime(2026, 5, 5, 16, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 5, 5, 15, 45, tzinfo=timezone.utc)
+        event = {"event_ticker": "KXBTCD-26MAY0512", "close_time": close, "ttl_hours": 0.25}
+        mkt = market("KXBTCD-26MAY0512", close, "T100000.00")
+        quote = BookQuote(mkt["ticker"], 0.49, 10, 0.51, 10, 0.49, 10, 0.50, 10)
+        times = pd.date_range(end=pd.Timestamp(now), periods=20, freq="min", tz="UTC")
+        rising = pd.DataFrame({"time": times, "close": [100000.0] * 9 + [100000.0] + [100020.0] * 9 + [100200.0]})
+        falling = pd.DataFrame({"time": times, "close": [100200.0] * 9 + [100200.0] + [100180.0] * 9 + [100000.0]})
+        calm = pd.DataFrame({"time": times, "close": [100000.0 + i for i in range(20)]})
+        try:
+            set_signal_strategy("high_conf_80_no_chase")
+            with patch("scripts.btc_1hr_research_live.edge_uncertainty_cents", return_value=0.0):
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.80, 15.0)):
+                    self.assertIsNone(signal_from_book(event, mkt, quote, rising, {}, 100200.0, 1, 12.0, 2.0, now=now))
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.20, 15.0)):
+                    self.assertIsNone(signal_from_book(event, mkt, quote, falling, {}, 100000.0, 1, 12.0, 2.0, now=now))
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.80, 15.0)):
+                    allowed = signal_from_book(event, mkt, quote, calm, {}, 100019.0, 1, 12.0, 2.0, now=now)
+            self.assertIsNotNone(allowed)
+            self.assertEqual(allowed.side, "yes")
+        finally:
+            set_signal_strategy("research")
+
+    def test_high_conf_80_entry59_70_no_chase_requires_entry_floor_and_cap(self) -> None:
+        close = datetime(2026, 5, 5, 16, 0, tzinfo=timezone.utc)
+        event = {"event_ticker": "KXBTCD-26MAY0512", "close_time": close, "ttl_hours": 0.25}
+        mkt = market("KXBTCD-26MAY0512", close, "T100000.00")
+        too_cheap = BookQuote(mkt["ticker"], 0.54, 10, 0.58, 10, 0.42, 10, 0.46, 10)
+        allowed_quote = BookQuote(mkt["ticker"], 0.57, 10, 0.59, 10, 0.41, 10, 0.43, 10)
+        too_expensive = BookQuote(mkt["ticker"], 0.69, 10, 0.71, 10, 0.29, 10, 0.31, 10)
+        try:
+            set_signal_strategy("high_conf_80_entry59_70_no_chase")
+            with patch("scripts.btc_1hr_research_live.edge_uncertainty_cents", return_value=0.0):
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.82, 15.0)):
+                    self.assertIsNone(signal_from_book(event, mkt, too_cheap, None, {}, 100000.0, 1, 12.0, 2.0))
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.82, 15.0)):
+                    allowed = signal_from_book(event, mkt, allowed_quote, None, {}, 100000.0, 1, 12.0, 2.0)
+                with patch("scripts.btc_1hr_research_live.model_probability", return_value=(0.90, 15.0)):
+                    self.assertIsNone(signal_from_book(event, mkt, too_expensive, None, {}, 100000.0, 1, 12.0, 2.0))
+            self.assertIsNotNone(allowed)
+            self.assertEqual(allowed.side, "yes")
+            self.assertAlmostEqual(allowed.entry_price, 0.59, places=6)
+        finally:
+            set_signal_strategy("research")
+
+    def test_high_conf_candidates_are_blocked_in_live_mode(self) -> None:
+        for strategy in [
+            "high_conf_80",
+            "high_conf_80_no_chase",
+            "high_conf_80_entry70_no_chase",
+            "high_conf_80_entry59_70_no_chase",
+        ]:
+            args = type(
+                "Args",
+                (),
+                {
+                    "mode": "live",
+                    "signal_strategy": strategy,
+                    "market_data": "websocket",
+                    "interval_sec": 60,
+                    "shadow_bankroll": 0.0,
+                    "paper_report_sec": 300,
+                },
+            )()
+            with self.subTest(strategy=strategy):
+                with self.assertRaises(ValueError):
+                    validate_args(args)
+
+    def test_high_conf_shadow_wrappers_reject_identity_overrides(self) -> None:
+        from scripts import btc_1hr_high_conf80_entry59_70_no_chase_shadow as entry59
+        from scripts import btc_1hr_high_conf80_entry70_no_chase_shadow as entry70
+        from scripts import btc_1hr_high_conf80_no_chase_shadow as no_chase
+        from scripts import btc_1hr_high_conf80_shadow as plain
+
+        wrappers = {
+            "high_conf_80": plain,
+            "high_conf_80_no_chase": no_chase,
+            "high_conf_80_entry70_no_chase": entry70,
+            "high_conf_80_entry59_70_no_chase": entry59,
+        }
+        for strategy, wrapper in wrappers.items():
+            with self.subTest(strategy=strategy):
+                with self.assertRaises(SystemExit):
+                    wrapper.build_forward_args(["--signal-strategy", "research"])
+                with self.assertRaises(SystemExit):
+                    wrapper.build_forward_args(["--db-path", "other.db"])
+                argv = wrapper.build_forward_args(["--once", "--dry-run"])
+                self.assertIn("--dry-run", argv)
+                self.assertIn("--signal-strategy", argv)
+                self.assertIn(strategy, argv)
+                self.assertIn("--db-path", argv)
+
     def test_shape_adjacent_strategy_requires_clean_chain_and_adjacent_edge(self) -> None:
         close = datetime(2026, 5, 5, 16, 0, tzinfo=timezone.utc)
         event_ticker = "KXBTCD-26MAY0512"
@@ -387,13 +504,35 @@ class ResearchLiveSafetyTests(unittest.TestCase):
                 "close": [100500.0, 100500.0, 100500.0],
             }
         )
-        summary = paper_shadow_summary(conn, btc, 1000.0, close + timedelta(hours=1, minutes=1))
-        self.assertEqual(summary["settled_trades"], 2)
-        self.assertEqual(summary["open_trades"], 1)
-        self.assertAlmostEqual(summary["realized_pnl"], 0.58 - 0.84, places=6)
-        portfolio = shadow_portfolio_snapshot(conn, btc, 1000.0, close + timedelta(hours=1, minutes=1))
+        with patch.object(live_mod, "PAPER_SETTLEMENT_SOURCE", "proxy"):
+            summary = paper_shadow_summary(conn, btc, 1000.0, close + timedelta(hours=1, minutes=1))
+            self.assertEqual(summary["settled_trades"], 2)
+            self.assertEqual(summary["open_trades"], 1)
+            self.assertAlmostEqual(summary["realized_pnl"], 0.58 - 0.84, places=6)
+            portfolio = shadow_portfolio_snapshot(conn, btc, 1000.0, close + timedelta(hours=1, minutes=1))
         self.assertGreater(portfolio.available_balance, 998.0)
         self.assertEqual(len(portfolio.active_tickers), 1)
+
+    def test_record_trade_persists_execution_realism_fields(self) -> None:
+        conn = db_connect(":memory:")
+        close = datetime(2026, 5, 5, 6, 0, tzinfo=timezone.utc)
+        signal = replace(
+            sample_signal(close),
+            available_qty=123.0,
+            top_visible_qty=123.0,
+            quote_received_at_ns=1_000_000_000,
+            signal_received_at_ns=1_250_000_000,
+            quote_age_ms=250.0,
+        )
+        record_trade(conn, "paper", "paper_filled", signal)
+        row = conn.execute("SELECT * FROM research_live_trades").fetchone()
+        self.assertAlmostEqual(row["available_qty"], 123.0)
+        self.assertAlmostEqual(row["top_visible_qty"], 123.0)
+        self.assertEqual(row["quote_received_at_ns"], 1_000_000_000)
+        self.assertEqual(row["signal_received_at_ns"], 1_250_000_000)
+        self.assertAlmostEqual(row["quote_age_ms"], 250.0)
+        self.assertAlmostEqual(row["yes_bid"], signal.yes_bid)
+        self.assertAlmostEqual(row["no_ask"], signal.no_ask)
 
     def test_kalshi_canceled_fok_maps_to_not_filled(self) -> None:
         order = {

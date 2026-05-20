@@ -64,7 +64,22 @@ from scripts.risk_adjusted_research import RiskSizingConfig, choose_risk_adjuste
 
 EXECUTOR_NAME = os.getenv("BTC_1HR_EXECUTOR_NAME", "btc_1hr_research_live")
 SIGNAL_STRATEGY = os.getenv("BTC_1HR_SIGNAL_STRATEGY", "research").strip().lower() or "research"
-SUPPORTED_SIGNAL_STRATEGIES = {"research", "js_guarded", "market_shrink_no_cautious", "market_shrink_no_cautious_shape_adjacent"}
+SUPPORTED_SIGNAL_STRATEGIES = {
+    "research",
+    "js_guarded",
+    "market_shrink_no_cautious",
+    "market_shrink_no_cautious_shape_adjacent",
+    "high_conf_80",
+    "high_conf_80_no_chase",
+    "high_conf_80_entry70_no_chase",
+    "high_conf_80_entry59_70_no_chase",
+}
+PAPER_ONLY_SIGNAL_STRATEGIES = {
+    "high_conf_80",
+    "high_conf_80_no_chase",
+    "high_conf_80_entry70_no_chase",
+    "high_conf_80_entry59_70_no_chase",
+}
 SIZING_POLICY = os.getenv("BTC_1HR_SIZING_POLICY", "flat_max").strip().lower() or "flat_max"
 SUPPORTED_SIZING_POLICIES = {"flat_max", "risk_adjusted"}
 
@@ -91,6 +106,11 @@ RESEARCH_MIN_ENTRY = 0.25
 RESEARCH_MAX_ENTRY = 0.75
 RESEARCH_MIN_YES_P = 0.65
 RESEARCH_MAX_NO_P = 0.35
+HIGH_CONF_80_MIN_YES_P = 0.80
+HIGH_CONF_80_MAX_NO_P = 0.20
+HIGH_CONF_80_NO_CHASE_10M_USD = 150.0
+HIGH_CONF_80_ENTRY59_MIN_ENTRY = 0.59
+HIGH_CONF_80_ENTRY70_MAX_ENTRY = 0.70
 _RESEARCH_MIN_NO_SIDE_PROB_ENV = os.getenv("BTC_1HR_MIN_NO_SIDE_PROB", "").strip()
 RESEARCH_MIN_NO_SIDE_PROB = (
     float(_RESEARCH_MIN_NO_SIDE_PROB_ENV) if _RESEARCH_MIN_NO_SIDE_PROB_ENV else None
@@ -123,11 +143,13 @@ BTC_SPOT_MAX_AGE_SEC = 15.0
 BTC_CANDLE_MAX_AGE_SEC = 180.0
 BTC_CANDLE_REFRESH_LOOKBACK_MIN = 10
 BTC_CANDLE_FALLBACK_SOURCE = os.getenv("BTC_1HR_BTC_CANDLE_FALLBACK", "kraken").strip().lower()
+PAPER_SETTLEMENT_SOURCE = os.getenv("BTC_1HR_PAPER_SETTLEMENT_SOURCE", "official").strip().lower()
 WS_SCAN_STATUS_TTL_SEC = 30.0
 WS_EVENT_REFRESH_SEC = 180.0
 WS_EVENT_REFRESH_JITTER_SEC = 30.0
 WS_BTC_CANDLE_REFRESH_SEC = 60.0
 WS_MAX_SCAN_WORKERS = max(2, min(8, (os.cpu_count() or 4)))
+_PAPER_OFFICIAL_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 CAPTURE_QUEUE_MAX = 250_000
 CAPTURE_BATCH_SIZE = 2_000
 CAPTURE_FLUSH_SEC = 1.0
@@ -217,6 +239,23 @@ def strategy_requires_full_chain(strategy: str | None) -> bool:
     return str(strategy or SIGNAL_STRATEGY).strip().lower() in {"market_shrink_no_cautious_shape_adjacent"}
 
 
+def strategy_uses_high_conf_80(strategy: str | None) -> bool:
+    return str(strategy or SIGNAL_STRATEGY).strip().lower() in {
+        "high_conf_80",
+        "high_conf_80_no_chase",
+        "high_conf_80_entry70_no_chase",
+        "high_conf_80_entry59_70_no_chase",
+    }
+
+
+def strategy_uses_no_chase_guard(strategy: str | None) -> bool:
+    return str(strategy or SIGNAL_STRATEGY).strip().lower() in {
+        "high_conf_80_no_chase",
+        "high_conf_80_entry70_no_chase",
+        "high_conf_80_entry59_70_no_chase",
+    }
+
+
 def reprice_event_cooldown_seconds() -> float:
     return max(0.0, float(REPRICE_EVENT_COOLDOWN_SEC or 0.0))
 
@@ -271,6 +310,7 @@ class BookQuote:
     no_bid_qty: float
     no_ask: float | None
     no_ask_qty: float
+    received_at_ns: int | None = None
 
     @property
     def yes_spread_cents(self) -> float | None:
@@ -309,6 +349,10 @@ class TradeSignal:
     yes_ask: float | None
     no_bid: float | None
     no_ask: float | None
+    signal_received_at_ns: int | None = None
+    quote_received_at_ns: int | None = None
+    quote_age_ms: float | None = None
+    top_visible_qty: float | None = None
 
 
 @dataclass(frozen=True)
@@ -736,6 +780,7 @@ class LiveOrderbook:
             no_bid_qty=no_bid_qty,
             no_ask=no_ask,
             no_ask_qty=yes_bid_qty if no_ask is not None else 0.0,
+            received_at_ns=self.received_at_ns,
         )
 
 
@@ -1074,6 +1119,8 @@ CAPTURE_SCHEMAS: dict[str, list[tuple[str, str]]] = {
 class LiveCaptureWriter:
     def __init__(self, path: Path | str, enabled: bool = True, capture_raw_ws: bool = CAPTURE_RAW_WS_DEFAULT) -> None:
         self.path = Path(path).expanduser()
+        self.status_path = self.path.with_name(self.path.name + ".status.json")
+        self.replay_sidecar_path = self.path.with_name(self.path.name + ".replay.jsonl")
         self.enabled = enabled
         self.capture_raw_ws = capture_raw_ws
         self._queue: queue.Queue[tuple[str, dict[str, Any]] | None] = queue.Queue(maxsize=CAPTURE_QUEUE_MAX)
@@ -1087,6 +1134,14 @@ class LiveCaptureWriter:
         self.last_error: str | None = None
         self.failed = False
         self._watermark_idx = -1
+        self._sidecar_rows_by_table: dict[str, int] = defaultdict(int)
+        self._sidecar_latest_utc_by_table: dict[str, str] = {}
+        self._sidecar_signal_nonzero_rows = 0
+        self._sidecar_signal_action_counts: dict[str, int] = defaultdict(int)
+        self._sidecar_signal_latest_action = ""
+        self._sidecar_signal_latest_detail = ""
+        self._sidecar_last_write_monotonic = 0.0
+        self._replay_sidecar_rows_by_table: dict[str, int] = defaultdict(int)
         if self.enabled:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._thread = threading.Thread(target=self._run, name="live-capture-writer", daemon=True)
@@ -1176,17 +1231,148 @@ class LiveCaptureWriter:
             defs = ", ".join(f"{name} {typ}" for name, typ in columns)
             con.execute(f"CREATE TABLE IF NOT EXISTS {table} ({defs})")
 
-    def _flush(self, con, pending: dict[str, list[dict[str, Any]]]) -> None:
-        started = time.monotonic()
-        for table, rows in list(pending.items()):
-            if not rows or table not in CAPTURE_SCHEMAS:
-                continue
-            columns = [name for name, _ in CAPTURE_SCHEMAS[table]]
+    def _init_sidecar_state(self, con) -> None:
+        """Seed the lock-free status sidecar from the capture DB at writer start."""
+        for table, columns in CAPTURE_SCHEMAS.items():
+            column_names = {name for name, _ in columns}
+            try:
+                self._sidecar_rows_by_table[table] = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                if "received_at_utc" in column_names:
+                    latest = con.execute(f"SELECT MAX(received_at_utc) FROM {table}").fetchone()[0]
+                    if latest is not None:
+                        self._sidecar_latest_utc_by_table[table] = str(latest)
+            except Exception as exc:
+                log.debug("capture status sidecar seed skipped table=%s error=%r", table, exc)
+        try:
+            self._sidecar_signal_nonzero_rows = int(
+                con.execute("SELECT COUNT(*) FROM signal_scan WHERE candidate_count > 0").fetchone()[0]
+            )
+            action_rows = con.execute(
+                """
+                SELECT action, COUNT(*) AS n
+                FROM signal_scan
+                GROUP BY action
+                ORDER BY n DESC
+                """
+            ).fetchall()
+            self._sidecar_signal_action_counts = defaultdict(
+                int, {str(action): int(count) for action, count in action_rows}
+            )
+            latest = con.execute(
+                """
+                SELECT action, detail
+                FROM signal_scan
+                ORDER BY received_at_utc DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if latest is not None:
+                self._sidecar_signal_latest_action = str(latest[0] or "")
+                self._sidecar_signal_latest_detail = str(latest[1] or "")
+        except Exception as exc:
+            log.debug("capture status sidecar signal seed skipped error=%r", exc)
+
+    def _observe_flushed_rows(self, table: str, rows: list[dict[str, Any]]) -> None:
+        self._sidecar_rows_by_table[table] += len(rows)
+        for row in reversed(rows):
+            latest = row.get("received_at_utc")
+            if latest:
+                self._sidecar_latest_utc_by_table[table] = str(latest)
+                break
+        if table == "signal_scan":
+            for row in rows:
+                try:
+                    if int(row.get("candidate_count") or 0) > 0:
+                        self._sidecar_signal_nonzero_rows += 1
+                except Exception:
+                    pass
+                action = str(row.get("action") or "")
+                if action:
+                    self._sidecar_signal_action_counts[action] += 1
+            latest = rows[-1] if rows else {}
+            self._sidecar_signal_latest_action = str(latest.get("action") or "")
+            self._sidecar_signal_latest_detail = str(latest.get("detail") or "")
+
+    def _write_status_sidecar(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._sidecar_last_write_monotonic < 5.0:
+            return
+        payload = {
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "capture_db": str(self.path),
+            "replay_sidecar": str(self.replay_sidecar_path),
+            "enabled": self.enabled,
+            "capture_raw_ws": self.capture_raw_ws,
+            "failed": self.failed,
+            "last_error": self.last_error or "",
+            "queue_depth": self.depth(),
+            "max_depth": self.max_depth,
+            "dropped": self.dropped,
+            "dropped_by_table": dict(sorted(self.dropped_by_table.items())),
+            "suppressed_by_table": dict(sorted(self.suppressed_by_table.items())),
+            "last_flush_ms": self.last_flush_ms,
+            "rows_by_table": dict(sorted(self._sidecar_rows_by_table.items())),
+            "latest_utc_by_table": dict(sorted(self._sidecar_latest_utc_by_table.items())),
+            "replay_sidecar_rows_by_table": dict(sorted(self._replay_sidecar_rows_by_table.items())),
+            "signal_scan_nonzero_candidate_rows": self._sidecar_signal_nonzero_rows,
+            "signal_scan_action_counts": dict(sorted(self._sidecar_signal_action_counts.items())),
+            "signal_scan_latest_action": self._sidecar_signal_latest_action,
+            "signal_scan_latest_detail": self._sidecar_signal_latest_detail,
+        }
+        tmp_path = self.status_path.with_name(self.status_path.name + ".tmp")
+        try:
+            tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            tmp_path.replace(self.status_path)
+            self._sidecar_last_write_monotonic = now
+        except Exception as exc:
+            self.last_error = f"status_sidecar_write_failed: {exc!r}"
+            log.debug("capture status sidecar write failed: %r", exc)
+
+    def _write_replay_sidecar_rows(self, table: str, rows: list[dict[str, Any]]) -> None:
+        if table not in {"ws_orderbook_top", "signal_scan", "order_decision", "ws_lifecycle"} or not rows:
+            return
+        try:
+            with self.replay_sidecar_path.open("a", encoding="utf-8") as f:
+                f.write("".join(json.dumps({"table": table, **row}, default=str) + "\n" for row in rows))
+            self._replay_sidecar_rows_by_table[table] += len(rows)
+        except Exception as exc:
+            self.last_error = f"replay_sidecar_write_failed: {exc!r}"
+            log.debug("capture replay sidecar write failed: %r", exc)
+
+    def _insert_capture_rows(self, con, table: str, columns: list[str], rows: list[dict[str, Any]]) -> None:
+        try:
+            import pandas as pd
+
+            frame = pd.DataFrame.from_records(rows, columns=columns)
+            view_name = "__capture_batch"
+            con.register(view_name, frame)
+            try:
+                col_sql = ", ".join(columns)
+                con.execute(f"INSERT INTO {table} ({col_sql}) SELECT {col_sql} FROM {view_name}")
+            finally:
+                con.unregister(view_name)
+        except Exception:
             values = [tuple(row.get(column) for column in columns) for row in rows]
             placeholders = ",".join("?" for _ in columns)
             con.executemany(f"INSERT INTO {table} VALUES ({placeholders})", values)
+
+    def _flush(self, con, pending: dict[str, list[dict[str, Any]]]) -> None:
+        started = time.monotonic()
+        flushed_any = False
+        for table, rows in list(pending.items()):
+            if not rows or table not in CAPTURE_SCHEMAS:
+                continue
+            batch_rows = list(rows)
+            columns = [name for name, _ in CAPTURE_SCHEMAS[table]]
+            self._insert_capture_rows(con, table, columns, batch_rows)
+            self._observe_flushed_rows(table, batch_rows)
+            self._write_replay_sidecar_rows(table, batch_rows)
             pending[table].clear()
+            flushed_any = True
         self.last_flush_ms = (time.monotonic() - started) * 1000.0
+        if flushed_any:
+            self._write_status_sidecar()
 
     def _run(self) -> None:
         import duckdb
@@ -1196,6 +1382,8 @@ class LiveCaptureWriter:
         try:
             con = duckdb.connect(str(self.path))
             self._init_schema(con)
+            self._init_sidecar_state(con)
+            self._write_status_sidecar(force=True)
             last_flush = time.monotonic()
             while True:
                 timeout = max(0.05, CAPTURE_FLUSH_SEC - (time.monotonic() - last_flush))
@@ -1218,12 +1406,14 @@ class LiveCaptureWriter:
         except Exception as exc:
             self.failed = True
             self.last_error = repr(exc)
+            self._write_status_sidecar(force=True)
             log.exception("live capture writer failed")
         finally:
             if con is not None:
                 try:
                     self._flush(con, pending)
                     con.close()
+                    self._write_status_sidecar(force=True)
                 except Exception:
                     log.exception("live capture writer close failed")
 
@@ -1400,6 +1590,8 @@ class KalshiWsClient:
         log.info("Kalshi websocket connected: %s", self.ws_url)
         self.state.reset_orderbooks()
         self.state.mark_kalshi_connected(True)
+        recv_task = None
+        command_task = None
         try:
             await self._subscribe_static_channels(ws)
             await self._sync_orderbook_subscription(ws)
@@ -1422,9 +1614,12 @@ class KalshiWsClient:
                         self._desired_markets = set(command.get("tickers") or [])
                         await self._sync_orderbook_subscription(ws)
                     command_task = asyncio.create_task(self._commands.get())
-            recv_task.cancel()
-            command_task.cancel()
         finally:
+            tasks = [task for task in (recv_task, command_task) if task is not None and not task.done()]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
             self.state.mark_kalshi_connected(False)
             self.state.reset_orderbooks()
             await ws.close()
@@ -2295,6 +2490,25 @@ def model_probability(event: dict, market: dict, btc_1m, emp_cache: dict, spot: 
     return p, ttl_min
 
 
+def btc_usd_return_lookback(btc_1m, ts: datetime, minutes: int) -> float | None:
+    if btc_1m is None or len(btc_1m) == 0 or "time" not in btc_1m.columns or "close" not in btc_1m.columns:
+        return None
+    try:
+        times = pd.to_datetime(btc_1m["time"], utc=True, errors="coerce")
+        lookup = pd.Timestamp(ts).tz_convert("UTC")
+        now_idx = int(np.searchsorted(times.dt.tz_localize(None).to_numpy(), lookup.tz_localize(None).to_datetime64(), side="right")) - 1
+    except Exception:
+        return None
+    prior_idx = now_idx - int(minutes)
+    if now_idx < 0 or prior_idx < 0 or now_idx >= len(btc_1m):
+        return None
+    current = optional_float(btc_1m.iloc[now_idx]["close"])
+    prior = optional_float(btc_1m.iloc[prior_idx]["close"])
+    if current is None or prior is None or not math.isfinite(current) or not math.isfinite(prior):
+        return None
+    return float(current - prior)
+
+
 def signal_from_book(
     event: dict,
     market: dict,
@@ -2387,6 +2601,19 @@ def signal_from_book(
         max_spread = max_spread_cents
         min_entry = RESEARCH_MIN_ENTRY
         max_entry = RESEARCH_MAX_ENTRY
+    elif strategy_uses_high_conf_80(signal_strategy):
+        threshold = min_edge_cents + edge_uncertainty_cents(p_yes, emp_cache)
+        strong_prob = (side == "yes" and p_yes >= HIGH_CONF_80_MIN_YES_P) or (
+            side == "no" and p_yes <= HIGH_CONF_80_MAX_NO_P
+        )
+        max_spread = max_spread_cents
+        min_entry = RESEARCH_MIN_ENTRY
+        min_entry = HIGH_CONF_80_ENTRY59_MIN_ENTRY if signal_strategy == "high_conf_80_entry59_70_no_chase" else min_entry
+        max_entry = (
+            HIGH_CONF_80_ENTRY70_MAX_ENTRY
+            if signal_strategy in {"high_conf_80_entry70_no_chase", "high_conf_80_entry59_70_no_chase"}
+            else RESEARCH_MAX_ENTRY
+        )
     else:
         threshold = min_edge_cents + edge_uncertainty_cents(p_yes, emp_cache)
         strong_prob = (side == "yes" and p_yes >= RESEARCH_MIN_YES_P) or (
@@ -2399,6 +2626,12 @@ def signal_from_book(
         max_entry = RESEARCH_MAX_ENTRY
     if not strong_prob:
         return None
+    if strategy_uses_no_chase_guard(signal_strategy):
+        scan_time = now or datetime.now(timezone.utc)
+        ret_10m = btc_usd_return_lookback(btc_1m, scan_time, 10)
+        side_ret_10m = ret_10m if side == "yes" else (-ret_10m if ret_10m is not None else None)
+        if side_ret_10m is not None and math.isfinite(side_ret_10m) and side_ret_10m >= HIGH_CONF_80_NO_CHASE_10M_USD:
+            return None
     if net_edge_cents < threshold:
         return None
     if best["spread"] > max_spread + FLOAT_EPSILON:
@@ -2409,6 +2642,13 @@ def signal_from_book(
         return None
 
     close_time = market.get("close_time") or event.get("close_time")
+    signal_received_at_ns = utc_now_ns()
+    quote_received_at_ns = quote.received_at_ns
+    quote_age_ms = (
+        max(0.0, (signal_received_at_ns - quote_received_at_ns) / 1_000_000.0)
+        if quote_received_at_ns is not None
+        else None
+    )
     return TradeSignal(
         event_ticker=event_ticker,
         market_ticker=ticker,
@@ -2432,7 +2672,38 @@ def signal_from_book(
         yes_ask=quote.yes_ask,
         no_bid=quote.no_bid,
         no_ask=quote.no_ask,
+        signal_received_at_ns=signal_received_at_ns,
+        quote_received_at_ns=quote_received_at_ns,
+        quote_age_ms=quote_age_ms,
+        top_visible_qty=float(best["available_qty"]),
     )
+
+
+TRADE_REALISM_COLUMNS = [
+    ("available_qty", "REAL"),
+    ("top_visible_qty", "REAL"),
+    ("quote_received_at_ns", "INTEGER"),
+    ("signal_received_at_ns", "INTEGER"),
+    ("quote_age_ms", "REAL"),
+    ("edge_threshold_cents", "REAL"),
+    ("strike", "REAL"),
+    ("ttl_min", "REAL"),
+    ("yes_bid", "REAL"),
+    ("yes_ask", "REAL"),
+    ("no_bid", "REAL"),
+    ("no_ask", "REAL"),
+]
+
+
+def ensure_trade_realism_columns(conn: sqlite3.Connection) -> None:
+    existing = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(research_live_trades)").fetchall()
+    }
+    for name, sql_type in TRADE_REALISM_COLUMNS:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE research_live_trades ADD COLUMN {name} {sql_type}")
+    conn.commit()
 
 
 def db_connect(path: Path | str) -> sqlite3.Connection:
@@ -2470,10 +2741,23 @@ def db_connect(path: Path | str) -> sqlite3.Connection:
             average_yes_fill_price REAL,
             actual_entry_price REAL,
             actual_fee_paid REAL,
+            available_qty REAL,
+            top_visible_qty REAL,
+            quote_received_at_ns INTEGER,
+            signal_received_at_ns INTEGER,
+            quote_age_ms REAL,
+            edge_threshold_cents REAL,
+            strike REAL,
+            ttl_min REAL,
+            yes_bid REAL,
+            yes_ask REAL,
+            no_bid REAL,
+            no_ask REAL,
             raw_response TEXT
         )
         """
     )
+    ensure_trade_realism_columns(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS research_event_locks (
@@ -2690,9 +2974,11 @@ def record_trade(
             entry_fee_estimate, model_p_yes, edge_gross_cents, net_edge_cents,
             spread_cents, btc_spot, close_time, client_order_id, order_id,
             fill_count, average_yes_fill_price, actual_entry_price,
-            actual_fee_paid, raw_response
+            actual_fee_paid, available_qty, top_visible_qty, quote_received_at_ns,
+            signal_received_at_ns, quote_age_ms, edge_threshold_cents, strike,
+            ttl_min, yes_bid, yes_ask, no_bid, no_ask, raw_response
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
@@ -2718,6 +3004,18 @@ def record_trade(
             avg_yes,
             actual_entry,
             actual_fee,
+            signal.available_qty,
+            signal.top_visible_qty if signal.top_visible_qty is not None else signal.available_qty,
+            signal.quote_received_at_ns,
+            signal.signal_received_at_ns,
+            signal.quote_age_ms,
+            signal.edge_threshold_cents,
+            signal.strike,
+            signal.ttl_min,
+            signal.yes_bid,
+            signal.yes_ask,
+            signal.no_bid,
+            signal.no_ask,
             json.dumps(response, sort_keys=True),
         ),
     )
@@ -3005,6 +3303,27 @@ def btc_close_at_or_before(btc_1m, ts: datetime) -> float | None:
     return value if value is not None and math.isfinite(value) and value > 0 else None
 
 
+def paper_official_market_result(ticker: str, ttl_sec: float = 60.0) -> dict[str, Any]:
+    """Fetch public Kalshi market metadata for paper-settlement accounting."""
+    cached = _PAPER_OFFICIAL_RESULT_CACHE.get(ticker)
+    now_monotonic = time.monotonic()
+    if cached is not None:
+        cached_at, market = cached
+        if str(market.get("status", "")).lower() == "finalized" or now_monotonic - cached_at < ttl_sec:
+            return market
+    try:
+        response = requests.get(f"{KalshiApi.PROD_URL}/markets/{ticker}", timeout=10)
+        if response.status_code == 404:
+            market = {"fetch_error": "404_not_found"}
+        else:
+            response.raise_for_status()
+            market = response.json().get("market") or {}
+    except Exception as exc:
+        market = {"fetch_error": repr(exc)}
+    _PAPER_OFFICIAL_RESULT_CACHE[ticker] = (now_monotonic, market)
+    return market
+
+
 def paper_shadow_summary(
     conn: sqlite3.Connection,
     btc_1m,
@@ -3041,17 +3360,29 @@ def paper_shadow_summary(
             active_exposure += premium
             open_trades += 1
             continue
-        settlement_spot = btc_close_at_or_before(btc_1m, close_time)
-        if settlement_spot is None:
-            active_exposure += premium
-            open_trades += 1
-            continue
         strike = market_strike_from_ticker(row["market_ticker"])
         if strike is None:
             active_exposure += premium
             open_trades += 1
             continue
-        yes_wins = settlement_spot >= strike
+        if PAPER_SETTLEMENT_SOURCE == "official":
+            market = paper_official_market_result(row["market_ticker"])
+            result = str(market.get("result") or "").lower()
+            status = str(market.get("status") or "").lower()
+            if status != "finalized" or result not in {"yes", "no"}:
+                active_exposure += premium
+                open_trades += 1
+                continue
+            yes_wins = result == "yes"
+        elif PAPER_SETTLEMENT_SOURCE == "proxy":
+            settlement_spot = btc_close_at_or_before(btc_1m, close_time)
+            if settlement_spot is None:
+                active_exposure += premium
+                open_trades += 1
+                continue
+            yes_wins = settlement_spot >= strike
+        else:
+            raise ValueError("BTC_1HR_PAPER_SETTLEMENT_SOURCE must be 'official' or 'proxy'")
         won = (row["side"] == "yes" and yes_wins) or (row["side"] == "no" and not yes_wins)
         payout = float(contracts) if won else 0.0
         pnl = payout - premium
@@ -4091,6 +4422,12 @@ def current_event_needs_refresh(events: list[dict]) -> bool:
     return ttl_min < RESEARCH_MIN_TTL_MIN or ttl_min > RESEARCH_MAX_TTL_MIN
 
 
+def event_refresh_delay_sec(events: list[dict]) -> float:
+    if not events:
+        return min(10.0, WS_EVENT_REFRESH_SEC)
+    return WS_EVENT_REFRESH_SEC + random.uniform(0.0, WS_EVENT_REFRESH_JITTER_SEC)
+
+
 def drain_updates(update_queue: queue.Queue, first: dict[str, Any] | None) -> list[dict[str, Any]]:
     updates: list[dict[str, Any]] = []
     if first is not None:
@@ -4170,7 +4507,7 @@ def run_websocket_loop(
         )
         record_capture_health(recorder, state, args, "startup")
 
-        next_event_refresh = time.monotonic() + WS_EVENT_REFRESH_SEC + random.uniform(0.0, WS_EVENT_REFRESH_JITTER_SEC)
+        next_event_refresh = time.monotonic() + event_refresh_delay_sec(executor.events)
         next_btc_refresh = time.monotonic() + WS_BTC_CANDLE_REFRESH_SEC
         next_health = time.monotonic() + 30.0
         next_paper_report = time.monotonic() + min(60.0, float(args.paper_report_sec))
@@ -4235,7 +4572,7 @@ def run_websocket_loop(
                         full_snapshot_scanned_key = None
                 except Exception:
                     log.exception("event refresh failed")
-                next_event_refresh = now + WS_EVENT_REFRESH_SEC + random.uniform(0.0, WS_EVENT_REFRESH_JITTER_SEC)
+                next_event_refresh = now + event_refresh_delay_sec(executor.events)
 
             if now >= next_btc_refresh:
                 try:
@@ -4346,6 +4683,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if PAPER_SETTLEMENT_SOURCE not in {"official", "proxy"}:
+        raise ValueError("BTC_1HR_PAPER_SETTLEMENT_SOURCE must be 'official' or 'proxy'")
+    if args.mode == "live" and args.signal_strategy in PAPER_ONLY_SIGNAL_STRATEGIES:
+        raise ValueError(
+            f"{args.signal_strategy} is paper-only until it passes the promotion gate; "
+            "use its dedicated shadow wrapper or pass --paper/--dry-run."
+        )
     if args.market_data == "polling" and args.interval_sec < 15:
         raise ValueError("--interval-sec must be >= 15")
     if args.shadow_bankroll < 0:
@@ -4360,7 +4704,7 @@ def main() -> None:
     set_sizing_policy(args.sizing_policy)
     validate_args(args)
     log.info(
-        "starting research executor mode=%s signal_strategy=%s sizing_policy=%s trade_env=%s market_data=%s series=%s train_days=%d contracts=%d ttl=%.1f-%.1fm no_min_side_prob=%s no_near_cap=%s/%s no_low_prob_cap=%s/%s reprice_event_cooldown=%s interval=%ds shadow_bankroll=$%.2f capture_db=%s log=%s",
+        "starting research executor mode=%s signal_strategy=%s sizing_policy=%s trade_env=%s market_data=%s series=%s train_days=%d contracts=%d ttl=%.1f-%.1fm no_min_side_prob=%s no_near_cap=%s/%s no_low_prob_cap=%s/%s reprice_event_cooldown=%s interval=%ds shadow_bankroll=$%.2f paper_settlement=%s capture_db=%s log=%s",
         args.mode,
         SIGNAL_STRATEGY,
         SIZING_POLICY,
@@ -4379,6 +4723,7 @@ def main() -> None:
         f"{int(reprice_event_cooldown_seconds())}s" if reprice_event_cooldown_seconds() > 0 else "off",
         args.interval_sec,
         args.shadow_bankroll,
+        PAPER_SETTLEMENT_SOURCE if args.mode == "paper" else "n/a",
         args.capture_db_path,
         LOG_FILE,
     )

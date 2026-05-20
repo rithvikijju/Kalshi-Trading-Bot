@@ -7,7 +7,7 @@ btc_1hr_research_live.py and changes only the deployment gates:
 * current research signal
 * websocket market data by default
 * 5-20 minutes to close
-* max five contracts per trade
+* half-Kelly risk sizing with max three contracts per trade
 * block NO trades unless model side probability is at least 72%
 * cap NO trades within $115 of strike at one contract
 * skip the current event for 5 minutes after a failed websocket reprice/filter
@@ -25,8 +25,9 @@ os.environ["BTC_1HR_SIGNAL_STRATEGY"] = "research"
 os.environ["BTC_1HR_SIZING_POLICY"] = "risk_adjusted"
 os.environ["BTC_1HR_MIN_TTL_MIN"] = "5"
 os.environ["BTC_1HR_MAX_TTL_MIN"] = "20"
-os.environ["BTC_1HR_MAX_CONTRACTS_PER_TRADE"] = "5"
-os.environ["BTC_1HR_RISK_BASE_MAX_CONTRACTS"] = "5"
+os.environ["BTC_1HR_MAX_CONTRACTS_PER_TRADE"] = "3"
+os.environ["BTC_1HR_RISK_BASE_MAX_CONTRACTS"] = "3"
+os.environ["BTC_1HR_RISK_KELLY_FRACTION"] = "0.50"
 os.environ["BTC_1HR_RISK_MEDIUM_ENTRY_CAP"] = "0.65"
 os.environ["BTC_1HR_RISK_HIGH_ENTRY_CAP"] = "0.75"
 os.environ["BTC_1HR_RISK_BASE_MEDIUM_ENTRY_CAP"] = "0.65"

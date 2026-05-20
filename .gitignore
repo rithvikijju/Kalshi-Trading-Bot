@@ -16,6 +16,8 @@ paper_trades.jsonl
 logs/
 backtest_outputs/
 .codex_work/
+gpt_pro_packets/
+docs/gpt_pro_reviews/
 *.duckdb
 *.parquet
 data/*.db
@@ -30,6 +32,8 @@ data/**/*.parquet
 # Full local datamarts are too large for regular GitHub pushes.
 data/research_datamart/*
 !data/research_datamart/datamart_report.json
+data/btc15m_historical_datamart/
+data/predexon_kalshi_orderbooks/
 data/research_datamart_test/
 data/research_datamart_bidask_smoke/
 data/research_datamart_smoke_bidask/
