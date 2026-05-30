@@ -256,6 +256,8 @@ def coinbase_summary(con: duckdb.DuckDBPyConnection, manifest: dict[str, Any], c
                 }
             ]
         )
+    cols = {str(row[1]) for row in con.execute(f"PRAGMA table_info({coinbase_table})").fetchall()}
+    raw_schema_fields_present = {"product_id", "exchange_time"}.issubset(cols)
     row = scalar_row(
         con,
         f"""
@@ -279,8 +281,18 @@ def coinbase_summary(con: duckdb.DuckDBPyConnection, manifest: dict[str, Any], c
         FROM ordered
         """,
     )
-    row["coinbase_ticker_source"] = manifest.get("coinbase_ticker_source", "unknown")
-    row["synthetic_coinbase_from_top"] = bool(manifest.get("synthetic_coinbase_from_top", False))
+    manifest_source = str(manifest.get("coinbase_ticker_source") or "")
+    if manifest_source:
+        source = manifest_source
+    elif raw_schema_fields_present:
+        source = "raw_sidecar_schema"
+    else:
+        source = "synthetic_or_unknown_schema"
+    row["coinbase_ticker_source"] = source
+    row["raw_coinbase_schema_fields_present"] = raw_schema_fields_present
+    row["synthetic_coinbase_from_top"] = bool(manifest.get("synthetic_coinbase_from_top", False)) or source.startswith(
+        "synthetic"
+    )
     return pd.DataFrame([{"metric": key, "value": value, "note": ""} for key, value in row.items()])
 
 
@@ -406,8 +418,20 @@ def verdict(
     if float(gaps.get("gaps_over_threshold") or 0) > 0:
         hard_failures.append("top_book_gaps_over_threshold")
     notes = []
-    if bool(manifest.get("synthetic_coinbase_from_top", False)) or cb.get("synthetic_coinbase_from_top") is True:
+    synthetic_coinbase = bool(manifest.get("synthetic_coinbase_from_top", False)) or table_bool(
+        cb.get("synthetic_coinbase_from_top", False)
+    )
+    raw_coinbase_schema = table_bool(cb.get("raw_coinbase_schema_fields_present", False))
+    coinbase_source = str(cb.get("coinbase_ticker_source") or "")
+    promotion_grade_coinbase = (
+        table_bool(cb.get("coinbase_ticker_exists", True))
+        and not synthetic_coinbase
+        and (coinbase_source in {"raw_sidecar", "raw_sidecar_schema"} or raw_coinbase_schema)
+    )
+    if synthetic_coinbase:
         notes.append("coinbase_ticker is synthetic from top-book btc_spot; not promotion-grade BTC tick-age evidence")
+    elif not promotion_grade_coinbase:
+        notes.append("coinbase_ticker source is not proven raw; not promotion-grade BTC tick-age evidence")
     if compare and compare.get("parity_available") is True:
         if float(compare.get("main_match_rate") or 0.0) < 0.8:
             notes.append("independent capture bucket match rate below 80%")
@@ -423,8 +447,7 @@ def verdict(
             {
                 "top_book_research_grade": raw_top_book_clean,
                 "filtered_top_book_research_grade": filtered_top_book_research_grade,
-                "promotion_grade_coinbase_ticks": not bool(manifest.get("synthetic_coinbase_from_top", False))
-                and table_bool(cb.get("coinbase_ticker_exists", True)),
+                "promotion_grade_coinbase_ticks": promotion_grade_coinbase,
                 "hard_failures": ";".join(hard_failures),
                 "filterable_failures": ";".join(filterable_failures),
                 "valid_book_rows": valid_book_rows,

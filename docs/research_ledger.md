@@ -15165,3 +15165,70 @@ artifacts:
   generic replay still has `1` price mismatch, so generic top-book replay
   remains diagnostic. The sidecar-selected replay is the authoritative
   wrapper-parity path for future lowdd paper fills.
+
+### 2026-05-30 - Lowdd four-row refresh and raw-vs-shadow fidelity
+
+- Remote status at about `2026-05-30T08:51Z`:
+  - raw BTC15M capture was live with `failed = false`, `last_error = ""`,
+    `ws_orderbook_top = 17,112,049`, and latest top-book
+    `2026-05-30T08:51:22.784375Z`;
+  - lowdd sidecar was live with `failed = false`, `last_error = ""`,
+    `signal_scan = 2,542,645`, `order_decision = 5,720`, and latest top-book
+    `2026-05-30T08:51:28.242123Z`.
+- New post-restart lowdd paper fill:
+  id `16`, `KXBTC15M-26MAY300430-30`, YES, `9` contracts at `0.65`,
+  official YES, paper-order PnL `+$3.00`.
+- Materialized only the bounded lowdd sidecar decision slice
+  `2026-05-30T07:00:00Z..2026-05-30T08:40:00Z` into ignored runtime:
+  `runtime\sidecar_slices\btc15m_lowdd_20260530_0700_0840.duckdb`.
+  Counts: `62,540` signal-scan rows and `4` order-decision rows.
+- Refreshed official post-restart paper report:
+  `runtime\remote_backtests\btc15m_lowdd_postrestart_20260530_0700_0840`.
+  Results: `4` trades, `4` settled, `3` wins, official PnL `+$8.05`,
+  premium `$16.95`, return on premium `47.4926%`, win rate `75%`, max
+  drawdown `-$0.97`.
+- Refreshed sidecar-selected official replay:
+  `runtime\remote_backtests\btc15m_lowdd_sidecar_selected_20260530_0700_0840`.
+  Results: `4` selected rows, `4` settled rows, one-contract PnL `+$0.84`,
+  paper-order-scaled PnL `+$8.05`, order price mismatch rows `0`.
+- Refreshed paper/live-sidecar parity:
+  `runtime\remote_backtests\btc15m_lowdd_paper_replay_parity_20260530_0700_0840`.
+  All `4 / 4` paper fills matched live sidecar selected/order rows. The generic
+  replay comparison was not supplied for this quick refresh, so all four
+  verdicts are `live_sidecar_parity_pass_generic_replay_missing`.
+- Refreshed the lowdd forward gate:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_0900`.
+  Verdict remains `production_ready = false`,
+  `research_status = research_promising_insufficient_forward_sample`. The only
+  blockers are still sample-size blockers: `selected_rows_below_min`,
+  `settled_rows_below_min`, `order_rows_below_min`, and
+  `paper_settled_rows_below_min`, because `4` rows is far below the default
+  `50` row threshold.
+- Raw-vs-lowdd capture fidelity check:
+  materialized `2026-05-30T08:00:00Z..2026-05-30T08:40:00Z` top-book slices
+  from the raw capture and lowdd sidecar into ignored runtime. Raw slice counts:
+  `58,806` top-book rows, `3,217` lifecycle rows, and `56,189` synthetic
+  Coinbase rows. Lowdd slice counts: `57,831` top-book rows, `3,172`
+  lifecycle rows, and `55,403` synthetic Coinbase rows.
+- Fidelity output:
+  `backtest_outputs\btc15m_raw_lowdd_fidelity_20260530_0800_0840`.
+  The raw top-book slice has no hard failures, `58,684 / 58,806` valid
+  filterable top-book rows (`99.7925%`), and no top-book gaps over `120s`.
+  Filterable failures are `27` null-book-field rows, `86` crossed YES-book
+  rows, and `79` crossed NO-book rows.
+- Raw-vs-lowdd parity:
+  `442 / 450` raw 5-second buckets matched the lowdd sidecar (`98.22%` raw
+  match rate, `99.33%` lowdd match rate). YES mid-price p95 difference was
+  `0c`; `97.49%` of matched buckets were within `1c`; maximum matched-bucket
+  difference was `9c`.
+- Patched `scripts/audit_btc15m_sidecar_fidelity.py` so copied materialized
+  DuckDBs without their manifest do not accidentally mark synthetic Coinbase
+  rows as promotion-grade. The audit now inspects the Coinbase table schema and
+  marks synthetic-or-unknown schema as not promotion-grade BTC tick-age
+  evidence. Regression coverage was added in
+  `scripts/test_btc15m_sidecar_fidelity.py`.
+- Interpretation:
+  raw capture remains faithful enough for filtered top-book research on this
+  fresh window and agrees closely with the lowdd sidecar. It is not
+  promotion-grade Coinbase tick-age evidence because these materialized
+  Coinbase rows are synthetic from top-book `btc_spot`.
