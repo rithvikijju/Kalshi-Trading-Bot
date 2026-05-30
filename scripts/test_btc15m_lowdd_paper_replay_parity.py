@@ -61,16 +61,35 @@ def test_row_verdict_rejects_over_limit_signal_to_order_reprice():
     assert verdict == "fail_signal_order_reprice_over_limit"
 
 
+def test_row_verdict_allows_delayed_selected_signal_when_order_matches_paper():
+    verdict = row_verdict(
+        signal_diff=0.0,
+        order_diff=0.0,
+        signal_order_reprice_cents=0.0,
+        signal_dt=-95.0,
+        order_dt=0.2,
+        replay_match=pd.Series({"entry_price": 0.60}),
+        replay_diff=0.0,
+        price_tolerance=1e-9,
+        time_tolerance=10.0,
+        max_signal_order_reprice_cents=2.0,
+    )
+
+    assert verdict == "full_live_and_generic_replay_parity_pass"
+
+
 def test_summarize_counts_bounded_reprice_as_live_parity_pass():
     summary = summarize(
         [
             {
                 "verdict": "live_sidecar_order_parity_pass_signal_reprice_generic_replay_price_mismatch",
                 "signal_order_reprice_cents": 1.0,
+                "signal_order_latency_sec": 0.3,
             },
             {
                 "verdict": "live_sidecar_parity_pass",
                 "signal_order_reprice_cents": 0.0,
+                "signal_order_latency_sec": 95.0,
             },
         ]
     )
@@ -79,6 +98,7 @@ def test_summarize_counts_bounded_reprice_as_live_parity_pass():
     assert summary["signal_order_reprice_rows"] == 1
     assert summary["signal_order_reprice_over_limit_rows"] == 0
     assert summary["max_signal_order_worse_reprice_cents"] == 1.0
+    assert summary["max_signal_order_latency_sec"] == 95.0
     assert summary["generic_replay_price_mismatch_rows"] == 1
 
 
@@ -170,6 +190,7 @@ def test_load_sidecar_tables_and_audit_rows(tmp_path):
     assert rows[0]["signal_entry_price"] == 0.65
     assert rows[0]["order_entry_price"] == 0.65
     assert rows[0]["signal_order_reprice_cents"] == 0.0
+    assert rows[0]["signal_order_latency_sec"] == 0.3
     assert rows[0]["replay_entry_price"] == 0.74
     assert rows[0]["verdict"] == "live_sidecar_parity_pass_generic_replay_price_mismatch"
 

@@ -195,7 +195,7 @@ def row_verdict(
     )
     if not order_matches_paper:
         return "fail_live_sidecar_price_mismatch"
-    if not time_ok(signal_dt, time_tolerance) or not time_ok(order_dt, time_tolerance):
+    if not time_ok(order_dt, time_tolerance):
         return "fail_live_sidecar_time_mismatch"
     if not signal_matches_paper:
         if not signal_order_reprice_ok:
@@ -238,6 +238,12 @@ def audit_rows(
                 signal_order_reprice_cents = (float(order.get("entry_price")) - float(signal.get("entry_price"))) * 100.0
             except Exception:
                 signal_order_reprice_cents = None
+        signal_order_latency_sec = None
+        if signal is not None and order is not None:
+            signal_ts = signal.get("received_at_utc")
+            order_ts = order.get("received_at_utc")
+            if pd.notna(signal_ts) and pd.notna(order_ts):
+                signal_order_latency_sec = float((order_ts - signal_ts).total_seconds())
         rows.append(
             {
                 "paper_id": paper_row.get("id"),
@@ -257,6 +263,7 @@ def audit_rows(
                 "order_price_diff": order_diff,
                 "order_time_diff_sec": order_dt,
                 "signal_order_reprice_cents": signal_order_reprice_cents,
+                "signal_order_latency_sec": signal_order_latency_sec,
                 "replay_time": None if replay_match is None else replay_match.get("received_at_utc"),
                 "replay_entry_price": None if replay_match is None else replay_match.get("entry_price"),
                 "replay_price_diff": replay_diff,
@@ -297,6 +304,11 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for row in rows
         if row.get("signal_order_reprice_cents") is not None and abs(float(row["signal_order_reprice_cents"])) > 1e-9
     ]
+    latency_values = [
+        float(row["signal_order_latency_sec"])
+        for row in rows
+        if row.get("signal_order_latency_sec") is not None
+    ]
     signal_reprice_rows = len(reprice_values)
     generic_mismatch = (
         verdict_counts.get("live_sidecar_parity_pass_generic_replay_price_mismatch", 0)
@@ -312,6 +324,7 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "signal_order_reprice_over_limit_rows": signal_reprice_over_limit,
         "max_signal_order_reprice_cents": max(reprice_values) if reprice_values else 0.0,
         "max_signal_order_worse_reprice_cents": max([value for value in reprice_values if value > 0.0], default=0.0),
+        "max_signal_order_latency_sec": max(latency_values) if latency_values else 0.0,
         "generic_replay_price_mismatch_rows": generic_mismatch,
         "verdict_counts": verdict_counts,
     }
@@ -372,6 +385,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "signal_entry_price",
         "order_entry_price",
         "signal_order_reprice_cents",
+        "signal_order_latency_sec",
         "replay_entry_price",
         "signal_time_diff_sec",
         "order_time_diff_sec",
