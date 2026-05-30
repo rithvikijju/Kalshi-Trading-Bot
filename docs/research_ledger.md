@@ -14959,3 +14959,39 @@ artifacts:
   loss. Keep the raw collector and lowdd paper shadow running; do not promote
   or size up without substantially more post-restart official-settled rows and
   row-level drawdown stability.
+
+### 2026-05-30 - Pair-lock selection-bias audit rejects pair-only candidate
+
+- Added `scripts/audit_btc15m_pair_lock_selection_bias.py` and
+  `scripts/test_btc15m_pair_lock_selection_bias.py`.
+- Purpose:
+  `cheap_pair_lock_rr` only reports events where a later opposite-side leg
+  appeared cheaply enough to lock payout. That is future-conditioned unless the
+  strategy also counts first-leg exposure for events where no later lock
+  appears. The causal comparison is `cheap_tail_position_aware`, which keeps
+  those unpaired first legs.
+- Fetched the small CSV outputs from the remote 15-hour full raw replay into
+  ignored `runtime\remote_backtests\btc15m_full_snapshot_window_grid_20260529_1600_20260530_0700`
+  and audited them plus the local sidecar replay windows. Output:
+  `backtest_outputs\btc15m_pair_lock_selection_bias_20260530_latest`.
+- Results:
+  - Full raw `2026-05-29T16:00Z..2026-05-30T07:00Z`:
+    `cheap_pair_lock_rr` had `21` pair rows, pair-only PnL `+$1.11`; the
+    position-aware comparison had the same `21` paired rows but also `39`
+    unpaired first-leg exposures with PnL `-$6.171`, making total
+    position-aware PnL `-$5.061`, max drawdown `-$5.376`.
+  - Sidecar `2026-05-29T18:00Z..2026-05-30T06:00Z`:
+    pair-only PnL `+$0.71`; `32` unpaired exposures lost `-$5.534`, making
+    position-aware PnL `-$4.824`.
+  - Sidecar `18:00Z..00:00Z`:
+    pair-only PnL `+$0.49`; `17` unpaired exposures lost `-$2.857`, making
+    position-aware PnL `-$2.367`.
+  - Sidecar `00:00Z..06:00Z`:
+    pair-only PnL `+$0.22`; `15` unpaired exposures lost `-$2.677`, making
+    position-aware PnL `-$2.457`.
+- Verdict:
+  all audited windows are `reject_pair_only_future_conditioned`. Pair-lock
+  remains a useful diagnostic for book structure, but it is not a standalone
+  strategy and should not be deployed or ranked as a candidate unless a future
+  runner can enter both legs causally without carrying unbounded first-leg
+  selection risk.
