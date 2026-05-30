@@ -4,6 +4,7 @@ import pytest
 
 from scripts.backtest_btc15m_lowdd_sidecar_selected import (
     build_rows,
+    dedupe_selected_by_event,
     load_selected_and_orders,
     one_contract_pnl,
     order_scaled_pnl,
@@ -131,3 +132,29 @@ def test_build_rows_and_summarize_with_fake_official(monkeypatch):
     assert rows[0]["order_price_diff"] == pytest.approx(0.0)
     assert summary["signal_one_contract_pnl"] == pytest.approx(0.33)
     assert summary["order_scaled_pnl"] == pytest.approx(3.0)
+
+
+def test_dedupe_selected_by_event_keeps_first_signal():
+    selected = pd.DataFrame(
+        [
+            {
+                "selected_at_utc": pd.Timestamp("2026-05-30T10:25:20.402405Z"),
+                "selected_received_at_ns": 2,
+                "event_ticker": "EVT",
+                "market_ticker": "MKT",
+                "side": "yes",
+            },
+            {
+                "selected_at_utc": pd.Timestamp("2026-05-30T10:25:20.365412Z"),
+                "selected_received_at_ns": 1,
+                "event_ticker": "EVT",
+                "market_ticker": "MKT",
+                "side": "yes",
+            },
+        ]
+    )
+
+    kept, duplicates = dedupe_selected_by_event(selected)
+
+    assert kept["selected_received_at_ns"].tolist() == [1]
+    assert duplicates["selected_received_at_ns"].tolist() == [2]

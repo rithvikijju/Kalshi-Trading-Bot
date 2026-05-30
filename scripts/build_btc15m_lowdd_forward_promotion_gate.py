@@ -156,6 +156,8 @@ def evaluate_gate(
 ) -> dict[str, Any]:
     missing_inputs = missing_inputs or []
     selected_rows = to_int(selected_summary.get("selected_rows"))
+    raw_selected_rows = to_int(selected_summary.get("raw_selected_rows"), selected_rows)
+    duplicate_selected_rows = to_int(selected_summary.get("duplicate_selected_rows"))
     settled_rows = to_int(selected_summary.get("settled_rows"))
     order_rows = to_int(selected_summary.get("order_rows"))
     paper_rows = to_int(paper_summary.get("trades"))
@@ -227,6 +229,8 @@ def evaluate_gate(
         blockers.append("order_paper_premium_mismatch")
     if generic_mismatch_rows > 0:
         advisories.append("generic_replay_price_mismatch_sidecar_selected_is_authoritative")
+    if duplicate_selected_rows > 0:
+        advisories.append("duplicate_selected_signals_deduped")
 
     price_parity_ok = (
         live_sidecar_price_mismatch_rows == 0
@@ -254,7 +258,9 @@ def evaluate_gate(
         "research_status": research_status,
         "blockers": ";".join(unique_blockers),
         "advisories": ";".join(sorted(set(advisories))),
+        "raw_selected_rows": raw_selected_rows,
         "selected_rows": selected_rows,
+        "duplicate_selected_rows": duplicate_selected_rows,
         "settled_rows": settled_rows,
         "order_rows": order_rows,
         "paper_rows": paper_rows,
@@ -360,7 +366,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "research_status",
         "blockers",
         "advisories",
+        "raw_selected_rows",
         "selected_rows",
+        "duplicate_selected_rows",
         "settled_rows",
         "order_rows",
         "paper_settled_rows",

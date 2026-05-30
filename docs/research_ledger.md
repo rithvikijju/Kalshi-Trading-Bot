@@ -15764,3 +15764,98 @@ artifacts:
   fragile, and window-unstable. Lowdd remains the only quality-clean positive
   BTC15M replay candidate in the latest slice, but it is still not deployable
   because its official/paper-forward sample is only `6` rows.
+
+### 2026-05-30 - BTC15M 10:41Z remote refresh, lowdd duplicate-selected fix
+
+- Git/branch refresh:
+  local `sami` fast-forward pulled cleanly and `git push` reported
+  `Everything up-to-date`. Remote branch scan showed no newer non-`sami`
+  strategy commits: `origin/sami` was latest at `2026-05-30 06:35:30 -0400`;
+  the next most recent strategy branches were still from `2026-05-13`.
+- Remote collector status at approximately `2026-05-30T10:40:34Z`:
+  raw `btc15m_live_capture` sidecar was alive with `failed=false`,
+  `dropped=0`, PID `6084`, queue depth `6`, and latest
+  `ws_orderbook_top=2026-05-30T10:40:32.390930Z`.
+  Lowdd forward shadow was alive with `failed=false`, `dropped=0`, PID
+  `12796`, queue depth `19`, latest
+  `signal_scan=2026-05-30T10:40:32.947033Z`, and `20` rows in
+  `research_live_trades`.
+- Fresh bounded materialization:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1041`.
+  Window:
+  `2026-05-30T06:40:00Z..2026-05-30T10:41:00Z`.
+  Raw slice counts were `279,881` `ws_orderbook_top`, `1,339`
+  `ws_lifecycle`, and `263,129` synthetic `coinbase_ticker` rows.
+  Lowdd slice counts were `277,822` `ws_orderbook_top`, `135,043`
+  `signal_scan`, `9` `order_decision`, and `262,405` synthetic
+  `coinbase_ticker` rows.
+- Data-fidelity artifact:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_0640_1041`.
+  Verdict stayed research-only: valid top-book rate was `99.5076%`, but
+  `top_book_gaps_over_threshold` remained a hard failure and Coinbase ticks
+  were synthetic from top-book `btc_spot`, so the slice is not
+  promotion-grade BTC tick-age evidence.
+- Fresh whole-window official replay:
+  `backtest_outputs\btc15m_live_holdout_20260530_0640_1041`.
+  All `17` events in the window were finalized by Kalshi REST. Results:
+  `current_lowdd_no_rv` had `8` trades, PnL `+$1.74`, return on premium
+  `33.0798%`, win rate `87.5%`, max drawdown `-$0.25`.
+  `cheap_yes_rr_first` had `13` trades, PnL `+$0.999`, return on premium
+  `19.9760%`, win rate `46.1538%`, max drawdown `-$1.10`.
+  `cheap_pair_lock_rr` stayed positive at `+$0.30` with `8` rows, but remains
+  excluded by the prior selection-bias audit. The other cheap-tail variants
+  were official-PnL negative.
+- Rolling-window robustness:
+  `backtest_outputs\btc15m_live_holdout_window_grid_20260530_0640_1041` and
+  `backtest_outputs\btc15m_replay_candidate_robustness_20260530_1041_quality`.
+  `current_lowdd_no_rv` remained quality-clean with `8` official-settled,
+  executable rows, no duplicate event exposure, bootstrap p05 `+$0.71`,
+  bootstrap profit probability `99.62%`, and `4 / 5` nonnegative windows
+  (`4` positive, `1` flat). Verdict:
+  `research_promising_insufficient_sample`.
+  `cheap_yes_rr_first` stayed positive on the whole-window ledger but was still
+  bootstrap/window fragile: bootstrap p05 `-$1.86205`, profit probability
+  `71.16%`, and `2 / 5` positive windows. Verdict:
+  `research_promising_insufficient_sample_bootstrap_fragile`.
+- Lowdd sidecar/paper evidence:
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_20260530_0640_1041`,
+  `backtest_outputs\btc15m_lowdd_postrestart_20260530_0640_1041`,
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_20260530_0640_1041`, and
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_0640_1041`.
+  The raw lowdd sidecar contained `9` selected rows, but one was a duplicate
+  selected scan for event `KXBTC15M-26MAY300630`. The selected-sidecar replay
+  now dedupes repeated selected scans by event and writes
+  `duplicate_selected_signals.csv`; evidence rows are `8` selected, `8`
+  settled, `8` order rows, and `8` paper rows. Sidecar order-scaled official
+  PnL exactly matched the paper official ledger after dedupe:
+  `+$20.43` on `$42.57` premium, `87.5%` win rate, max drawdown `-$0.97`.
+  Live sidecar parity passed for all `8` paper rows; selected-to-order reprice
+  rows were `2`, with `0` over the configured limit and max worse reprice
+  `1.0c`.
+- Lowdd promotion gate:
+  production-ready remained `false`. Blockers were only sample-size gates:
+  `selected_rows_below_min`, `settled_rows_below_min`,
+  `order_rows_below_min`, and `paper_settled_rows_below_min`. Advisories:
+  duplicate selected signals were deduped, generic replay price mismatches are
+  advisory because live sidecar parity is authoritative, and selected-to-order
+  reprices were within config.
+- Branch replayability refresh:
+  `backtest_outputs\btc_branch_replayability_20260530_1041`. Results were
+  unchanged across `19` remote branches: `1` directly replayable current BTC15M
+  branch (`origin/sami`), `3` branches needing an adapter, `14` needing a
+  harness, and `1` not BTC capture replay-ready. Fresh capture facts:
+  `17` BTC15M binary markets, `0` cumulative `-T` markets, `1`
+  lifecycle `determined` row, and `5` lifecycle `settled` rows.
+- Readiness:
+  `backtest_outputs\deployment_readiness_20260530_1041_lowdd_gate` still had
+  `production_ready_count=0`. The standalone lowdd gate is promising but
+  sample-small; broad global readiness still includes conservative historical
+  blockers from older verifier artifacts.
+- Validation:
+  `python -m pytest scripts\test_btc15m_lowdd_sidecar_selected.py
+  scripts\test_btc15m_lowdd_forward_promotion_gate.py -q --basetemp
+  .pytest-codex-tmp-lowdd-dedupe-gate` passed with `10` tests.
+  `python -m py_compile scripts\backtest_btc15m_lowdd_sidecar_selected.py
+  scripts\build_btc15m_lowdd_forward_promotion_gate.py
+  scripts\test_btc15m_lowdd_sidecar_selected.py
+  scripts\test_btc15m_lowdd_forward_promotion_gate.py` passed.

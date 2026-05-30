@@ -188,6 +188,24 @@ def attach_nearest_order(row: pd.Series, orders: pd.DataFrame) -> pd.Series | No
     return subset.sort_values(["_abs_dt_sec", "order_at_utc"]).iloc[0]
 
 
+def dedupe_selected_by_event(selected: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Keep the first selected signal per event and report later duplicates.
+
+    The lowdd wrapper is one-trade-per-event.  A repeated selected scan for the
+    same event should not become a second replay trade when the paper order
+    ledger only emitted one fill.
+    """
+
+    if selected.empty:
+        return selected.copy(), selected.copy()
+    sort_cols = [col for col in ["selected_at_utc", "selected_received_at_ns"] if col in selected.columns]
+    ordered = selected.sort_values(sort_cols).copy() if sort_cols else selected.copy()
+    duplicate_mask = ordered.duplicated(subset=["event_ticker"], keep="first")
+    kept = ordered.loc[~duplicate_mask].reset_index(drop=True)
+    duplicates = ordered.loc[duplicate_mask].reset_index(drop=True)
+    return kept, duplicates
+
+
 def build_rows(selected: pd.DataFrame, orders: pd.DataFrame, sleep_sec: float) -> list[dict[str, Any]]:
     session = requests.Session()
     cache: dict[str, dict[str, Any]] = {}
@@ -250,7 +268,12 @@ def max_drawdown(values: list[float]) -> float:
     return worst
 
 
-def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize(
+    rows: list[dict[str, Any]],
+    *,
+    raw_selected_rows: int | None = None,
+    duplicate_selected_rows: int = 0,
+) -> dict[str, Any]:
     settled = [row for row in rows if row.get("official_result") in {"yes", "no"}]
     signal_pnls = [float(row["signal_one_contract_pnl"]) for row in settled if row.get("signal_one_contract_pnl") is not None]
     signal_premiums = [float(row["signal_one_contract_premium"]) for row in settled if row.get("signal_one_contract_premium") is not None]
@@ -258,7 +281,9 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     order_pnls = [float(row["order_scaled_pnl"]) for row in order_rows]
     order_premiums = [float(row["order_scaled_premium"]) for row in order_rows]
     return {
+        "raw_selected_rows": len(rows) if raw_selected_rows is None else int(raw_selected_rows),
         "selected_rows": len(rows),
+        "duplicate_selected_rows": int(duplicate_selected_rows),
         "settled_rows": len(settled),
         "signal_one_contract_pnl": round(sum(signal_pnls), 6),
         "signal_one_contract_premium": round(sum(signal_premiums), 6),
@@ -320,10 +345,17 @@ ROW_COLUMNS = [
 def run(args: argparse.Namespace) -> dict[str, Any]:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     selected, orders = load_selected_and_orders(args.materialized_db, args.start_utc, args.end_utc)
+    raw_selected_rows = len(selected)
+    selected, duplicate_selected = dedupe_selected_by_event(selected)
     rows = build_rows(selected, orders, args.sleep)
-    summary = summarize(rows)
+    summary = summarize(
+        rows,
+        raw_selected_rows=raw_selected_rows,
+        duplicate_selected_rows=len(duplicate_selected),
+    )
     write_csv(args.out_dir / "selected_signal_trades.csv", rows, ROW_COLUMNS)
     write_csv(args.out_dir / "selected_signal_summary.csv", [summary], list(summary.keys()))
+    duplicate_selected.to_csv(args.out_dir / "duplicate_selected_signals.csv", index=False)
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "materialized_db": str(args.materialized_db),
@@ -331,6 +363,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "end_utc": args.end_utc or "",
         "notes": [
             "Rows come from signal_scan action='selected', not from generic top-book rescoring.",
+            "Duplicate selected signals for the same event are reported but not counted as extra trades.",
             "signal_one_contract_* fields use one-contract taker-fee PnL.",
             "order_scaled_* fields use order_decision estimated_cost for paper wrapper size.",
         ],
