@@ -16265,3 +16265,83 @@ artifacts:
   received-time top-book rows in DuckDB; the remaining blocker is not data
   faithfulness, but forward sample size and future official-settled paper rows
   for the frozen lowdd policy.
+
+### 2026-05-30 - Current post-fix branch and rule replay refresh
+
+- Materialized the current raw-Coinbase post-fix replay sidecar window
+  `2026-05-30T11:48:00Z..2026-05-30T12:52:00Z` without copying raw JSONL
+  sidecars into git. Local ignored snapshots:
+  `runtime\remote_snapshots\sidecar_slices_20260530_1148_1252_alltables\btc15m_raw_20260530_1148_1252.duckdb`
+  and
+  `runtime\remote_snapshots\sidecar_slices_20260530_1148_1252_alltables\btc15m_lowdd_20260530_1148_1252.duckdb`.
+  The raw slice had `50,157` `ws_orderbook_top`, `3,874`
+  `ws_lifecycle`, and `813` raw `coinbase_ticker` rows. The lowdd slice had
+  `49,758` `ws_orderbook_top`, `25,154` `signal_scan`, `1`
+  `order_decision`, and `808` raw `coinbase_ticker` rows.
+- Fidelity artifact:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_1148_1252`.
+  Coinbase remained promotion-grade:
+  `promotion_grade_coinbase_ticks=true`, `coinbase_ticker_source=raw_sidecar`,
+  and `synthetic_coinbase_from_top=false`. Top-book quality was weaker than the
+  shorter `11:48Z..12:18Z` slice because the standard gap gate found one market
+  gap over `120s`: `KXBTC15M-26MAY300830-30` had a `170.148s` gap. The audit
+  therefore reported `top_book_research_grade=false` and
+  `filtered_top_book_research_grade=false`, with hard failure
+  `top_book_gaps_over_threshold`. Raw-vs-lowdd parity was still broadly good:
+  `648 / 671` raw buckets matched, raw match rate `96.5723%`, compare match
+  rate `96.8610%`, mean YES-mid difference `0.0667c`, p95 `0.3c`, and
+  within-`1c` rate `98.8818%`.
+- Branch replayability artifact:
+  `backtest_outputs\btc_branch_replayability_20260530_1148_1252`.
+  Across `19` remote branches, only `origin/sami` was directly replayable on
+  the BTC15M binary capture schema. Counts:
+  `1` `directly_replayable_current_btc15m`, `3`
+  `not_directly_replayable_needs_adapter`, `14`
+  `not_directly_replayable_needs_harness`, and `1`
+  `not_btc_capture_replay_ready`. The v2 branch family still cannot be run
+  directly because the capture has BTC15M binary markets, not cumulative `-T`
+  markets, and the original harness expects dedup/all-table aliases.
+- V2 adapter feasibility artifact:
+  `backtest_outputs\btc15m_kalshi_v2_adapter_feasibility_20260530_1148_1252`.
+  The adapter preflight improved versus the older synthetic-Coinbase slice:
+  `coinbase_raw_book_field_rate=1.0`, `5 / 5` BTC15M markets matched Kalshi
+  REST metadata, and all had floor strike and result fields. All `17` kalshi-v2
+  branch refs remained
+  `research_adapter_feasible_not_original_v2_deployable`; TP/SL/time-exit
+  logic remains excluded until independent live exit-fill validation exists.
+- Current-rule official holdout artifact:
+  `backtest_outputs\btc15m_live_holdout_20260530_1148_1252`. It covered only
+  `5` finalized events, so it is a diagnostic slice, not a promotion sample.
+  `current_lowdd_no_rv` had `1` trade for `+$0.39`; `cheap_no_rr_first` had
+  `3` trades for `+$0.165` but failed robustness as bootstrap-fragile;
+  `cheap_tail_best_side_first` had `4` trades for `+$0.077` and was also
+  bootstrap-fragile; `cheap_yes_rr_first` and `cheap_tail_position_aware` were
+  negative. `cheap_pair_lock_rr` stayed excluded by the earlier selection-bias
+  audit.
+- V2 binary adapter artifact:
+  `backtest_outputs\btc15m_v2_binary_adapter_20260530_1148_1252`.
+  `v2_default_binary_h2s` had `4` trades, PnL `-$0.61`, and was rejected for
+  nonpositive official PnL. `v2_awareness_binary_h2s` had `4` trades, PnL
+  `-$0.04`, also rejected. `v2_awareness_yes_only_h2s` had `1` trade for
+  `+$0.29`, which the robustness audit labeled
+  `research_promising_insufficient_sample`.
+- Lowdd selected-sidecar artifact:
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_20260530_1148_1252`.
+  It still contained only the same one post-fix selected/order row:
+  `selected_rows=1`, `settled_rows=1`, `order_rows=1`,
+  `order_scaled_pnl=+$3.06`, and `order_price_mismatch_rows=0`.
+- Robustness artifact:
+  `backtest_outputs\btc15m_replay_candidate_robustness_20260530_1148_1252`.
+  No strategy became deployable or promotion-ready. Positive rows were all
+  either too small (`current_lowdd_no_rv`, v2 YES-only) or bootstrap-fragile
+  (`cheap_no_rr_first`, `cheap_tail_best_side_first`).
+- Validation:
+  `python -m py_compile` passed for the materializer, fidelity audit, branch
+  replayability audit, v2 adapter feasibility audit, live holdout, v2 adapter,
+  lowdd selected-sidecar replay, and replay robustness scripts used here.
+- Interpretation:
+  this refresh improves branch coverage on the current collected BTC15M data
+  and removes a stale concern about v2 adapter BTC tick provenance on the
+  post-fix slice. It does not change deployment status. The branch family still
+  contributes research adapters only, and the current forward path remains
+  clean data collection plus more official-settled lowdd paper rows.
