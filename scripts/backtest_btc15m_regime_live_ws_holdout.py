@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--capture-db", type=Path, default=DEFAULT_CAPTURE_DB)
     p.add_argument("--start", default=None)
     p.add_argument("--end", default=None)
+    p.add_argument("--btc-model", choices=["spot", "rolling60"], default="spot")
     p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
     return p.parse_args()
 
@@ -234,8 +235,8 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     top, btc, lifecycle, decisions, capture_info = load_capture(args.capture_db, args.start, args.end)
     meta, results = prepare_meta(lifecycle)
-    q = prepare_quotes(top, btc, meta, results)
-    q = add_proxy_results(q, btc)
+    q = prepare_quotes(top, btc, meta, results, args.btc_model)
+    q = add_proxy_results(q, btc, args.btc_model)
     c = add_btc_ret_to_quotes(q, btc)
 
     frames = []
@@ -266,6 +267,7 @@ def main() -> int:
     rule_defs.to_csv(args.out_dir / "rule_definitions.csv", index=False)
     info = {
         **capture_info,
+        "btc_model": args.btc_model,
         "candidate_rows": int(len(c)),
         "rules": len(RULES),
         "official_proxy": compare_official_proxy(all_trades) if not all_trades.empty else {},

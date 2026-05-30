@@ -16459,3 +16459,63 @@ artifacts:
   or shadow should be promoted from these filters. If pair-lock economics are
   ever revisited, they need a separate simultaneous two-leg FOK execution audit
   and should not be mixed into directional BTC15M strategy evidence.
+
+### 2026-05-30 - Full raw regime and ML replay refresh
+
+- Patched stale live-websocket replay scripts after the shared F2 helper API
+  changed:
+  `scripts\backtest_btc15m_regime_live_ws_holdout.py` and
+  `scripts\backtest_btc15m_ml_live_ws_holdout.py` now pass an explicit
+  `--btc-model` into `prepare_quotes` / `add_proxy_results`. The ML script also
+  now writes official-subset PnL rows (`pnl_official`,
+  `pnl_official_2c`) instead of reporting only proxy-label PnL, and its
+  as-of feature helper avoids full-frame concat copies so 6-hour grid windows
+  run reliably.
+- Pulled the full raw snapshot DB locally into ignored runtime storage:
+  `runtime\remote_snapshots\full_raw_snapshot_20260530_1320\btc15m_live_capture_full_20260530_1320.duckdb`
+  (`2,074,095,616` bytes). This was copied from the controlled remote snapshot,
+  not added to git.
+- Full raw fixed-regime replay artifact:
+  `backtest_outputs\btc15m_regime_live_ws_full_raw_20260522_0530_1300`.
+  It used the full raw snapshot
+  `2026-05-22T02:40:00Z..2026-05-30T13:00:00Z`, `17,339,935` top-book rows,
+  `204,976` BTC ticks, and `72,850` lifecycle rows.
+- Regime results:
+  `base_f2` was negative over proxy-stressed rows (`207` trades, `-$13.44`
+  with 2c stress) and also negative on the tiny official subset (`9` trades,
+  `-$0.20`). `edge12_to_28_highrv32` and `highrv320_q1_base` each had `11`
+  proxy-stressed trades for `+$1.09`, but only `1` official row for `+$0.39`.
+  `highrv320_q100_base` had `10` proxy trades for `+$0.57` and the same single
+  official row. `liquid_highrv32_not_against` was proxy-negative. The strict
+  plus high-RV rule had `14` proxy trades for `+$1.49` but its only official row
+  lost `-$0.50`. No fixed-regime rule became deployable.
+- Full raw ML live-WS window grid artifact:
+  `backtest_outputs\btc15m_ml_live_ws_full_raw_window_grid_20260522_0530_1300`.
+  The grid ran `34` six-hour windows across the full snapshot using the frozen
+  April `xgboost_tabular` and `lightgbm_tabular` models. The helper
+  `scripts\summarize_btc15m_ml_window_grid.py` writes
+  `ml_window_grid_official_proxy_summary.csv`,
+  `ml_window_grid_by_window.csv`, `summary_manifest.json`, and `report.md`.
+- ML results:
+  `xgboost_tabular` produced `104` clean executable rows, `104` events, proxy
+  PnL `-$3.49` under 2c stress, and only `8` official-settled rows for
+  `+$0.39` official 2c PnL. `lightgbm_tabular` produced `48` clean executable
+  rows, `48` events, proxy PnL `+$3.00` under 2c stress, and only `5`
+  official-settled rows for `+$1.37` official 2c PnL. Both models had no
+  duplicate-event rows and no non-executable or wide-quote rows in the selected
+  grid output.
+- Validation:
+  `python -m py_compile scripts\backtest_btc15m_regime_live_ws_holdout.py scripts\backtest_btc15m_ml_live_ws_holdout.py scripts\summarize_btc15m_ml_window_grid.py`
+  passed. A regime smoke on the `2026-05-30T11:48Z..12:52Z` sidecar slice ran
+  after the API fix. An ML official-subset smoke on
+  `2026-05-29T00:00Z..06:00Z` ran after the official-PnL patch; proxy was
+  positive on `5` xgboost trades, but the single official-settled row was
+  negative (`-$0.74` under 2c stress).
+- Interpretation:
+  the full raw replay refresh kills the old broad `base_f2` regime on this
+  data and leaves the smaller high-RV/regime and ML positives as sample-small
+  research diagnostics only. The most interesting non-lowdd research thread is
+  `lightgbm_tabular`, because it is proxy-positive and official-subset-positive
+  on clean rows, but `5` official rows is far below any promotion bar. It can be
+  monitored as a sidecar metric in future research, not traded or paper-promoted
+  without fresh official-settled forward evidence.

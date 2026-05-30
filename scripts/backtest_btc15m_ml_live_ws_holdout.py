@@ -71,11 +71,15 @@ def add_asof_change(
     lb_min: float,
     out_col: str,
 ) -> pd.DataFrame:
-    pieces: list[pd.DataFrame] = []
+    out = df.copy()
+    out[out_col] = np.nan
+    age_col = f"lookback_age_{str(lb_min).replace('.', '_')}m_sec"
+    out[age_col] = np.nan
     offset_ns = int(float(lb_min) * 60 * 1_000_000_000)
-    for _, group in df.groupby(group_col, sort=False):
-        group = group.sort_values("received_at_ns").copy()
+    for _, idx in out.groupby(group_col, sort=False).groups.items():
+        group = out.loc[idx, ["received_at_ns", value_col]].sort_values("received_at_ns").copy()
         left = group[["received_at_ns", value_col]].copy()
+        left["_idx"] = group.index.to_numpy()
         left["target_ns"] = left["received_at_ns"] - offset_ns
         right = group[["received_at_ns", value_col]].rename(
             columns={"received_at_ns": "past_ns", value_col: "past_value"}
@@ -86,13 +90,15 @@ def add_asof_change(
             left_on="target_ns",
             right_on="past_ns",
             direction="backward",
-        ).sort_index()
-        group[out_col] = group[value_col].to_numpy(dtype=float) - merged["past_value"].to_numpy(dtype=float)
-        group[f"lookback_age_{str(lb_min).replace('.', '_')}m_sec"] = (
-            group["received_at_ns"].to_numpy(dtype=np.int64) - merged["past_ns"].to_numpy(dtype=float)
+        )
+        target_idx = merged["_idx"].to_numpy()
+        out.loc[target_idx, out_col] = (
+            merged[value_col].to_numpy(dtype=float) - merged["past_value"].to_numpy(dtype=float)
+        )
+        out.loc[target_idx, age_col] = (
+            merged["received_at_ns"].to_numpy(dtype=np.int64) - merged["past_ns"].to_numpy(dtype=float)
         ) / 1_000_000_000.0
-        pieces.append(group)
-    return pd.concat(pieces, ignore_index=True).sort_values("received_at_ns").reset_index(drop=True) if pieces else df
+    return out
 
 
 def add_btc_returns(q: pd.DataFrame, btc: pd.DataFrame) -> pd.DataFrame:
@@ -126,10 +132,10 @@ def add_btc_returns(q: pd.DataFrame, btc: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_side_candidates(q: pd.DataFrame, btc: pd.DataFrame, capture_end: pd.Timestamp) -> pd.DataFrame:
+def build_side_candidates(q: pd.DataFrame, btc: pd.DataFrame, capture_end: pd.Timestamp, btc_model: str) -> pd.DataFrame:
     q = q.copy()
     q = q[q["close_time"].le(capture_end)].copy()
-    q = add_proxy_results(q, btc)
+    q = add_proxy_results(q, btc, btc_model)
     q = q[q["proxy_result"].astype(str).str.lower().isin(["yes", "no"])].copy()
     if q.empty:
         return pd.DataFrame()
@@ -246,9 +252,38 @@ def add_two_cent_stress(trades: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def add_official_pnl(trades: pd.DataFrame) -> pd.DataFrame:
+    out = trades.copy()
+    if "official_result" not in out.columns:
+        out["official_result"] = np.nan
+    has_official = out["official_result"].notna()
+    official_win = out["official_result"].astype(str).str.lower().eq(out["side"].astype(str).str.lower())
+    entry = pd.to_numeric(out["entry_price"], errors="coerce")
+    fee = pd.to_numeric(out["entry_fee"], errors="coerce")
+    out["official_win"] = np.where(has_official, official_win, np.nan)
+    out["pnl_official"] = np.where(has_official, np.where(official_win, 1.0 - entry - fee, -entry - fee), np.nan)
+    entry_2c = (entry + 0.02).clip(upper=0.99)
+    fee_2c = fee_array(entry_2c)
+    out["pnl_official_2c"] = np.where(
+        has_official,
+        np.where(official_win, 1.0 - entry_2c - fee_2c, -entry_2c - fee_2c),
+        np.nan,
+    )
+    return out
+
+
 def summarize(trades: pd.DataFrame, model_name: str, gate_p: float, gate_ev: float, pnl_col: str) -> dict[str, Any]:
     m = train_metrics(trades, pnl_col)
     return {"model": model_name, "gate_min_p": gate_p, "gate_min_ev": gate_ev, "pnl_col": pnl_col, **m}
+
+
+def summarize_official_subset(trades: pd.DataFrame, model_name: str, gate_p: float, gate_ev: float, pnl_col: str) -> dict[str, Any]:
+    official = trades[trades["official_result"].notna()].copy() if "official_result" in trades.columns else trades.iloc[0:0].copy()
+    if not official.empty:
+        official["win"] = official["official_win"].astype(float)
+    row = summarize(official, model_name, gate_p, gate_ev, pnl_col)
+    row["official_subset"] = True
+    return row
 
 
 def main() -> int:
@@ -257,6 +292,7 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
+    parser.add_argument("--btc-model", choices=["spot", "rolling60"], default="spot")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--models", default="xgboost_tabular,lightgbm_tabular")
     args = parser.parse_args()
@@ -264,9 +300,9 @@ def main() -> int:
 
     top, btc, lifecycle, decisions, info = load_capture(args.capture_db, args.start, args.end)
     meta, official = metadata_from_lifecycle(lifecycle)
-    q = prepare_quotes(top, btc, meta, official)
+    q = prepare_quotes(top, btc, meta, official, args.btc_model)
     capture_end = pd.Timestamp(info["capture_end_utc"])
-    candidates = build_side_candidates(q, btc, capture_end)
+    candidates = build_side_candidates(q, btc, capture_end, args.btc_model)
     if candidates.empty:
         raise SystemExit("no candidates after causal websocket feature reconstruction")
     candidates, existing_features = prepare_features(candidates)
@@ -291,11 +327,18 @@ def main() -> int:
         gate_p, gate_ev = load_gate(args.model_dir, model_name)
         trades = first_per_event(scored[(scored["pred_win_prob"] >= gate_p) & (scored["pred_ev"] >= gate_ev)]).copy()
         trades = add_two_cent_stress(trades)
+        trades = add_official_pnl(trades)
         trades["gate_min_p"] = gate_p
         trades["gate_min_ev"] = gate_ev
         trade_frames.append(trades)
-        summary_rows.append(summarize(trades, model_name, gate_p, gate_ev, "pnl"))
-        summary_rows.append(summarize(trades, model_name, gate_p, gate_ev, "pnl_2c"))
+        for row in [
+            summarize(trades, model_name, gate_p, gate_ev, "pnl"),
+            summarize(trades, model_name, gate_p, gate_ev, "pnl_2c"),
+        ]:
+            row["official_subset"] = False
+            summary_rows.append(row)
+        summary_rows.append(summarize_official_subset(trades, model_name, gate_p, gate_ev, "pnl_official"))
+        summary_rows.append(summarize_official_subset(trades, model_name, gate_p, gate_ev, "pnl_official_2c"))
 
     all_trades = pd.concat(trade_frames, ignore_index=True) if trade_frames else pd.DataFrame()
     summary = pd.DataFrame(summary_rows)
@@ -303,10 +346,12 @@ def main() -> int:
         **info,
         "models": args.models,
         "model_dir": str(args.model_dir),
+        "btc_model": args.btc_model,
         "candidate_rows": int(len(candidates)),
         "candidate_events": int(candidates["event_ticker"].nunique()),
         "feature_columns_available_after_prepare": existing_features,
         "feature_reconstruction_note": "top-of-book websocket only; missing full-depth fields are NaN and imputed by model pipelines",
+        "label_note": "pnl/pnl_2c use proxy close labels; pnl_official/pnl_official_2c rows summarize only trades with Kalshi official_result populated in lifecycle capture.",
     }
     all_trades.to_parquet(args.out / "ml_live_ws_trades.parquet", index=False, compression="zstd")
     summary.to_csv(args.out / "ml_live_ws_summary.csv", index=False)
