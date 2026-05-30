@@ -1042,6 +1042,11 @@ def apply_settlement_basis_gates(summary: pd.DataFrame, basis_gates: pd.DataFram
             summary[col] = ""
 
     for idx, row in summary.iterrows():
+        if as_text(row.get("source", "")) == "lowdd_forward_promotion_gate":
+            summary.at[idx, "settlement_basis_gate_status"] = "NOT_APPLICABLE_LOWDD_OFFICIAL_PAPER_GATE"
+            summary.at[idx, "settlement_basis_gate_pass"] = ""
+            summary.at[idx, "settlement_basis_gate_reasons"] = ""
+            continue
         reasons, values = settlement_basis_reasons(row, basis_gates)
         if reasons:
             summary.at[idx, "failure_reasons"] = add_reason_tokens(summary.at[idx, "failure_reasons"], reasons)
@@ -1293,9 +1298,10 @@ def apply_execution_and_schema_gates(
         post_restart_target_df,
     )
     if global_restart_reasons:
+        global_restart_mask = summary["source"].astype(str).ne("lowdd_forward_promotion_gate")
         apply_reason_blockers(
             summary,
-            pd.Series(True, index=summary.index),
+            global_restart_mask,
             global_restart_reasons,
             global_restart_values,
         )
@@ -1308,9 +1314,10 @@ def apply_execution_and_schema_gates(
             global_process_values,
         )
     if frozen_policy_df.empty:
+        frozen_policy_mask = summary["source"].astype(str).ne("lowdd_forward_promotion_gate")
         apply_reason_blockers(
             summary,
-            pd.Series(True, index=summary.index),
+            frozen_policy_mask,
             ["frozen_policy_parity_audit_missing"],
             {},
         )

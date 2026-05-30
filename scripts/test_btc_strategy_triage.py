@@ -11,6 +11,10 @@ from scripts.audit_btc_strategy_triage import CANDIDATES, blocker_categories, ov
 
 
 class BtcStrategyTriageTests(unittest.TestCase):
+    def test_lowdd_is_first_active_forward_candidate(self) -> None:
+        self.assertEqual(CANDIDATES[0].candidate, "btc15m_lowdd_current_wrapper")
+        self.assertEqual(CANDIDATES[0].readiness_source, "lowdd_forward_promotion_gate")
+
     def test_overlap_context_marks_q1000_as_not_independent_when_identical_to_q250_yes(self) -> None:
         q1000 = next(spec for spec in CANDIDATES if spec.candidate == "q1000_yes")
         pairwise = pd.DataFrame(

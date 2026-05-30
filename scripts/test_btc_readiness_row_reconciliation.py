@@ -355,6 +355,53 @@ class BtcReadinessRowReconciliationTests(unittest.TestCase):
         self.assertIn("post_restart_target_process_identity_not_ready", row["failure_reasons"])
         self.assertEqual(row["post_restart_target_evidence_clock_status"], "FAIL_PROCESS_IDENTITY")
 
+    def test_lowdd_forward_gate_does_not_inherit_legacy_global_restart_blockers(self) -> None:
+        summary = pd.DataFrame(
+            [
+                {
+                    "family": "BTC15M",
+                    "candidate": "btc15m_lowdd_current_wrapper",
+                    "source": "lowdd_forward_promotion_gate",
+                    "production_ready": False,
+                    "failure_reasons": "selected_rows_below_min",
+                },
+                {
+                    "family": "BTC15M",
+                    "candidate": "q250_firstskip_qty500_yes",
+                    "source": "latest_live_replay_rest_official",
+                    "production_ready": False,
+                    "failure_reasons": "",
+                },
+            ]
+        )
+        verification_checklist = pd.DataFrame(
+            [
+                {"check": "target_process_identity", "passes_for_evidence_clock": False},
+                {"check": "required_capture_sidecars_ready", "passes_for_evidence_clock": False},
+                {"check": "all_target_shadows_running", "passes_for_evidence_clock": False},
+                {"check": "active_ledger_schemas_ready", "passes_for_evidence_clock": False},
+            ]
+        )
+
+        out = apply_execution_and_schema_gates(
+            summary,
+            execution_df=pd.DataFrame(),
+            schema_df=pd.DataFrame(),
+            post_restart_df=pd.DataFrame(),
+            row_reconciliation_df=pd.DataFrame(),
+            post_restart_verification_info={
+                "restart_executed": False,
+                "evidence_clock_ready": False,
+                "collection_gate_ready": False,
+            },
+            post_restart_verification_checklist_df=verification_checklist,
+        )
+
+        lowdd = out[out["candidate"].eq("btc15m_lowdd_current_wrapper")].iloc[0]
+        legacy = out[out["candidate"].eq("q250_firstskip_qty500_yes")].iloc[0]
+        self.assertEqual(lowdd["failure_reasons"], "selected_rows_below_min")
+        self.assertIn("post_restart_controlled_restart_not_executed", legacy["failure_reasons"])
+
     def test_q250_yes_focused_replay_is_blocked_by_missing_paper_shadow_match(self) -> None:
         summary = pd.DataFrame(
             [
@@ -556,6 +603,26 @@ class BtcReadinessRowReconciliationTests(unittest.TestCase):
         self.assertIn("settlement_basis_gate_failed", row["failure_reasons"])
         self.assertIn("settlement_basis_proxy_official_mismatch_rate_high", row["failure_reasons"])
         self.assertIn("settlement_basis_too_few_official_rows", row["failure_reasons"])
+
+    def test_lowdd_forward_gate_skips_proxy_settlement_basis_mapping(self) -> None:
+        summary = pd.DataFrame(
+            [
+                {
+                    "family": "BTC15M",
+                    "candidate": "btc15m_lowdd_current_wrapper",
+                    "source": "lowdd_forward_promotion_gate",
+                    "production_ready": False,
+                    "failure_reasons": "paper_settled_rows_below_min",
+                }
+            ]
+        )
+
+        out = apply_settlement_basis_gates(summary, pd.DataFrame())
+
+        row = out.iloc[0]
+        self.assertEqual(row["failure_reasons"], "paper_settled_rows_below_min")
+        self.assertEqual(row["settlement_basis_gate_status"], "NOT_APPLICABLE_LOWDD_OFFICIAL_PAPER_GATE")
+        self.assertNotIn("settlement_basis_mapping_missing", row["failure_reasons"])
 
 
 if __name__ == "__main__":

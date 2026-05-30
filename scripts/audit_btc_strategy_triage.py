@@ -45,8 +45,17 @@ class CandidateSpec:
 CANDIDATES: tuple[CandidateSpec, ...] = (
     CandidateSpec(
         family="BTC15M",
+        candidate="btc15m_lowdd_current_wrapper",
+        role="active paper-forward BTC15M path",
+        status="active_forward_research_insufficient_sample",
+        readiness_candidate="btc15m_lowdd_current_wrapper",
+        readiness_source="lowdd_forward_promotion_gate",
+        next_action="Keep the active lowdd paper-forward shadow and raw collector running; rerun the remote evidence refresh after new fills and do not deploy before the 50-row official/parity gate passes.",
+    ),
+    CandidateSpec(
+        family="BTC15M",
         candidate="q250_firstskip_qty500_yes",
-        role="top paper-forward BTC15M path",
+        role="stale preregistered paper-forward control",
         status="paper_forward_not_running",
         readiness_candidate="q250_firstskip_qty500_yes",
         pred_strategy="ttl10_12_entry50_q250",
@@ -545,7 +554,7 @@ def write_report(out_dir: Path, rows: pd.DataFrame, run_info: dict[str, Any]) ->
         "",
         "NO DEPLOY: every tracked BTC15M/BTC1H path remains below promotion gates.",
         "",
-        "The best next evidence path is `q250_firstskip_qty500_yes`, but it is not running as a clean paper shadow and has only tiny official replay evidence. `q250_firstskip_qty500` remains research-only because the both-side path is exposed to settlement-basis/NO-side fragility and was selected after prior live replay. `q1000_yes` is a useful sparse control. BTC1H remains observe-only until causal replay and clean official ledger evidence exist.",
+        "The best next evidence path is the active `btc15m_lowdd_current_wrapper`, but it still has only a small official-settled forward sample. `q250_firstskip_qty500_yes` and `q1000_yes` are stale preregistered controls, not active deployment candidates. `q250_firstskip_qty500` remains research-only because the both-side path is exposed to settlement-basis/NO-side fragility and was selected after prior live replay. BTC1H remains observe-only until causal replay and clean official ledger evidence exist.",
         "",
         "## Summary",
         "",

@@ -16603,3 +16603,56 @@ artifacts:
   and `paper_settled_rows_below_min`. This gives the research loop a repeatable
   command to rerun when the remote ledger accrues more official-settled rows,
   while preserving the no-deploy conclusion until the 50-row gate is met.
+
+### 2026-05-30 - Current branch/readiness checkpoint after lowdd refresh tooling
+
+- Ran the repeatable lowdd remote refresh again at `2026-05-30T15:40Z`.
+  There were no new paper fills since the prior refresh: the gate still had
+  `10` selected/order/paper rows, `10` official-settled rows, official PnL
+  `+$26.96`, signal one-contract PnL `+$3.22`, `10/10` live-sidecar parity,
+  `0` live-sidecar price mismatches, and `2` selected-to-order reprices within
+  the `2c` audit limit. The verdict stayed
+  `research_promising_insufficient_forward_sample`.
+- Remote status sidecars were live during that refresh. Raw capture had
+  `failed=false`, `dropped=0`, latest top-book
+  `2026-05-30T15:40:40Z`, and `17,540,012` top-book rows. Lowdd forward had
+  `failed=false`, `dropped=0`, PID `9408`, latest signal scan
+  `2026-05-30T15:40:36Z`, `5,228,335` top-book rows, and `2,766,303`
+  signal-scan rows.
+- Branch replayability artifact:
+  `backtest_outputs\btc_branch_replayability_20260530_1541`. This used the
+  full raw snapshot
+  `runtime\remote_snapshots\full_raw_snapshot_20260530_1320\btc15m_live_capture_full_20260530_1320.duckdb`,
+  not a small sidecar slice. Capture facts: `795` BTC15M binary markets,
+  `0` cumulative `-T` markets, `340,314` lifecycle `determined` rows, and
+  `437,529` lifecycle `settled` rows. Across `19` remote branches the result
+  remained: `1` directly replayable current BTC15M branch (`origin/sami`),
+  `3` `kalshi_v2` harness branches needing an adapter, `14` `kalshi_v2`
+  branches needing a harness, and `1` non-BTC-capture arbitrage branch.
+- Patched `scripts\check_btc_deployment_readiness.py` so the active lowdd
+  forward gate does not inherit stale legacy q250/q1000 post-restart blockers
+  or proxy settlement-basis mapping blockers. Lowdd has its own paper official
+  settlement and live-sidecar parity gate, so the readiness row should show the
+  lowdd gate blockers directly instead of unrelated legacy shadow gates.
+- Patched `scripts\audit_btc_strategy_triage.py` so
+  `btc15m_lowdd_current_wrapper` is the first active paper-forward BTC15M path,
+  while `q250_firstskip_qty500_yes` is demoted to a stale preregistered
+  paper-forward control.
+- Fresh readiness artifact:
+  `backtest_outputs\deployment_readiness_20260530_1541_lowdd_current`.
+  Global `production_ready_count` remained `0`. The lowdd row now has only the
+  correct sample-size blockers:
+  `order_rows_below_min`, `paper_settled_rows_below_min`,
+  `selected_rows_below_min`, and `settled_rows_below_min`. Its official paper
+  PnL is `+$26.96` on `10` official rows, but this is below the `50`-row gate.
+- Fresh triage artifact:
+  `backtest_outputs\btc_strategy_triage_20260530_1541_lowdd_current_v3`.
+  It marks lowdd as `active_forward_research_insufficient_sample` and
+  `deployable_now=false`, with the next action to keep the active lowdd
+  paper-forward shadow and raw collector running, rerun the remote evidence
+  refresh after new fills, and not deploy before the `50`-row official/parity
+  gate passes.
+- Validation:
+  `python -m pytest scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_strategy_triage.py -q --basetemp .pytest-codex-tmp-readiness-lowdd-current-2`
+  passed with `13` tests. `python -m py_compile` passed for the touched
+  readiness and triage scripts and tests.
