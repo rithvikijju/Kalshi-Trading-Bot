@@ -129,6 +129,7 @@ RISK_WINDOW_HOURS = float(os.getenv("BTC15M_RISK_WINDOW_HOURS", "24.0"))
 ROLLING_TRADE_CAP = int(os.getenv("BTC15M_ROLLING_TRADE_CAP", "0"))
 ROLLING_PREMIUM_CAP_DOLLARS = float(os.getenv("BTC15M_ROLLING_PREMIUM_CAP_DOLLARS", "0.0"))
 MONEY_RE = re.compile(r"\$([0-9,]+(?:\.\d+)?)")
+_PAPER_OFFICIAL_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 @dataclass(frozen=True)
@@ -468,6 +469,27 @@ def btc_close_at_or_before(history: BtcMinuteVolHistory, close_time: datetime) -
     return None
 
 
+def paper_official_market_result(ticker: str, ttl_sec: float = 60.0) -> dict[str, Any]:
+    cached = _PAPER_OFFICIAL_RESULT_CACHE.get(ticker)
+    now_monotonic = time.monotonic()
+    if cached is not None:
+        cached_at, market = cached
+        result = str(market.get("result") or "").lower()
+        if result in {"yes", "no"} or now_monotonic - cached_at < ttl_sec:
+            return market
+    try:
+        response = requests.get(f"{live.KalshiApi.PROD_URL}/markets/{ticker}", timeout=10)
+        if response.status_code == 404:
+            market = {"fetch_error": "404_not_found"}
+        else:
+            response.raise_for_status()
+            market = response.json().get("market") or {}
+    except Exception as exc:
+        market = {"fetch_error": repr(exc)}
+    _PAPER_OFFICIAL_RESULT_CACHE[ticker] = (now_monotonic, market)
+    return market
+
+
 def paper_shadow_summary(
     conn: sqlite3.Connection,
     btc_history: BtcMinuteVolHistory,
@@ -509,14 +531,19 @@ def paper_shadow_summary(
             open_trades += 1
             active_tickers.add(str(row["market_ticker"]).upper())
             continue
-        settlement_spot = btc_close_at_or_before(btc_history, close_time)
-        strike = live.market_strike_from_ticker(row["market_ticker"])
-        if settlement_spot is None or strike is None:
-            active_exposure += premium
-            open_trades += 1
-            active_tickers.add(str(row["market_ticker"]).upper())
-            continue
-        yes_wins = settlement_spot >= strike
+        market = paper_official_market_result(str(row["market_ticker"]))
+        result = str(market.get("result") or "").lower()
+        if result in {"yes", "no"}:
+            yes_wins = result == "yes"
+        else:
+            settlement_spot = btc_close_at_or_before(btc_history, close_time)
+            strike = live.market_strike_from_ticker(row["market_ticker"])
+            if settlement_spot is None or strike is None:
+                active_exposure += premium
+                open_trades += 1
+                active_tickers.add(str(row["market_ticker"]).upper())
+                continue
+            yes_wins = settlement_spot >= strike
         won = (row["side"] == "yes" and yes_wins) or (row["side"] == "no" and not yes_wins)
         pnl = (float(contracts) if won else 0.0) - premium
         realized_pnl += pnl

@@ -293,6 +293,55 @@ class Btc15mShadowConfigTest(unittest.TestCase):
             self.assertEqual(summary["at_risk_trades"], 1)
             self.assertIn("rolling_trade_cap", reason or "")
 
+    def test_lowdd_paper_summary_releases_closed_trade_with_official_result(self) -> None:
+        import scripts.btc15m_lowdd_live as mod
+
+        mod._PAPER_OFFICIAL_RESULT_CACHE.clear()
+        conn = mod.live.db_connect(":memory:")
+        close = datetime.now(timezone.utc) - timedelta(hours=2)
+        signal = mod.live.TradeSignal(
+            event_ticker="KXBTC15M-TEST",
+            market_ticker="KXBTC15M-TEST-00",
+            side="yes",
+            contracts=1,
+            entry_price=0.45,
+            yes_order_side="bid",
+            yes_limit_price=0.45,
+            available_qty=1000,
+            model_p_yes=0.70,
+            edge_gross_cents=25.0,
+            entry_fee=0.01,
+            net_edge_cents=24.0,
+            edge_threshold_cents=12.0,
+            spread_cents=1.0,
+            strike=100.0,
+            btc_spot=101.0,
+            ttl_min=4.0,
+            close_time=close.isoformat(),
+            yes_bid=0.44,
+            yes_ask=0.45,
+            no_bid=0.54,
+            no_ask=0.55,
+        )
+        mod.live.record_trade(conn, mod.paper_mode_name(), "paper_filled", signal, client_order_id="test-official-release")
+
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {"market": {"ticker": signal.market_ticker, "result": "yes", "status": "finalized"}}
+
+        with patch("scripts.btc15m_lowdd_live.requests.get", return_value=Response()):
+            summary = mod.paper_shadow_summary(conn, mod.BtcMinuteVolHistory(), 100.0)
+
+        self.assertEqual(summary["settled_trades"], 1)
+        self.assertEqual(summary["open_trades"], 0)
+        self.assertEqual(summary["active_exposure"], 0.0)
+        self.assertGreater(summary["available_balance"], 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()

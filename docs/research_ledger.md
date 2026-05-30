@@ -14627,3 +14627,61 @@ artifacts:
   should materialize BTC15M sidecar slices and search preregistered filters on
   fresh official-settled rows without using `btc_spot` as a canonical
   per-message label.
+
+### 2026-05-30 - BTC15M sidecar lowdd research and paper-accounting fix
+
+- Added bounded materialization support to
+  `scripts/materialize_btc_replay_sidecar.py`:
+  `--start-utc`, `--end-utc`, repeated `--table`, `--event-prefix`,
+  `--market-prefix`, raw `coinbase_ticker` preservation when present, manifest
+  filter metadata, and active-append-tolerant JSON parsing.
+- Materialized the remote raw BTC15M replay sidecar for
+  `2026-05-29T16:00:00Z..2026-05-30T06:00:00Z` without pausing collection or
+  copying the raw sidecar. Local ignored artifact:
+  `runtime/remote_snapshots/sidecar_slices/btc15m_raw_20260529_1600_20260530_0600.duckdb`.
+  Counts: `1,453,022` top-book rows, `90,076` lifecycle rows, and
+  `1,300,087` synthetic BTC rows from top-book `btc_spot`.
+- Frozen F2 causal replay on `2026-05-29T18:00:00Z..2026-05-30T06:00:00Z`:
+  - `q250_firstskip_qty500`: `1` trade, REST-official PnL `-$0.54`;
+  - `q250_firstskip_qty500_yes`: `0` trades;
+  - `q1000_yes`: `0` trades.
+  These remain unvalidated/signal-starved.
+- Broader live-holdout rule pack on the same official-settled window found
+  `current_lowdd_no_rv`: `16` trades, PnL `+$2.49`, return on premium
+  `+23.69%`, win rate `81.25%`, max drawdown `-$0.46`. Subwindows:
+  `16:00..18:00Z` was `-$0.33` on `4` trades; `18:00..00:00Z` was `+$1.31`
+  on `9`; `00:00..06:00Z` was `+$1.18` on `7`. This is promising research
+  evidence only; the old May 28 live ledger remained negative, and this slice
+  uses synthetic BTC ticks from top-book rows.
+- Diagnosed why the live lowdd paper shadow stopped filling:
+  the lowdd shadow replay sidecar had `760,173` scans, `2,939` selected
+  signals, and `2,939` order decisions in the same window, but every order
+  decision was `skip`; `2,907` were `sizing_budget_or_liquidity_zero`.
+  The paper portfolio showed `portfolio_available = 50.16` but
+  `estimated_cost = 0.00` because old May 28 paper fills were still counted as
+  active exposure after local BTC minute history no longer covered their close
+  times.
+- Patched `scripts/btc15m_lowdd_live.py` so paper shadow accounting settles
+  closed paper rows from Kalshi REST official market results before falling
+  back to local BTC history. Added regression coverage in
+  `scripts/test_btc15m_shadow_config.py`.
+- Validation:
+  `python -m py_compile scripts\btc15m_lowdd_live.py scripts\test_btc15m_shadow_config.py scripts\materialize_btc_replay_sidecar.py scripts\test_btc_replay_sidecar_materialization.py`
+  and
+  `python -m pytest scripts\test_btc15m_shadow_config.py scripts\test_btc_replay_sidecar_materialization.py -q --basetemp .pytest-codex-tmp-btc15m-lowdd-paper`
+  passed with `15 passed`.
+- Deployed the paper-accounting fix to the remote deployment copy and restarted
+  only the paper lowdd scheduled task
+  `\KalshiBTC_btc15m_lowdd_forward_shadow`. A stale May 28 child PID `13720`
+  survived the first task restart and was stopped; clean child PID `12796`
+  then matched the status sidecar and resumed row/scanning growth with
+  `failed=false`, `dropped=0`.
+- Raw BTC15M capture was not restarted or paused. It remained healthy after the
+  lowdd restart: PID `14260`, `failed=false`, `dropped=0`,
+  `ws_orderbook_top=16,933,760`, latest top-book row
+  `2026-05-30T06:35:26.235940Z`.
+- Next evidence gate:
+  count only post-restart lowdd paper rows as forward evidence for the fix,
+  verify sizing no longer skips on the next selected signal, and compare any
+  new paper fills to the raw-sidecar replay candidates before considering any
+  deployment discussion.

@@ -129,6 +129,190 @@ class BtcReplaySidecarMaterializationTests(unittest.TestCase):
             self.assertEqual(int(lifecycle["open_ts"]), 1000)
             self.assertEqual(int(lifecycle["close_ts"]), 2000)
 
+    def test_materializer_filters_time_window_and_preserves_raw_coinbase_ticks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sidecar = tmp_path / "capture.replay.jsonl"
+            out_db = tmp_path / "capture.duckdb"
+            rows = [
+                {
+                    "table": "ws_orderbook_top",
+                    "received_at_ns": 100,
+                    "received_at_utc": "2026-05-29T00:00:00Z",
+                    "market_ticker": "KXBTC15M-26MAY290000-100",
+                    "event_ticker": "KXBTC15M-26MAY290000",
+                    "btc_spot": 100.0,
+                },
+                {
+                    "table": "ws_orderbook_top",
+                    "received_at_ns": 200,
+                    "received_at_utc": "2026-05-29T00:10:00Z",
+                    "market_ticker": "KXBTC15M-26MAY290015-100",
+                    "event_ticker": "KXBTC15M-26MAY290015",
+                    "yes_ask": 0.42,
+                    "no_ask": 0.59,
+                    "btc_spot": 101.0,
+                },
+                {
+                    "table": "signal_scan",
+                    "received_at_ns": 210,
+                    "received_at_utc": "2026-05-29T00:10:01Z",
+                    "event_ticker": "KXBTC15M-26MAY290015",
+                    "candidate_count": 1,
+                    "selected_market": "KXBTC15M-26MAY290015-100",
+                    "action": "selected",
+                },
+                {
+                    "table": "coinbase_ticker",
+                    "received_at_ns": 220,
+                    "received_at_utc": "2026-05-29T00:10:02Z",
+                    "product_id": "BTC-USD",
+                    "price": 101.25,
+                    "best_bid": 101.20,
+                    "best_ask": 101.30,
+                    "sequence": 7,
+                    "exchange_time": "2026-05-29T00:10:02Z",
+                },
+                {
+                    "table": "ws_orderbook_top",
+                    "received_at_ns": 300,
+                    "received_at_utc": "2026-05-29T00:20:00Z",
+                    "market_ticker": "KXBTC15M-26MAY290030-100",
+                    "event_ticker": "KXBTC15M-26MAY290030",
+                    "btc_spot": 102.0,
+                },
+            ]
+            sidecar.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "scripts" / "materialize_btc_replay_sidecar.py"),
+                    "--sidecar",
+                    str(sidecar),
+                    "--out-db",
+                    str(out_db),
+                    "--overwrite",
+                    "--start-utc",
+                    "2026-05-29T00:05:00Z",
+                    "--end-utc",
+                    "2026-05-29T00:20:00Z",
+                ],
+                cwd=str(PROJECT_ROOT),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            manifest = json.loads(out_db.with_suffix(out_db.suffix + ".manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["raw_sidecar_rows_loaded"], 3)
+            self.assertEqual(manifest["counts"]["ws_orderbook_top"], 1)
+            self.assertEqual(manifest["counts"]["signal_scan"], 1)
+            self.assertEqual(manifest["counts"]["coinbase_ticker"], 1)
+            self.assertEqual(manifest["coinbase_ticker_source"], "raw_sidecar")
+            self.assertEqual(manifest["filters"]["start_utc_inclusive"], "2026-05-29T00:05:00Z")
+            self.assertEqual(manifest["filters"]["end_utc_exclusive"], "2026-05-29T00:20:00Z")
+
+            con = duckdb.connect(str(out_db), read_only=True)
+            try:
+                top = con.execute("select market_ticker, btc_spot from ws_orderbook_top").fetchall()
+                btc = con.execute("select product_id, price, best_bid, best_ask, sequence from coinbase_ticker").fetchall()
+            finally:
+                con.close()
+
+            self.assertEqual(top, [("KXBTC15M-26MAY290015-100", 101.0)])
+            self.assertEqual(btc, [("BTC-USD", 101.25, 101.2, 101.3, 7)])
+
+    def test_materializer_table_prefix_filter_and_synthetic_coinbase_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sidecar = tmp_path / "capture.replay.jsonl"
+            out_db = tmp_path / "capture.duckdb"
+            rows = [
+                {
+                    "table": "ws_orderbook_top",
+                    "received_at_ns": 100,
+                    "received_at_utc": "2026-05-29T00:10:00Z",
+                    "market_ticker": "KXBTC15M-26MAY290015-100",
+                    "event_ticker": "KXBTC15M-26MAY290015",
+                    "btc_spot": 101.0,
+                },
+                {
+                    "table": "ws_orderbook_top",
+                    "received_at_ns": 100,
+                    "received_at_utc": "2026-05-29T00:10:00Z",
+                    "market_ticker": "KXBTC15M-26MAY290015-101",
+                    "event_ticker": "KXBTC15M-26MAY290015",
+                    "btc_spot": 101.0,
+                },
+                {
+                    "table": "ws_orderbook_top",
+                    "received_at_ns": 110,
+                    "received_at_utc": "2026-05-29T00:10:01Z",
+                    "market_ticker": "KXBTCD-26MAY2910-100",
+                    "event_ticker": "KXBTCD-26MAY2910",
+                    "btc_spot": 102.0,
+                },
+                {
+                    "table": "signal_scan",
+                    "received_at_ns": 120,
+                    "received_at_utc": "2026-05-29T00:10:02Z",
+                    "event_ticker": "KXBTC15M-26MAY290015",
+                    "candidate_count": 1,
+                },
+            ]
+            sidecar.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "scripts" / "materialize_btc_replay_sidecar.py"),
+                    "--sidecar",
+                    str(sidecar),
+                    "--out-db",
+                    str(out_db),
+                    "--overwrite",
+                    "--table",
+                    "ws_orderbook_top",
+                    "--table",
+                    "coinbase_ticker",
+                    "--event-prefix",
+                    "KXBTC15M",
+                    "--synthetic-coinbase-from-top",
+                ],
+                cwd=str(PROJECT_ROOT),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            manifest = json.loads(out_db.with_suffix(out_db.suffix + ".manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["raw_sidecar_rows_loaded"], 2)
+            self.assertEqual(manifest["counts"]["ws_orderbook_top"], 2)
+            self.assertEqual(manifest["counts"]["coinbase_ticker"], 1)
+            self.assertEqual(manifest["coinbase_ticker_source"], "synthetic_from_ws_orderbook_top_btc_spot")
+            self.assertEqual(manifest["filters"]["tables"], ["ws_orderbook_top", "coinbase_ticker"])
+            self.assertEqual(manifest["filters"]["event_prefixes"], ["KXBTC15M"])
+
+            con = duckdb.connect(str(out_db), read_only=True)
+            try:
+                tables = {
+                    row[0]
+                    for row in con.execute(
+                        "select table_name from information_schema.tables where table_schema = 'main'"
+                    ).fetchall()
+                }
+                synthetic = con.execute("select received_at_ns, price from coinbase_ticker").fetchall()
+            finally:
+                con.close()
+
+            self.assertIn("ws_orderbook_top", tables)
+            self.assertIn("coinbase_ticker", tables)
+            self.assertNotIn("signal_scan", tables)
+            self.assertEqual(synthetic, [(100, 101.0)])
+
 
 if __name__ == "__main__":
     unittest.main()
