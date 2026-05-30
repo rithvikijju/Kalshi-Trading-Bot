@@ -16156,3 +16156,63 @@ artifacts:
   correct next experiment is to extend this same post-restart window after at
   least one more BTC15M event settles, then rerun official holdout, lowdd
   sidecar-selected replay, paper parity, and the promotion gate.
+
+### 2026-05-30 - First full post-fix lowdd paper parity row
+
+- Extended the post-restart replay-sidecar window to
+  `2026-05-30T11:48:00Z..2026-05-30T12:18:00Z` after the lowdd shadow
+  produced one settled paper row. The materialized remote slices live under
+  `runtime\remote_snapshots\sidecar_slices_20260530_1148_1218`; the summary
+  artifacts are:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_1148_1218`,
+  `backtest_outputs\btc15m_live_holdout_20260530_1148_1218`,
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_20260530_1148_1218`,
+  `backtest_outputs\btc15m_lowdd_postrestart_20260530_1148_1218_identity_rerun`,
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_20260530_1148_1218_identity_rerun`,
+  and
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_1148_1218_identity_rerun`.
+- Raw sidecar fidelity stayed promotion-grade for the data we need:
+  `promotion_grade_coinbase_ticks=true`,
+  `filtered_top_book_research_grade=true`, no hard failures, `22,207` valid
+  top-book rows, `99.33796%` valid-book rate, `375` raw `coinbase_ticker`
+  rows, raw Coinbase schema present, and
+  `synthetic_coinbase_from_top=false`. The only book issues were filterable
+  `null_book_fields`, `crossed_yes_book`, and `crossed_no_book` rows.
+- Generic replay on the short post-fix slice is still too small to trust.
+  `cheap_yes_rr_first` lost `-$0.628` across `2` trades, `cheap_no_rr_first`
+  won `+$0.49` on `1` trade, `cheap_tail_best_side_first` won `+$0.402`
+  across `2` trades, and `current_lowdd_no_rv` had `1` official-settled trade
+  for `+$0.39`.
+- The actual lowdd paper row is better evidence than generic replay because it
+  connects the selected sidecar, order-decision sidecar, and paper ledger.
+  Event `KXBTC15M-26MAY300815`, market `KXBTC15M-26MAY300815-15`, side `no`,
+  selected at entry `0.60` with model `p_yes=0.385`, officially settled to
+  `no`. The paper order used `8` contracts at `0.60`, premium `$4.94`, and
+  official PnL `+$3.06`.
+- Hardened the paper parity audit to match order decisions by
+  `client_order_id` when available and to treat selected-signal-to-order
+  latency as a diagnostic rather than a parity failure. The rerun had
+  `paper_rows=1`, `live_sidecar_parity_pass_rows=1`,
+  `live_sidecar_price_mismatch_rows=0`, `signal_order_reprice_rows=0`, and
+  `max_signal_order_latency_sec=106.748653`. Generic replay still showed one
+  advisory price mismatch because it entered at `0.59` earlier than the
+  selected/order/paper path; the sidecar-selected path is the authoritative
+  parity check here.
+- Forward promotion remains blocked by sample size only:
+  `production_ready=false`,
+  `research_status=research_promising_insufficient_forward_sample`,
+  blockers `order_rows_below_min`, `paper_settled_rows_below_min`,
+  `selected_rows_below_min`, and `settled_rows_below_min`.
+  Current counts are `selected_rows=1`, `settled_rows=1`, `order_rows=1`, and
+  `paper_settled_rows=1` versus the `50`-row minimum.
+- Validation:
+  `python -m pytest scripts\test_btc15m_lowdd_paper_replay_parity.py
+  scripts\test_btc15m_lowdd_postrestart_report.py
+  scripts\test_btc15m_lowdd_forward_promotion_gate.py -q --basetemp
+  .pytest-codex-tmp-lowdd-identity-parity` passed with `16` tests.
+- Interpretation:
+  the first true post-fix lowdd paper row is positive and passes identity-aware
+  live sidecar/paper parity, but it is not enough evidence to deploy. Keep
+  collecting forward rows until the promotion gate has at least `50` settled
+  selected/order/paper observations, then rerun the same gate before changing
+  production exposure.
