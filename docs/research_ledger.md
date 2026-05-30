@@ -15960,3 +15960,82 @@ artifacts:
   .pytest-codex-tmp-v2-binary` passed with `3` tests.
   `python -m py_compile scripts\backtest_btc15m_v2_binary_adapter.py
   scripts\test_btc15m_v2_binary_adapter.py` passed.
+
+### 2026-05-30 - Fresh remote BTC15M slice through 11:18Z
+
+- Remote health check:
+  the always-on laptop BTC15M raw capture and lowdd forward shadow were still
+  advancing after the refresh. At `2026-05-30T11:26Z`, raw capture had
+  `17,267,441` `ws_orderbook_top` rows, lowdd had `4,963,763`
+  `ws_orderbook_top` rows and `2,625,020` `signal_scan` rows. Both reported
+  `failed=false`, `dropped=0`, empty `last_error`, and queue depth `0/1`.
+  BTC1H `high_conf80_entry70_no_chase` remained stale from
+  `2026-05-28T05:15Z`, so it is not current forward evidence.
+- Materialized fresh remote sidecars without pausing collection:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1118`.
+  Window:
+  `2026-05-30T06:40:00Z..2026-05-30T11:18:20Z`.
+  Raw slice:
+  `319,078` top-book rows, `1,549` lifecycle rows, and `298,808`
+  synthetic Coinbase rows. Lowdd slice:
+  `317,460` top-book rows, `156,793` signal-scan rows, `9` order-decision
+  rows, and `298,727` synthetic Coinbase rows.
+- Fidelity artifact:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_0640_1118`.
+  Valid top-book rate was `99.4158%`, with no null timestamps and no
+  implausible BTC spot rows, but the verdict remained not promotion-grade:
+  `hard_failures=top_book_gaps_over_threshold` and
+  `promotion_grade_coinbase_ticks=false` because Coinbase ticks were synthetic
+  from top-book `btc_spot`. Independent raw-vs-lowdd 5-second bucket parity was
+  available with `97.6775%` main match rate and `98.5994%` within-tolerance
+  YES-mid rate.
+- Generic BTC15M holdout artifact:
+  `backtest_outputs\btc15m_live_holdout_20260530_0640_1118`.
+  It scored `20` events with `19` finalized official results.
+  `current_lowdd_no_rv` stayed at `8` trades, PnL `+$1.74`, return on
+  premium `33.0798%`, win rate `87.5%`, max drawdown `-$0.25`; no new fills
+  were added after the prior `10:41Z` slice. `cheap_yes_rr_first` had `15`
+  trades, PnL `+$0.769`, return on premium `12.3415%`, but only `46.6667%`
+  win rate. `cheap_no_rr_first`, `cheap_tail_best_side_first`, and
+  `cheap_tail_position_aware` were negative. `cheap_pair_lock_rr` was positive
+  but remains excluded by prior selection-bias audit.
+- Robustness artifact:
+  `backtest_outputs\btc15m_replay_candidate_robustness_20260530_1118_quality`.
+  `current_lowdd_no_rv` remained
+  `research_promising_insufficient_sample` with `8` official-settled
+  executable rows, no duplicate events, bootstrap p05 `+$0.71`, bootstrap
+  profit probability `99.62%`, and `4 / 5` positive hourly windows plus one
+  flat window. `cheap_yes_rr_first` was only
+  `research_promising_insufficient_sample_bootstrap_fragile` with bootstrap
+  p05 `-$2.3615` and profit probability `65.52%`.
+- Lowdd sidecar/paper parity:
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_20260530_0640_1118`,
+  `backtest_outputs\btc15m_lowdd_postrestart_20260530_0640_1118`,
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_20260530_0640_1118`,
+  and
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_0640_1118`.
+  Lowdd had `9` raw selected rows, deduped to `8`, all official-settled.
+  Paper official PnL matched order-scaled replay PnL exactly at `+$20.43` on
+  `$42.57` premium. Live sidecar parity passed `8 / 8`; `2` selected-to-order
+  reprices were within the configured limit with max worse reprice `1c`.
+  Production-ready stayed `false`; blockers were only sample-size gates:
+  selected, settled, order, and paper rows all below the `50`-row minimum.
+- V2 binary adapter refresh:
+  `backtest_outputs\btc15m_v2_binary_adapter_20260530_0640_1118` and
+  `backtest_outputs\btc15m_v2_binary_adapter_robustness_20260530_0640_1118`.
+  All-side v2 variants stayed negative:
+  `v2_default_binary_h2s` `17` trades, PnL `-$1.73`; and
+  `v2_awareness_binary_h2s` `17` trades, PnL `-$1.62`. YES-only v2 had
+  `8` trades, PnL `+$1.55`, return on premium `28.4404%`, win rate `87.5%`,
+  but robustness weakened to
+  `research_promising_insufficient_sample_bootstrap_fragile` with bootstrap
+  p05 `-$0.22` and profit probability `92.88%`.
+- Interpretation:
+  the current actionable research state is unchanged but clearer. Lowdd is the
+  best BTC15M forward candidate, with clean official settlement and live
+  sidecar/paper parity, but it is still collection-starved and not deployable.
+  V2-derived all-side logic is negative on the binary BTC15M slice; V2
+  YES-only remains a weak research watchlist item, not a forward-deployable
+  policy. The raw sidecar is useful for research replay, but promotion-grade
+  BTC tick-age evidence still requires a direct readable DuckDB snapshot or
+  raw Coinbase sidecar capture rather than synthetic Coinbase rows.
