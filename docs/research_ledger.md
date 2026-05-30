@@ -16216,3 +16216,52 @@ artifacts:
   collecting forward rows until the promotion gate has at least `50` settled
   selected/order/paper observations, then rerun the same gate before changing
   production exposure.
+
+### 2026-05-30 - Controlled remote DuckDB fidelity audit
+
+- Performed a brief controlled pause/read/restart of the two current active
+  remote BTC15M collectors to inspect the actual locked DuckDB files, not just
+  replay sidecars or status JSON. Pre-check at `2026-05-30T12:47:24Z` showed
+  both `btc15m_live_capture` PID `12940` and
+  `btc15m_lowdd_forward_shadow` PID `4992` running, task-aligned, and under
+  `TASK_SUPERVISION_OK`. Stop completed at `2026-05-30T12:47:35Z`; restart
+  completed with fresh scheduled-task processes PID `6512` and PID `3864`.
+  Post-check at `2026-05-30T12:49:21Z` again showed
+  `ALL_CURRENT_ACTIVE_RUNNING` and `TASK_SUPERVISION_OK`.
+- Raw BTC15M capture DB:
+  `C:\Users\ClawService\.btc_kalshi_bot\btc15m_live_capture.duckdb`.
+  While stopped and unlocked it contained `17,330,151` `ws_orderbook_top`
+  rows, `1,329,303` `ws_lifecycle` rows, `204,757` raw `coinbase_ticker`
+  rows, and `24,160` `capture_health` rows. The raw Coinbase table had
+  `0` null `received_at_utc`, `0` null `price`, `61,955` distinct prices,
+  and covered `2026-05-22T02:40:02Z..2026-05-30T12:47:22Z`.
+- Raw top-book DB quality remained research-grade after filtering bad book
+  rows: `17,247,738 / 17,330,151` rows valid, valid-book rate
+  `99.52445%`, `0` null market tickers, `0` null event tickers, `0` null
+  `received_at_utc`, and only `329` null `btc_spot` rows across the full raw
+  capture. Invalid rows were filterable: `33,773` null-book rows, `45,319`
+  crossed-YES rows, and `44,769` crossed-NO rows.
+- Lowdd forward shadow capture DB:
+  `C:\Users\ClawService\.btc_kalshi_bot\btc15m_lowdd_forward_shadow_capture.duckdb`.
+  While stopped and unlocked it contained `5,018,807` `ws_orderbook_top`
+  rows, `343,316` `ws_lifecycle` rows, `62,125` raw `coinbase_ticker`
+  rows, `2,653,854` `signal_scan` rows, and `5,726` `order_decision` rows.
+  The raw Coinbase table again had `0` null `received_at_utc` and `0` null
+  `price`. Top-book valid-book rate was `99.53128%`.
+- The small differences between pre-stop status counters and unlocked DB
+  counts were in the expected direction: the DB had a few hundred more
+  top-book/signal rows than the last status sidecar flush because rows were
+  still being written between `updated_at_utc` and the stop. There was no
+  evidence of dropped writer rows: both current status sidecars reported
+  `failed=false`, `dropped=0`, and empty `dropped_by_table`.
+- Lowdd had no new post-fix order after the previously audited
+  `2026-05-30T12:11:49Z` `order_decision`. At audit time it still had
+  `21` paper fills in the ledger, but only one order after the
+  `11:48Z` raw-Coinbase-sidecar restart. Therefore a new parity/promotion
+  rerun would still be the same one-row post-fix gate, not a stronger sample.
+- Interpretation:
+  this direct locked-DB audit strengthens the data-fidelity side of the
+  research loop. The raw capture is storing real Coinbase ticks and high-quality
+  received-time top-book rows in DuckDB; the remaining blocker is not data
+  faithfulness, but forward sample size and future official-settled paper rows
+  for the frozen lowdd policy.
