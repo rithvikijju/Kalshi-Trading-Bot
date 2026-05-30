@@ -16122,3 +16122,37 @@ artifacts:
   research-only for Coinbase tick-age evidence. Future sidecar materializations
   after a controlled restart can be audited for raw Coinbase tick coverage
   without pausing the live DuckDB writer.
+
+### 2026-05-30 - Post-restart raw Coinbase sidecar fidelity check
+
+- Verified the remote collectors after the lowdd launch repair:
+  at `2026-05-30T12:02Z`, raw BTC15M PID `12940` and lowdd PID `4992` were
+  both task-aligned, `failed=false`, `dropped=0`, and had fresh top-book,
+  Coinbase, and lowdd signal-scan timestamps.
+- Materialized the first post-restart replay-sidecar slice without pausing
+  collection:
+  `runtime\remote_snapshots\sidecar_slices_20260530_1148_1155`.
+  Window:
+  `2026-05-30T11:48:00Z..2026-05-30T11:55:00Z`.
+  Raw slice counts:
+  `4,166` `ws_orderbook_top`, `93` `ws_lifecycle`, and `54` raw
+  `coinbase_ticker` rows. Lowdd slice counts:
+  `3,873` `ws_orderbook_top`, `90` `ws_lifecycle`, `2,443`
+  `signal_scan`, and `52` raw `coinbase_ticker` rows.
+- Fidelity artifact:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_1148_1155`.
+  Verdict:
+  `promotion_grade_coinbase_ticks=true`,
+  `filtered_top_book_research_grade=true`,
+  `top_book_research_grade=false` only because of filterable crossed-book
+  rows. There were no hard failures, `valid_book_rate=99.5919%`, Coinbase
+  source was `raw_sidecar`, raw Coinbase schema fields were present, and
+  `synthetic_coinbase_from_top=false`.
+- Independent raw-vs-lowdd top-book parity over 5-second buckets was strong:
+  `75 / 78` raw buckets matched, lowdd compare match rate was `100%`, max
+  YES-mid difference was `0.8c`, and all matched buckets were within `1c`.
+- Lowdd had no post-restart selected/order rows in this first short slice; the
+  latest log showed it waiting for the next event to enter the TTL band. The
+  correct next experiment is to extend this same post-restart window after at
+  least one more BTC15M event settles, then rerun official holdout, lowdd
+  sidecar-selected replay, paper parity, and the promotion gate.
