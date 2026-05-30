@@ -14995,3 +14995,65 @@ artifacts:
   strategy and should not be deployed or ranked as a candidate unless a future
   runner can enter both legs causally without carrying unbounded first-leg
   selection risk.
+
+### 2026-05-30 - BTC15M replay robustness audit and third lowdd paper fill
+
+- Added `scripts/audit_btc15m_replay_candidate_robustness.py` and
+  `scripts/test_btc15m_replay_candidate_robustness.py`.
+- Purpose:
+  turn positive replay summaries into a stricter scientific gate by checking
+  trade count, path drawdown, trade-bootstrap PnL, profit probability, and
+  rolling-window stability when window summaries are available. Pair-lock rows
+  are explicitly excluded because the selection-bias audit above already
+  rejected them as future-conditioned.
+- Ran the audit on:
+  - full raw replay
+    `runtime\remote_backtests\btc15m_full_snapshot_window_grid_20260529_1600_20260530_0700`;
+  - sidecar slices
+    `runtime\branch_backtests\btc15m_live_holdout_sidecar_20260529_1600_1800`,
+    `runtime\branch_backtests\btc15m_live_holdout_sidecar_20260529_1800_20260530_0000`,
+    `runtime\branch_backtests\btc15m_live_holdout_sidecar_20260530_0000_0600`,
+    and `runtime\branch_backtests\btc15m_live_holdout_sidecar_20260529_1800_20260530_0600`.
+  Output:
+  `backtest_outputs\btc15m_replay_candidate_robustness_20260530_latest`.
+- Full raw `2026-05-29T16:00Z..2026-05-30T07:00Z` robustness results:
+  - `current_lowdd_no_rv`: `21` trades, official PnL `+$2.40`, return on
+    premium `17.65%`, win rate `76.19%`, max drawdown `-$0.90`, positive /
+    negative / flat windows `10 / 2 / 3`, trade-bootstrap p05 `-$0.14`, profit
+    probability `93.86%`. Verdict:
+    `research_promising_insufficient_sample_bootstrap_fragile`.
+  - `cheap_yes_rr_first`: `42` trades, official PnL `+$2.566`, return on
+    premium `19.10%`, win rate `38.10%`, max drawdown `-$1.434`, windows
+    `9 / 5 / 1`, trade-bootstrap p05 `-$1.921`, profit probability `82.42%`.
+    Verdict: `research_promising_insufficient_sample_bootstrap_fragile`.
+  - `cheap_no_rr_first`, `cheap_tail_best_side_first`, and
+    `cheap_tail_position_aware` remain rejected on non-positive official PnL.
+  - `cheap_pair_lock_rr` is excluded by the prior selection-bias audit even
+    though its pair-only bootstrap is positive.
+- Sidecar-slice robustness was directionally consistent:
+  `current_lowdd_no_rv` was positive on `18:00Z..00:00Z`, `00:00Z..06:00Z`,
+  and `18:00Z..06:00Z`, but negative on `16:00Z..18:00Z`; every positive
+  sidecar slice still failed the sample-size gate.
+- Refreshed the remote lowdd post-restart report after a new paper fill at
+  `2026-05-30T08:10:01.945911Z`.
+  Since the clean restart, the lowdd sidecar now has `140,665` top-book rows,
+  `64,850` signal scans, `3` selected signals, and `3` `paper_fill / filled`
+  order decisions through `2026-05-30T08:19:56Z`.
+- New post-restart row:
+  id `15`, `KXBTC15M-26MAY300415-15`, YES, `9` contracts at `0.65`, total fee
+  `$0.15`, quote age `1.9963ms`, top visible qty `21.37`, Kalshi result YES,
+  official PnL `+$3.00`.
+- Post-restart lowdd summary is now `3` trades, `3` settled, `2` wins,
+  `1` loss, official PnL `+$5.05`, premium `$10.95`, return on premium
+  `46.1187%`, win rate `66.6667%`, max drawdown `-$0.97`.
+- Remote sidecar freshness at `2026-05-30T08:19Z`: raw BTC15M latest top-book
+  row was `2026-05-30T08:19:32.719186Z`; lowdd latest top-book row was
+  `2026-05-30T08:19:33.991232Z` and latest signal scan was
+  `2026-05-30T08:19:33.995225Z`.
+- Interpretation:
+  `current_lowdd_no_rv` is still the lead BTC15M research path because it has
+  replay positivity, sidecar consistency after `18:00Z`, live paper parity, and
+  now `3` official-settled post-restart paper rows. It remains strictly
+  research-only: the full replay bootstrap lower tail crosses zero, the profit
+  probability is below a `95%` robustness gate, and the forward sample is far
+  below a reasonable promotion count.
