@@ -16519,3 +16519,50 @@ artifacts:
   on clean rows, but `5` official rows is far below any promotion bar. It can be
   monitored as a sidecar metric in future research, not traded or paper-promoted
   without fresh official-settled forward evidence.
+
+### 2026-05-30 - Lowdd forward official refresh at 15:24Z
+
+- Refreshed the running remote lowdd paper-forward evidence from the laptop
+  server without adding data to git. The remote raw replay JSONL was still
+  fresh at `2026-05-30T15:24:48Z`; the lowdd replay JSONL was fresh at
+  `2026-05-30T15:24:47Z`. The lowdd trade ledger was snapshotted via SQLite
+  backup to ignored local runtime storage before analysis.
+- Official paper artifact:
+  `backtest_outputs\btc15m_lowdd_postrestart_remote_20260530_1524`.
+  Since the clean restart cutoff `2026-05-30T06:33:25Z`, the ledger had
+  `10` post-restart filled rows, all `10` REST-official settled. Results:
+  `9` wins, `1` loss, official PnL `+$26.96`, official premium `$49.04`,
+  return on premium `+54.98%`, win rate `90.00%`, and max drawdown `-$0.97`.
+  Fees were treated as total recorded fees, matching the lowdd ledger and
+  `scripts\build_btc15m_lowdd_postrestart_report.py`.
+- Fresh live-sidecar materialization artifact:
+  `runtime\remote_snapshots\lowdd_signal_order_20260530_1524\btc15m_lowdd_signal_order.duckdb`
+  from the remote replay JSONL, filtered to `signal_scan` and `order_decision`
+  rows since `2026-05-30T06:33:25Z`. It loaded `298,855` signal-scan rows and
+  `11` order-decision rows. This avoided copying the full multi-GB sidecar.
+- Fresh selected-signal artifact:
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_remote_20260530_1524`.
+  It found `11` raw selected rows, deduped to `10` one-per-event selected rows,
+  with `10` settled rows. One-contract signal PnL was `+$3.22` on `$5.78`
+  premium; order-scaled PnL matched the paper official ledger at `+$26.96` on
+  `$49.04` premium.
+- Fresh paper/sidecar parity artifact:
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_remote_20260530_1524`.
+  All `10/10` paper rows passed live-sidecar parity. There were `0` live
+  sidecar price mismatches. Two selected-signal to order-entry reprices occurred
+  but both stayed within the audit limit, with max worse reprice `1.0c`.
+- Promotion gate artifact:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_remote_refreshed_20260530_1524`.
+  Verdict remains not production-ready:
+  `research_promising_insufficient_forward_sample`. Remaining blockers are only
+  the preregistered sample-size gates:
+  `selected_rows_below_min`, `settled_rows_below_min`, `order_rows_below_min`,
+  and `paper_settled_rows_below_min` against the `50`-row minimums.
+  Advisories were `duplicate_selected_signals_deduped` and
+  `selected_order_reprice_within_config_limit`.
+- Interpretation:
+  this is the strongest live-forward lowdd result so far because official
+  settlement, order-scaled PnL, and live-sidecar parity all agree on the same
+  `10` post-restart rows. It is still not enough to deploy or increase risk:
+  the evidence is sample-small and should keep collecting until the frozen gate
+  reaches at least `50` clean official-settled selected/order/paper rows.
