@@ -16656,3 +16656,41 @@ artifacts:
   `python -m pytest scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_strategy_triage.py -q --basetemp .pytest-codex-tmp-readiness-lowdd-current-2`
   passed with `13` tests. `python -m py_compile` passed for the touched
   readiness and triage scripts and tests.
+
+### 2026-05-30 - Consolidated BTC15M research candidate screen
+
+- Added repeatable candidate-screen builder:
+  `scripts\build_btc15m_research_candidate_screen.py`.
+  The script reads the latest branch replayability, lowdd live paper official
+  gate, full-raw robustness, chronological walk-forward filter audits, full-raw
+  regime replay, full-raw ML grid, and v2 adapter artifacts. It writes one
+  conservative action table classifying each candidate as keep-collecting,
+  diagnostic sidecar only, reject/do-not-start, or deployable.
+- Fresh screen artifact:
+  `backtest_outputs\btc15m_research_candidate_screen_20260530_1205`.
+  Result: `43` screened rows, `0` deployable candidates, and no started or
+  restarted processes.
+- Decision:
+  keep the raw collector and `btc15m_lowdd_current_wrapper` paper-forward shadow
+  running. Lowdd remains the only active forward path: `10` official/parity
+  paper rows, `+$26.96` official PnL on `$49.04` premium, `10/10` live-sidecar
+  parity, but still blocked by the `50`-row selected/order/paper official sample
+  gates.
+- Non-lowdd research result:
+  `lightgbm_tabular` is the only candidate worth freezing as a non-trading
+  diagnostic sidecar metric. It had `48` clean full-raw replay rows, proxy
+  2c PnL `+$3.00`, and `5` official-subset rows for official 2c PnL `+$1.37`,
+  but `5` official rows is far below the gate and cannot justify a trading or
+  paper-ordering shadow.
+- Rejected / do-not-start decisions:
+  `xgboost_tabular` is proxy-negative (`104` rows, `-$3.49` proxy 2c PnL);
+  broad full-raw cheap YES/NO/tail rules are negative or fail execution-quality
+  checks; pair-lock remains excluded by selection-bias audit despite positive
+  headline PnL; walk-forward filters have negative/bootstrap-fragile OOS
+  evidence; v2 awareness YES-only remains sample-small and adapter-only
+  (`6-8` official rows in the robustness slices, with bootstrap fragility on the
+  wider slice); regime positives have only `1` official-subset row.
+- Validation:
+  `python -m py_compile scripts\build_btc15m_research_candidate_screen.py`
+  passed. This screen is a reporting/research-control tool only; it does not
+  alter any live or paper process.
