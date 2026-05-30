@@ -375,6 +375,53 @@ def add_btc15m_latest_live_replay(
             )
 
 
+def add_btc15m_lowdd_forward_gate(rows: list[dict[str, Any]], gate_dir: Path | None) -> None:
+    """Add the active lowdd wrapper's paper-forward promotion gate."""
+    if gate_dir is None:
+        return
+    df = read_csv(gate_dir / "lowdd_forward_promotion_gate_summary.csv")
+    if df.empty:
+        rows.append(
+            {
+                "family": "BTC15M",
+                "candidate": "btc15m_lowdd_current_wrapper",
+                "source": "lowdd_forward_promotion_gate",
+                "production_ready": False,
+                "failure_reasons": "missing_lowdd_forward_promotion_gate_summary",
+                "pred_trades": "",
+                "pred_pnl": "",
+                "live_proxy_trades": "",
+                "live_proxy_pnl": "",
+                "live_official_trades": "",
+                "live_official_pnl": "",
+                "live_official_win_rate": "",
+            }
+        )
+        return
+    for _, row in df.iterrows():
+        blockers = reason_tokens(row.get("blockers", ""))
+        advisories = reason_tokens(row.get("advisories", ""))
+        if not to_bool(row.get("production_ready", False)) and not blockers:
+            blockers.append(str(row.get("research_status") or "gate_not_ready"))
+        rows.append(
+            {
+                "family": "BTC15M",
+                "candidate": str(row.get("candidate") or "btc15m_lowdd_current_wrapper"),
+                "source": "lowdd_forward_promotion_gate",
+                "production_ready": to_bool(row.get("production_ready", False)) and not blockers,
+                "failure_reasons": ";".join(sorted(set(blockers))),
+                "advisories": ";".join(sorted(set(advisories))),
+                "pred_trades": "",
+                "pred_pnl": "",
+                "live_proxy_trades": to_float(row, "selected_rows"),
+                "live_proxy_pnl": to_float(row, "signal_one_contract_pnl"),
+                "live_official_trades": to_float(row, "paper_settled_rows"),
+                "live_official_pnl": to_float(row, "paper_official_pnl"),
+                "live_official_win_rate": "",
+            }
+        )
+
+
 def add_btc1h(rows: list[dict[str, Any]], audit_dir: Path | None) -> None:
     if audit_dir is None:
         return
@@ -1442,6 +1489,7 @@ def main() -> int:
     shadow_status_info = read_json(shadow_status_dir / "run_info.json" if shadow_status_dir else None)
     frozen_policy_dir = latest_dir("btc_frozen_policy_parity_")
     basis_risk_dir = latest_dir("btc_settlement_basis_risk_audit_")
+    lowdd_forward_gate_dir = latest_dir("btc15m_lowdd_forward_promotion_gate_")
 
     rows: list[dict[str, Any]] = []
     add_btc15m_broad(
@@ -1466,6 +1514,7 @@ def main() -> int:
         args.min_live_official_trades,
     )
     add_btc15m_latest_live_replay(rows, latest_live_replay_dirs, args.min_live_official_trades)
+    add_btc15m_lowdd_forward_gate(rows, lowdd_forward_gate_dir)
     add_btc1h(rows, btc1h_dir)
     add_btc1h_multi_holdout(
         rows,
@@ -1543,6 +1592,7 @@ def main() -> int:
         "materialized_grid_dir": str(materialized_dir.relative_to(PROJECT_ROOT)) if materialized_dir else "",
         "rest_official_dir": str(rest_dir.relative_to(PROJECT_ROOT)) if rest_dir else "",
         "latest_live_replay_dirs": [str(path.relative_to(PROJECT_ROOT)) for path in latest_live_replay_dirs],
+        "lowdd_forward_gate_dir": str(lowdd_forward_gate_dir.relative_to(PROJECT_ROOT)) if lowdd_forward_gate_dir else "",
         "btc1h_gate_dir": str(btc1h_dir.relative_to(PROJECT_ROOT)) if btc1h_dir else "",
         "btc1h_multi_holdout_dir": str(btc1h_multi_holdout_dir.relative_to(PROJECT_ROOT)) if btc1h_multi_holdout_dir else "",
         "btc1h_replay_reconciliation_dir": str(btc1h_replay_reconciliation_dir.relative_to(PROJECT_ROOT))
@@ -1593,6 +1643,7 @@ def main() -> int:
         f"- Side BTC15M gate: `{out_info['side_gate_dir']}`",
         f"- BTC15M materialized first-signal grid: `{out_info['materialized_grid_dir']}`",
         f"- REST official fill: `{out_info['rest_official_dir']}`",
+        f"- BTC15M lowdd forward gate: `{out_info['lowdd_forward_gate_dir']}`",
         f"- BTC1H gate: `{out_info['btc1h_gate_dir']}`",
         f"- BTC1H multi-holdout gate: `{out_info['btc1h_multi_holdout_dir']}`",
         f"- BTC1H replay-vs-ledger reconciliation: `{out_info['btc1h_replay_reconciliation_dir']}`",

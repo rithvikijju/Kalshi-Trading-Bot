@@ -15555,3 +15555,107 @@ artifacts:
   rows. This improves the lowdd status from rejected to promising, but it is
   still not deployable because the forward sample is too small and the raw
   materialized slice still uses synthetic Coinbase rows.
+
+### 2026-05-30 - BTC15M 10:12Z lowdd refresh and branch applicability check
+
+- Checked the laptop over SSH at about `2026-05-30T10:11Z`. The heavier
+  collector status script did not return within `60s`, so direct status-sidecar
+  and scheduled-task checks were used instead.
+- Remote raw BTC15M capture remained fresh:
+  `btc15m_live_capture.duckdb.status.json` had `failed=false`, `dropped=0`,
+  PID `6084`, queue depth `0`, latest `ws_orderbook_top` at
+  `2026-05-30T10:11:31.091425Z`, and replay sidecar rows
+  `17,183,243` for `ws_orderbook_top`.
+- Remote lowdd forward shadow remained fresh:
+  `btc15m_lowdd_forward_shadow_capture.duckdb.status.json` had
+  `failed=false`, `dropped=0`, PID `12796`, queue depth `2`, latest
+  `signal_scan` at `2026-05-30T10:11:30.427463Z`, latest
+  `ws_orderbook_top` at `2026-05-30T10:11:30.426401Z`, task
+  `\KalshiBTC_btc15m_lowdd_forward_shadow` status `Running`, and replay rows
+  `4,879,999` top-book, `2,580,080` signal-scan, and `5,722`
+  order-decision rows. The raw task still showed `Ready` while the writer PID
+  was alive, so do not manually restart raw capture while PID `6084` is still
+  writing.
+- Materialized fresh bounded sidecar slices on the laptop using the repo
+  `.venv` because system Python lacked DuckDB:
+  `2026-05-30T06:40:00Z..2026-05-30T10:12:00Z`.
+  Local ignored copies:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1012\btc15m_raw_20260530_0640_1012.duckdb`
+  and
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1012\btc15m_lowdd_20260530_0640_1012.duckdb`.
+- Raw materialized counts:
+  `242,963` top-book rows, `1,172` lifecycle rows, `229,577` synthetic
+  Coinbase rows, `15` BTC15M markets. Lowdd materialized counts:
+  `240,936` top-book rows, `1,187` lifecycle rows, `115,773` signal-scan
+  rows, and `6` paper-fill order-decision rows.
+- Data fidelity artifact:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_0640_1012`.
+  Verdict remained research-only:
+  `promotion_grade_coinbase_ticks=false` because Coinbase ticks are synthetic
+  from top-book `btc_spot`; `hard_failures=top_book_gaps_over_threshold`.
+  Valid-book rate was `99.5407%` with `1,116` filterable bad top-book rows.
+  Raw-vs-lowdd independent bucket parity was usable as a diagnostic:
+  `main_match_rate=97.2198%`, `compare_match_rate=95.8243%`,
+  YES-mid mean absolute difference `0.0589c`, p95 `0.10c`, max `9.0c`,
+  within-1c rate `98.3075%`.
+- Generic official live-holdout replay artifact:
+  `backtest_outputs\btc15m_live_holdout_20260530_0640_1012`.
+  All `15` BTC15M events in the window had finalized Kalshi settlements.
+  `current_lowdd_no_rv` remained positive with `6` trades, `+$1.49`
+  one-contract PnL, `42.4501%` return on premium, `83.3333%` win rate,
+  and max drawdown `-$0.25`. `cheap_yes_rr_first` was diagnostic-positive:
+  `11` trades, `+$1.019`, `25.5966%` return on premium, but only
+  `45.4545%` win rate. `cheap_pair_lock_rr` was `6` trades, `+$0.24`,
+  `4.1667%` return on premium, `100%` win rate, but it remains a diagnostic
+  rule without the lowdd wrapper's paper/order parity audit.
+- Lowdd sidecar-selected artifact:
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_20260530_0640_1012`.
+  No new paper fills arrived after the 09:40Z fill: still `6` selected rows,
+  all settled, signal one-contract PnL `+$1.58`, scaled order PnL `+$14.27`,
+  premium `$27.73`, win rate `83.3333%`, max drawdown `-$0.97`, and one
+  selected-to-order price reprice row.
+- Paper ledger artifact:
+  `backtest_outputs\btc15m_lowdd_postrestart_20260530_0640_1012`.
+  Same `6` official-settled paper trades, `5` wins, `+$14.27` official PnL,
+  `$27.73` premium, `51.4605%` return on premium, max drawdown `-$0.97`.
+- Parity artifact:
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_20260530_0640_1012`.
+  Result stayed clean after the reprice-classification patch:
+  `6 / 6` live sidecar parity pass rows,
+  `live_sidecar_price_mismatch_rows = 0`,
+  `signal_order_reprice_rows = 1`,
+  `signal_order_reprice_over_limit_rows = 0`,
+  `max_signal_order_worse_reprice_cents = 1.0`, and
+  `generic_replay_price_mismatch_rows = 2`.
+- Promotion gate artifact:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_0640_1012`.
+  Verdict:
+  `production_ready=false`,
+  `research_status=research_promising_insufficient_forward_sample`.
+  Standalone blockers are only sample-size gates:
+  `selected_rows_below_min`, `settled_rows_below_min`,
+  `order_rows_below_min`, and `paper_settled_rows_below_min`.
+- Patched `scripts\check_btc_deployment_readiness.py` so the active lowdd
+  forward gate is included in the global deployment-readiness table. Validation:
+  `python -m py_compile scripts\check_btc_deployment_readiness.py` passed.
+  Fresh readiness artifact:
+  `backtest_outputs\deployment_readiness_20260530_1012_lowdd_gate`.
+  Global verdict remains `production_ready_count = 0`.
+- Branch applicability check:
+  after `git fetch`, no non-`sami` branch had commits newer than May 13, 2026.
+  The recent non-`sami` branches are all `kalshi_v2` / arb branches that expect
+  cumulative strike markets (`-T` tickers), `ws_orderbook_top_dedup`,
+  `coinbase_ticker_all`, and lifecycle `determined` rows. The fresh BTC15M
+  slice has `15` `KXBTC15M` binary up/down markets, `0` `-T` markets,
+  `0` `KXBTCD` markets, `0` lifecycle `determined` rows, and `4`
+  lifecycle `settled` rows. Those branches are not directly replayable on this
+  BTC15M slice without an adapter and an official-settlement path; the current
+  BTC15M experiments remain the valid branch-current comparison for this data.
+- Interpretation:
+  lowdd remains the best active paper-forward candidate, but still has only
+  `6` settled post-fix rows. The data is suitable for research-grade top-book
+  replay after filters, but not promotion-grade BTC tick-age evidence because
+  Coinbase ticks are synthetic in the materialized sidecar. Continue collecting
+  lowdd and raw BTC15M; the next useful check is another bounded refresh once
+  new paper fills arrive, plus a separate adapter experiment if we want to test
+  `kalshi_v2` branches against BTC15M binary markets.
