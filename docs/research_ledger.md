@@ -14585,3 +14585,45 @@ artifacts:
   create promotion evidence: all BTC1H candidates remain research-only under
   the original official-settlement, execution-realism, faithful-replay, and
   clean-clock gates.
+### 2026-05-30 - Branch/data research checkpoint
+
+- Audited the current laptop server collection state:
+  - BTC15M raw capture is live with `dropped = 0`,
+    `ws_orderbook_top = 16,755,021`, and replay sidecar counts matching status.
+  - BTC15M lowdd shadow is live with `dropped = 0`,
+    `ws_orderbook_top = 4,463,363`, `signal_scan = 2,381,496`, and
+    `order_decision = 5,716`.
+  - BTC1H high-conf capture is stale at `2026-05-28T05:15:56Z` and is not
+    current forward evidence.
+- Ran two collection-fidelity checks:
+  - recent BTC15M raw-vs-lowdd sidecar overlap had `26,900` common
+    `(market_ticker, seq, source)` top-book keys with zero Kalshi
+    price/quantity mismatches;
+  - latest captured `KXBTC15M-26MAY300045-45` top book matched Kalshi REST
+    NO bid `0.9990` qty `4920.20`.
+- Important limitation:
+  current BTC15M capture has `capture_raw_ws = false`; it is faithful
+  top-of-book replay evidence, not full raw websocket level/delta capture.
+- Built a local ignored BTC1H snapshot dataset from the remote capture:
+  `runtime/branch_backtests/btc1h_20260530_gapless.duckdb`.
+  It contains `7,029,636` deduped top-book rows, `1,423,192` signal scans,
+  and `62` order decisions, but also `45,428` market gaps over `120s`, so it
+  is research-only.
+- Backtested runnable v2 branch harnesses on that snapshot after adapting only
+  isolated runtime worktrees to consume the captured `KRAKEN:XBT/USD` ticker:
+  - `origin/arb-v3`: `170` trades, net PnL `-$16.09`, fees `$6.69`,
+    positive net trades `0 / 170`;
+  - `origin/claude/v2-backtest-harness`: same result on the snapshot;
+  - coarse combined v2 sweep completed first five variants before timeout,
+    and all were negative after fees (`-$12.35`, `-$10.62`, `-$10.62`,
+    `-$12.35`, and `-$0.32`).
+- Refreshed the current BTC15M lowdd official paper result from Kalshi REST:
+  `12` settled fills, `7 / 5` wins/losses, official PnL `-$3.84`, premium
+  `$49.84`, return on premium about `-7.7%`, and no new fills since
+  `2026-05-28T19:55:35Z`.
+- Interpretation:
+  no current branch or live forward candidate is validated. Keep top-of-book
+  capture running; treat v2 and lowdd as rejected/negative for now; next loop
+  should materialize BTC15M sidecar slices and search preregistered filters on
+  fresh official-settled rows without using `btc_spot` as a canonical
+  per-message label.
