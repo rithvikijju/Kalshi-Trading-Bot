@@ -16345,3 +16345,61 @@ artifacts:
   post-fix slice. It does not change deployment status. The branch family still
   contributes research adapters only, and the current forward path remains
   clean data collection plus more official-settled lowdd paper rows.
+
+### 2026-05-30 - Full raw BTC15M snapshot replay and filter audit
+
+- Took a controlled remote snapshot of the active raw BTC15M capture and lowdd
+  forward-shadow DuckDBs without adding data to git. Snapshot directory:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\remote_snapshots\full_raw_snapshot_20260530_1320`.
+  The copied raw capture DB was about `2.07GB`; the copied lowdd capture DB was
+  about `671MB`. The raw and lowdd collectors were stopped only for the copy and
+  then restarted under the scheduled-task supervision path. Post-restart status
+  reported `ALL_CURRENT_ACTIVE_RUNNING` and `TASK_SUPERVISION_OK`, with raw PID
+  `13912` and lowdd PID `9408`.
+- Full raw fidelity artifact:
+  `backtest_outputs\btc15m_full_raw_fidelity_20260522_0530_1315`.
+  The full raw capture covered
+  `2026-05-22T02:40:00Z..2026-05-30T13:00:00Z` and contained
+  `17,339,935` `ws_orderbook_top` rows, `1,329,429` `ws_lifecycle` rows,
+  `204,885` raw `coinbase_ticker` rows, and `24,181` `capture_health` rows.
+  Coinbase ticks remained promotion-grade:
+  `promotion_grade_coinbase_ticks=true`. Top-book quality remained usable for
+  research but failed the strict gap gate:
+  `valid_book_rows=17,257,451`, valid-book rate `99.52431%`, `798` markets,
+  `9` gaps over `120s`, p99 market gap `0.4299s`, and max gap `584.730s`.
+- Full raw 6-hour replay-grid artifact:
+  `backtest_outputs\btc15m_full_raw_live_holdout_window_grid_20260522_0530_1300_6h`.
+  The grid produced `34` six-hour windows and `6` aggregate strategy rows using
+  official REST settlement and decision-time book replay. `cheap_yes_rr_first`,
+  `cheap_no_rr_first`, `cheap_tail_best_side_first`, and
+  `cheap_tail_position_aware` were all negative over the full raw window. The
+  very positive-looking `cheap_pair_lock_rr` row was not usable because it is
+  still excluded by the prior selection-bias audit and row-quality blockers.
+- Full raw replay robustness artifact:
+  `backtest_outputs\btc15m_full_raw_replay_robustness_20260522_0530_1300_6h`.
+  `current_lowdd_no_rv` was the only large-sample positive row:
+  `310` trades/events, PnL `+$4.17`, return on premium `+2.09%`, win rate
+  `65.8%`, max drawdown `-$7.84`, bootstrap p05 `-$8.25`, bootstrap p50
+  `+$4.25`, bootstrap p95 `+$16.39`, and profit probability `71.22%`.
+  Verdict: `research_promising_bootstrap_fragile`, not deployable.
+- Full raw lowdd simple-filter artifact:
+  `backtest_outputs\btc15m_full_raw_filter_audit_20260522_0530_1300`.
+  The train/validation split was train before `2026-05-29T00:00:00Z` and
+  validation on or after that timestamp. The unfiltered lowdd baseline had
+  `267` train rows for only `+$0.32` train PnL, train bootstrap p05 `-$11.56`,
+  and train profit probability `52.2%`; the full-window profit came mostly from
+  the final validation slice (`43` rows, `+$3.85`).
+- Only one simple filter passed minimum rows, positive train bootstrap p05, and
+  positive validation PnL: `btc3_abs_bin=btc3_3_6bps`. It had `68` train rows,
+  train PnL `+$6.09`, train return `+13.87%`, train bootstrap p05 `+$0.728`,
+  `12` validation rows, validation PnL `+$0.42`, validation return `+4.90%`,
+  and validation bootstrap p05 `-$1.79`. This is a research-only
+  preregistration candidate for future forward metrics; the validation sample
+  is too small and still bootstrap-fragile.
+- Interpretation:
+  the longer raw dataset confirms that data collection is mostly faithful and
+  that raw Coinbase ticks are being stored directly, but the strategy evidence
+  is not strong enough to deploy or change live policy. The only actionable
+  next step is to keep the raw collector and lowdd paper-forward collection
+  running and to treat the `btc3_3_6bps` filter as a future, preregistered
+  sidecar metric rather than a promoted trading rule.
