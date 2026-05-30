@@ -14715,3 +14715,65 @@ artifacts:
   old `sizing_budget_or_liquidity_zero` blocker, but no qualifying post-restart
   signal has occurred yet. Leave the shadow running; do not retune thresholds
   on this window.
+
+### 2026-05-30 - BTC15M fidelity audit and latest settled sidecar replay
+
+- Refreshed remote status at `2026-05-30T06:50:53Z`. Raw BTC15M capture was
+  still live with PID `14260`, `failed=false`, `dropped=0`,
+  `ws_orderbook_top=16,957,370`, `ws_lifecycle=1,283,597`, and latest
+  top-book row `2026-05-30T06:50:47.726414Z`. Lowdd paper shadow was still
+  live with PID `12796`, `failed=false`, `dropped=0`, latest
+  `signal_scan=2026-05-30T06:50:50.431545Z`, and still `0` post-restart
+  ledger fills.
+- Tried the preferred direct-DuckDB holdout replay on
+  `2026-05-30T06:00:00Z..06:45:00Z`, but Windows denied copying the active raw
+  capture DB (`PermissionError(13)`). Collection was not paused. Fell back to
+  bounded replay-sidecar materialization.
+- Materialized the raw capture replay sidecar for
+  `2026-05-30T06:00:00Z..06:45:00Z` into remote ignored runtime storage:
+  `72,566` `ws_orderbook_top` rows, `4,222` lifecycle rows, and `68,671`
+  synthetic Coinbase rows from `ws_orderbook_top.btc_spot`. This is
+  research-grade for top-book replay only, not promotion-grade BTC tick-age
+  evidence.
+- Official-settled holdout replay on that latest slice found:
+  - `cheap_yes_rr_first`: `1` trade, PnL `-$0.180`;
+  - `cheap_no_rr_first`: `2` trades, PnL `-$0.135`;
+  - `cheap_tail_best_side_first`: `3` trades, PnL `-$0.315`;
+  - `cheap_tail_position_aware`: `3` trades, PnL `-$0.315`;
+  - `cheap_pair_lock_rr`: `0` trades;
+  - `current_lowdd_no_rv`: `0` trades.
+  All `4` events in the replay window had REST-official settlement rows.
+- Added `scripts/audit_btc15m_sidecar_fidelity.py` to make sidecar data-quality
+  checks reusable. It reports table counts, timestamp/quote invariants, top-book
+  gaps, Coinbase source quality, and optional independent-capture bucket parity.
+- Materialized the matching lowdd sidecar slice for the same window:
+  `62,941` top-book rows, `3,903` lifecycle rows, `27,652` signal scans,
+  `0` order decisions, and `59,523` synthetic Coinbase rows.
+- Fidelity/parity audit comparing raw vs lowdd captures in `5s` buckets found:
+  raw top-book rows had `0` timestamp/null ticker errors, `0` price out-of-range
+  rows, `0` negative quantities, and `0` gaps over `120s` (`p99` top-book gap
+  about `0.405s`, max gap about `32.43s`). It also found `129` rows with null
+  book fields, `254` crossed YES-book rows, and `241` crossed NO-book rows.
+  Independent-capture parity matched `448 / 511` raw buckets and `448 / 451`
+  lowdd buckets; `93.63%` of matched buckets were within `1c` YES-mid, with
+  p95 difference `1c`. Worst mismatches clustered around fast-moving near-close
+  markets.
+- Patched `scripts/backtest_btc15m_live_holdout.py` so replay drops invalid
+  top-book rows before feature construction: null/crossed/out-of-range prices
+  and negative visible quantities can no longer be scored as executable
+  zero-spread opportunities. Added regression coverage in
+  `scripts/test_btc15m_live_holdout.py`.
+- Reran the `06:00Z..06:45Z` replay after that filter; the strategy summary was
+  unchanged, so the losing cheap-tail rows in this slice were not caused by the
+  crossed-book rows. Future positive slices still need this filter for
+  execution realism.
+- Validation:
+  `python -m py_compile scripts\backtest_btc15m_live_holdout.py scripts\audit_btc15m_sidecar_fidelity.py scripts\test_btc15m_live_holdout.py`
+  and
+  `python -m pytest scripts\test_btc15m_live_holdout.py -q --basetemp .pytest-codex-tmp-btc15m-live-holdout`
+  passed with `1 passed`.
+- Interpretation:
+  the data is usable for filtered top-of-book research replay, but not a full
+  raw websocket archive and not promotion-grade BTC tick-age replay while the
+  sidecar path relies on synthetic Coinbase ticks. The newest official-settled
+  slice is negative for cheap-tail variants and has no lowdd trades.

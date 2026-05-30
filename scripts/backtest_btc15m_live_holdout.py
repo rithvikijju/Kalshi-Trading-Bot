@@ -212,6 +212,18 @@ def enrich(top: pd.DataFrame, btc: pd.DataFrame, results: pd.DataFrame) -> pd.Da
     q = q.dropna(subset=["yes_bid", "yes_ask", "no_bid", "no_ask", "event_ticker", "market_ticker"])
     for col in ["yes_bid", "yes_ask", "no_bid", "no_ask", "yes_bid_qty", "yes_ask_qty", "no_bid_qty", "no_ask_qty"]:
         q[col] = pd.to_numeric(q[col], errors="coerce")
+    q = q[
+        q["yes_bid"].between(0.0, 1.0)
+        & q["yes_ask"].between(0.0, 1.0)
+        & q["no_bid"].between(0.0, 1.0)
+        & q["no_ask"].between(0.0, 1.0)
+        & q["yes_bid"].le(q["yes_ask"])
+        & q["no_bid"].le(q["no_ask"])
+        & q["yes_bid_qty"].fillna(0).ge(0)
+        & q["yes_ask_qty"].fillna(0).ge(0)
+        & q["no_bid_qty"].fillna(0).ge(0)
+        & q["no_ask_qty"].fillna(0).ge(0)
+    ].copy()
     q["yes_mid"] = (q["yes_bid"] + q["yes_ask"]) / 2.0
     q["no_mid"] = 1.0 - q["yes_mid"]
     q["spread_cents"] = (q["yes_ask"] - q["yes_bid"]).clip(lower=0) * 100.0
