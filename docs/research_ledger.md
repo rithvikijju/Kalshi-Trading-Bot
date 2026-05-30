@@ -15904,3 +15904,59 @@ artifacts:
   `python -m py_compile
   scripts\audit_btc15m_kalshi_v2_adapter_feasibility.py
   scripts\test_btc15m_kalshi_v2_adapter_feasibility.py` passed.
+
+### 2026-05-30 - BTC15M v2 binary hold-to-settlement adapter
+
+- Added `scripts\backtest_btc15m_v2_binary_adapter.py` as the first concrete
+  `kalshi_v2` research adapter for current BTC15M binary websocket captures.
+  This is not an original branch replay. It adapts only the v2 fair-value
+  signal idea and deliberately excludes TP/SL/time-exit behavior.
+- Adapter design:
+  - maps each BTC15M binary market to Kalshi REST `floor_strike`;
+  - computes a causal lognormal `P(YES)` from decision-time `btc_spot`,
+    `floor_strike`, time-to-close, and rolling realized volatility;
+  - uses decision-time executable YES/NO asks and visible top quantity;
+  - charges one-contract taker fees;
+  - takes at most one first passing trade per event; and
+  - holds to official REST settlement.
+- Artifact:
+  `backtest_outputs\btc15m_v2_binary_adapter_20260530_0640_1041`.
+  Input capture:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1041\btc15m_raw_20260530_0640_1041.duckdb`.
+  Window:
+  `2026-05-30T06:40:00Z..2026-05-30T10:41:00Z`.
+  The run used `279,881` top-book rows, `263,129` BTC ticks, `17` BTC15M
+  events, and `17` official finalized result rows.
+- Adapter results:
+  - `v2_default_binary_h2s`: `15` trades, all NO, PnL `-$1.87`, return on
+    premium `-23.7611%`, win rate `40%`, max drawdown `-$2.83`.
+  - `v2_awareness_binary_h2s`: `15` trades, all NO, PnL `-$1.80`, return on
+    premium `-23.0769%`, win rate `40%`, max drawdown `-$2.76`.
+  - `v2_awareness_yes_only_h2s`: `6` trades, all YES, PnL `+$1.89`, return
+    on premium `45.9854%`, win rate `100%`, max drawdown `$0.00`.
+- Strict robustness artifact:
+  `backtest_outputs\btc15m_v2_binary_adapter_robustness_20260530_0640_1041`.
+  Both all-side variants were rejected as `reject_nonpositive_official_pnl`.
+  `v2_awareness_yes_only_h2s` had `6` official-settled, executable rows, no
+  duplicate event exposure, bootstrap p05 `+$1.13`, bootstrap profit
+  probability `100%`, and verdict `research_promising_insufficient_sample`.
+- Overlap with lowdd paper-forward rows:
+  YES-only v2 events were
+  `KXBTC15M-26MAY300400`, `KXBTC15M-26MAY300430`,
+  `KXBTC15M-26MAY300515`, `KXBTC15M-26MAY300600`,
+  `KXBTC15M-26MAY300615`, and `KXBTC15M-26MAY300630`.
+  It overlapped lowdd on `3` events (`0400`, `0430`, `0630`) and added `3`
+  separate YES-only events (`0515`, `0600`, `0615`). This is not independent
+  deployment evidence, but it is a plausible preregistered forward-research
+  candidate to monitor alongside lowdd.
+- Interpretation:
+  the v2 all-side binary adaptation currently reinforces the known NO-side
+  fragility: headline model edge can be negative after official settlement.
+  The YES-only adapter is the only positive v2-derived result on this slice,
+  but with only `6` rows and synthetic/provenance-weak Coinbase ticks it must
+  stay research-only.
+- Validation:
+  `python -m pytest scripts\test_btc15m_v2_binary_adapter.py -q --basetemp
+  .pytest-codex-tmp-v2-binary` passed with `3` tests.
+  `python -m py_compile scripts\backtest_btc15m_v2_binary_adapter.py
+  scripts\test_btc15m_v2_binary_adapter.py` passed.
