@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture-db", type=Path, required=True, help="Materialized DuckDB to audit.")
     parser.add_argument("--compare-db", type=Path, help="Optional independent capture DuckDB to compare.")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument("--start-utc", help="Optional inclusive UTC lower bound for received_at_utc.")
+    parser.add_argument("--end-utc", help="Optional exclusive UTC upper bound for received_at_utc.")
     parser.add_argument("--bucket-sec", type=int, default=5, help="Bucket size for optional parity comparison.")
     parser.add_argument("--gap-sec", type=float, default=120.0, help="Gap threshold for top-book coverage checks.")
     parser.add_argument("--price-tolerance-cents", type=float, default=1.0)
@@ -45,6 +47,30 @@ def table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
         return True
     except duckdb.Error:
         return False
+
+
+def create_audit_tables(con: duckdb.DuckDBPyConnection, start_utc: str | None, end_utc: str | None) -> dict[str, str]:
+    tables: dict[str, str] = {}
+    for table in ["ws_orderbook_top", "ws_lifecycle", "coinbase_ticker", "signal_scan", "order_decision", "capture_health"]:
+        if not table_exists(con, table):
+            tables[table] = table
+            continue
+        cols = {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "received_at_utc" not in cols or (not start_utc and not end_utc):
+            tables[table] = table
+            continue
+        dest = f"__audit_{table}"
+        clauses = []
+        params: list[Any] = []
+        if start_utc:
+            clauses.append("TRY_CAST(received_at_utc AS TIMESTAMPTZ) >= TRY_CAST(? AS TIMESTAMPTZ)")
+            params.append(start_utc)
+        if end_utc:
+            clauses.append("TRY_CAST(received_at_utc AS TIMESTAMPTZ) < TRY_CAST(? AS TIMESTAMPTZ)")
+            params.append(end_utc)
+        con.execute(f"CREATE TEMP TABLE {dest} AS SELECT * FROM {table} WHERE {' AND '.join(clauses)}", params)
+        tables[table] = dest
+    return tables
 
 
 def manifest_for(db_path: Path) -> dict[str, Any]:
@@ -78,13 +104,14 @@ def scalar_row(con: duckdb.DuckDBPyConnection, sql: str, params: list[Any] | Non
     return dict(zip(names, row)) if row is not None else {}
 
 
-def table_counts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+def table_counts(con: duckdb.DuckDBPyConnection, tables: dict[str, str]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for table in ["ws_orderbook_top", "ws_lifecycle", "coinbase_ticker", "signal_scan", "order_decision", "capture_health"]:
-        if not table_exists(con, table):
+        actual = tables.get(table, table)
+        if not table_exists(con, actual):
             rows.append({"table": table, "exists": False, "rows": 0, "min_utc": None, "max_utc": None})
             continue
-        cols = {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+        cols = {str(row[1]) for row in con.execute(f"PRAGMA table_info({actual})").fetchall()}
         if "received_at_utc" in cols:
             info = scalar_row(
                 con,
@@ -93,23 +120,23 @@ def table_counts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                        MIN(TRY_CAST(received_at_utc AS TIMESTAMPTZ)) AS min_utc,
                        MAX(TRY_CAST(received_at_utc AS TIMESTAMPTZ)) AS max_utc,
                        SUM(CASE WHEN TRY_CAST(received_at_utc AS TIMESTAMPTZ) IS NULL THEN 1 ELSE 0 END)::BIGINT AS null_utc
-                FROM {table}
+                FROM {actual}
                 """,
             )
         else:
-            info = scalar_row(con, f"SELECT COUNT(*)::BIGINT AS rows FROM {table}")
+            info = scalar_row(con, f"SELECT COUNT(*)::BIGINT AS rows FROM {actual}")
             info.update({"min_utc": None, "max_utc": None, "null_utc": None})
         info.update({"table": table, "exists": True})
         rows.append(info)
     return pd.DataFrame(rows)[["table", "exists", "rows", "min_utc", "max_utc", "null_utc"]]
 
 
-def quote_invariants(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    if not table_exists(con, "ws_orderbook_top"):
+def quote_invariants(con: duckdb.DuckDBPyConnection, top_table: str) -> pd.DataFrame:
+    if not table_exists(con, top_table):
         return pd.DataFrame([{"metric": "missing_ws_orderbook_top", "value": 1}])
     row = scalar_row(
         con,
-        """
+        f"""
         SELECT COUNT(*)::BIGINT AS rows,
                SUM(CASE WHEN TRY_CAST(received_at_utc AS TIMESTAMPTZ) IS NULL THEN 1 ELSE 0 END)::BIGINT AS null_received_at_utc,
                SUM(CASE WHEN received_at_ns IS NULL THEN 1 ELSE 0 END)::BIGINT AS null_received_at_ns,
@@ -121,20 +148,38 @@ def quote_invariants(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                SUM(CASE WHEN no_bid > no_ask THEN 1 ELSE 0 END)::BIGINT AS crossed_no_book,
                SUM(CASE WHEN yes_bid_qty < 0 OR yes_ask_qty < 0 OR no_bid_qty < 0 OR no_ask_qty < 0 THEN 1 ELSE 0 END)::BIGINT AS negative_qty,
                SUM(CASE WHEN btc_spot IS NOT NULL AND (btc_spot < 1000 OR btc_spot > 1000000) THEN 1 ELSE 0 END)::BIGINT AS implausible_btc_spot,
+               SUM(CASE WHEN TRY_CAST(received_at_utc AS TIMESTAMPTZ) IS NOT NULL
+                         AND received_at_ns IS NOT NULL
+                         AND market_ticker IS NOT NULL AND market_ticker != ''
+                         AND event_ticker IS NOT NULL AND event_ticker != ''
+                         AND yes_bid IS NOT NULL AND yes_ask IS NOT NULL AND no_bid IS NOT NULL AND no_ask IS NOT NULL
+                         AND yes_bid BETWEEN 0 AND 1 AND yes_ask BETWEEN 0 AND 1
+                         AND no_bid BETWEEN 0 AND 1 AND no_ask BETWEEN 0 AND 1
+                         AND yes_bid <= yes_ask AND no_bid <= no_ask
+                         AND COALESCE(yes_bid_qty, 0) >= 0
+                         AND COALESCE(yes_ask_qty, 0) >= 0
+                         AND COALESCE(no_bid_qty, 0) >= 0
+                         AND COALESCE(no_ask_qty, 0) >= 0
+                         AND (btc_spot IS NULL OR btc_spot BETWEEN 1000 AND 1000000)
+                        THEN 1 ELSE 0 END)::BIGINT AS valid_book_rows,
                COUNT(DISTINCT event_ticker)::BIGINT AS distinct_events,
                COUNT(DISTINCT market_ticker)::BIGINT AS distinct_markets
-        FROM ws_orderbook_top
+        FROM {top_table}
         """,
     )
+    rows = int(row.get("rows") or 0)
+    valid = int(row.get("valid_book_rows") or 0)
+    row["filterable_bad_rows"] = rows - valid
+    row["valid_book_rate"] = (valid / rows) if rows else 0.0
     return pd.DataFrame([{"metric": key, "value": value} for key, value in row.items()])
 
 
-def gap_summary(con: duckdb.DuckDBPyConnection, gap_sec: float) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if not table_exists(con, "ws_orderbook_top"):
+def gap_summary(con: duckdb.DuckDBPyConnection, top_table: str, gap_sec: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not table_exists(con, top_table):
         empty = pd.DataFrame()
         return empty, empty
     summary = con.execute(
-        """
+        f"""
         WITH ordered AS (
             SELECT market_ticker,
                    event_ticker,
@@ -142,7 +187,7 @@ def gap_summary(con: duckdb.DuckDBPyConnection, gap_sec: float) -> tuple[pd.Data
                    (received_at_ns - LAG(received_at_ns) OVER (
                        PARTITION BY market_ticker ORDER BY received_at_ns
                    )) / 1000000000.0 AS gap_sec
-            FROM ws_orderbook_top
+            FROM {top_table}
             WHERE received_at_ns IS NOT NULL
         )
         SELECT COUNT(DISTINCT market_ticker)::BIGINT AS markets,
@@ -156,7 +201,7 @@ def gap_summary(con: duckdb.DuckDBPyConnection, gap_sec: float) -> tuple[pd.Data
         [gap_sec],
     ).fetchdf()
     worst = con.execute(
-        """
+        f"""
         WITH ordered AS (
             SELECT market_ticker,
                    event_ticker,
@@ -165,7 +210,7 @@ def gap_summary(con: duckdb.DuckDBPyConnection, gap_sec: float) -> tuple[pd.Data
                    (received_at_ns - LAG(received_at_ns) OVER (
                        PARTITION BY market_ticker ORDER BY received_at_ns
                    )) / 1000000000.0 AS gap_sec
-            FROM ws_orderbook_top
+            FROM {top_table}
             WHERE received_at_ns IS NOT NULL
         )
         SELECT market_ticker, event_ticker, received_at_utc, gap_sec
@@ -178,10 +223,10 @@ def gap_summary(con: duckdb.DuckDBPyConnection, gap_sec: float) -> tuple[pd.Data
     return summary, worst
 
 
-def lifecycle_counts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    if not table_exists(con, "ws_lifecycle"):
+def lifecycle_counts(con: duckdb.DuckDBPyConnection, lifecycle_table: str) -> pd.DataFrame:
+    if not table_exists(con, lifecycle_table):
         return pd.DataFrame()
-    cols = {str(row[1]) for row in con.execute("PRAGMA table_info(ws_lifecycle)").fetchall()}
+    cols = {str(row[1]) for row in con.execute(f"PRAGMA table_info({lifecycle_table})").fetchall()}
     candidates = [col for col in ["event_type", "message_type", "reason"] if col in cols]
     if candidates:
         lifecycle_expr = "COALESCE(" + ", ".join(candidates + ["'unknown'"]) + ")"
@@ -193,15 +238,15 @@ def lifecycle_counts(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
                COUNT(*)::BIGINT AS rows,
                MIN(TRY_CAST(received_at_utc AS TIMESTAMPTZ)) AS min_utc,
                MAX(TRY_CAST(received_at_utc AS TIMESTAMPTZ)) AS max_utc
-        FROM ws_lifecycle
+        FROM {lifecycle_table}
         GROUP BY 1
         ORDER BY rows DESC, lifecycle_type
         """
     ).fetchdf()
 
 
-def coinbase_summary(con: duckdb.DuckDBPyConnection, manifest: dict[str, Any]) -> pd.DataFrame:
-    if not table_exists(con, "coinbase_ticker"):
+def coinbase_summary(con: duckdb.DuckDBPyConnection, manifest: dict[str, Any], coinbase_table: str) -> pd.DataFrame:
+    if not table_exists(con, coinbase_table):
         return pd.DataFrame(
             [
                 {
@@ -213,13 +258,13 @@ def coinbase_summary(con: duckdb.DuckDBPyConnection, manifest: dict[str, Any]) -
         )
     row = scalar_row(
         con,
-        """
+        f"""
         WITH ordered AS (
             SELECT received_at_ns,
                    TRY_CAST(received_at_utc AS TIMESTAMPTZ) AS ts,
                    price,
                    (received_at_ns - LAG(received_at_ns) OVER (ORDER BY received_at_ns)) / 1000000000.0 AS gap_sec
-            FROM coinbase_ticker
+            FROM {coinbase_table}
             WHERE received_at_ns IS NOT NULL
         )
         SELECT COUNT(*)::BIGINT AS rows,
@@ -239,11 +284,11 @@ def coinbase_summary(con: duckdb.DuckDBPyConnection, manifest: dict[str, Any]) -
     return pd.DataFrame([{"metric": key, "value": value, "note": ""} for key, value in row.items()])
 
 
-def bucketed_top(con: duckdb.DuckDBPyConnection, bucket_sec: int) -> pd.DataFrame:
-    if not table_exists(con, "ws_orderbook_top"):
+def bucketed_top(con: duckdb.DuckDBPyConnection, top_table: str, bucket_sec: int) -> pd.DataFrame:
+    if not table_exists(con, top_table):
         return pd.DataFrame()
     return con.execute(
-        """
+        f"""
         WITH base AS (
             SELECT market_ticker,
                    event_ticker,
@@ -253,7 +298,7 @@ def bucketed_top(con: duckdb.DuckDBPyConnection, bucket_sec: int) -> pd.DataFram
                    (no_bid + no_ask) / 2.0 AS no_mid,
                    (yes_ask - yes_bid) * 100.0 AS spread_cents,
                    btc_spot
-            FROM ws_orderbook_top
+            FROM {top_table}
             WHERE TRY_CAST(received_at_utc AS TIMESTAMPTZ) IS NOT NULL
               AND market_ticker IS NOT NULL
         ),
@@ -277,11 +322,13 @@ def bucketed_top(con: duckdb.DuckDBPyConnection, bucket_sec: int) -> pd.DataFram
 def parity_summary(
     main_con: duckdb.DuckDBPyConnection,
     compare_con: duckdb.DuckDBPyConnection,
+    main_tables: dict[str, str],
+    compare_tables: dict[str, str],
     bucket_sec: int,
     tolerance_cents: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    left = bucketed_top(main_con, bucket_sec)
-    right = bucketed_top(compare_con, bucket_sec)
+    left = bucketed_top(main_con, main_tables.get("ws_orderbook_top", "ws_orderbook_top"), bucket_sec)
+    right = bucketed_top(compare_con, compare_tables.get("ws_orderbook_top", "ws_orderbook_top"), bucket_sec)
     if left.empty or right.empty:
         return pd.DataFrame([{"metric": "parity_available", "value": False}]), pd.DataFrame()
     merged = left.merge(
@@ -337,11 +384,16 @@ def verdict(
     cb = dict(zip(coinbase_df["metric"].astype(str), coinbase_df["value"])) if not coinbase_df.empty else {}
     compare = dict(zip(compare_df["metric"].astype(str), compare_df["value"])) if not compare_df.empty else {}
     hard_failures = []
+    filterable_failures = []
     for metric in [
         "null_received_at_utc",
         "null_received_at_ns",
         "null_market_ticker",
         "null_event_ticker",
+    ]:
+        if float(q.get(metric) or 0) > 0:
+            hard_failures.append(metric)
+    for metric in [
         "null_book_fields",
         "price_out_of_range",
         "crossed_yes_book",
@@ -350,7 +402,7 @@ def verdict(
         "implausible_btc_spot",
     ]:
         if float(q.get(metric) or 0) > 0:
-            hard_failures.append(metric)
+            filterable_failures.append(metric)
     if float(gaps.get("gaps_over_threshold") or 0) > 0:
         hard_failures.append("top_book_gaps_over_threshold")
     notes = []
@@ -359,13 +411,24 @@ def verdict(
     if compare and compare.get("parity_available") is True:
         if float(compare.get("main_match_rate") or 0.0) < 0.8:
             notes.append("independent capture bucket match rate below 80%")
+    valid_book_rows = int(float(q.get("valid_book_rows") or 0))
+    filtered_top_book_research_grade = len(hard_failures) == 0 and valid_book_rows > 0
+    raw_top_book_clean = (
+        len(hard_failures) == 0
+        and len(filterable_failures) == 0
+        and int(q.get("rows") or 0) > 0
+    )
     return pd.DataFrame(
         [
             {
-                "top_book_research_grade": len(hard_failures) == 0 and int(q.get("rows") or 0) > 0,
+                "top_book_research_grade": raw_top_book_clean,
+                "filtered_top_book_research_grade": filtered_top_book_research_grade,
                 "promotion_grade_coinbase_ticks": not bool(manifest.get("synthetic_coinbase_from_top", False))
                 and table_bool(cb.get("coinbase_ticker_exists", True)),
                 "hard_failures": ";".join(hard_failures),
+                "filterable_failures": ";".join(filterable_failures),
+                "valid_book_rows": valid_book_rows,
+                "valid_book_rate": float(q.get("valid_book_rate") or 0.0),
                 "notes": "; ".join(notes),
             }
         ]
@@ -385,11 +448,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     manifest = manifest_for(args.capture_db)
     con = connect(args.capture_db)
     try:
-        counts = table_counts(con)
-        quote = quote_invariants(con)
-        gaps, worst_gaps = gap_summary(con, args.gap_sec)
-        lifecycle = lifecycle_counts(con)
-        coinbase = coinbase_summary(con, manifest)
+        audit_tables = create_audit_tables(con, args.start_utc, args.end_utc)
+        counts = table_counts(con, audit_tables)
+        quote = quote_invariants(con, audit_tables.get("ws_orderbook_top", "ws_orderbook_top"))
+        gaps, worst_gaps = gap_summary(con, audit_tables.get("ws_orderbook_top", "ws_orderbook_top"), args.gap_sec)
+        lifecycle = lifecycle_counts(con, audit_tables.get("ws_lifecycle", "ws_lifecycle"))
+        coinbase = coinbase_summary(con, manifest, audit_tables.get("coinbase_ticker", "coinbase_ticker"))
         parity = pd.DataFrame()
         parity_worst = pd.DataFrame()
         compare_manifest: dict[str, Any] = {}
@@ -397,7 +461,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             compare_manifest = manifest_for(args.compare_db)
             compare_con = connect(args.compare_db)
             try:
-                parity, parity_worst = parity_summary(con, compare_con, args.bucket_sec, args.price_tolerance_cents)
+                compare_tables = create_audit_tables(compare_con, args.start_utc, args.end_utc)
+                parity, parity_worst = parity_summary(
+                    con,
+                    compare_con,
+                    audit_tables,
+                    compare_tables,
+                    args.bucket_sec,
+                    args.price_tolerance_cents,
+                )
             finally:
                 compare_con.close()
         verdict_df = verdict(quote, gaps, coinbase, manifest, parity)
@@ -420,6 +492,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "capture_db": str(args.capture_db),
         "compare_db": str(args.compare_db) if args.compare_db else "",
+        "start_utc": args.start_utc or "",
+        "end_utc": args.end_utc or "",
         "bucket_sec": args.bucket_sec,
         "gap_sec": args.gap_sec,
         "price_tolerance_cents": args.price_tolerance_cents,
@@ -434,6 +508,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         f"Generated: `{info['created_at_utc']}`",
         f"Capture DB: `{args.capture_db}`",
         f"Compare DB: `{args.compare_db or ''}`",
+        f"Window: `{args.start_utc or ''}` -> `{args.end_utc or ''}`",
         "",
         "## Verdict",
         "",

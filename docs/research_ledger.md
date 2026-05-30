@@ -14777,3 +14777,73 @@ artifacts:
   raw websocket archive and not promotion-grade BTC tick-age replay while the
   sidecar path relies on synthetic Coinbase ticks. The newest official-settled
   slice is negative for cheap-tail variants and has no lowdd trades.
+
+### 2026-05-30 - Full raw DuckDB snapshot, real Coinbase replay, and first clean lowdd fill
+
+- Briefly paused only the raw BTC15M capture to obtain a full DuckDB snapshot;
+  lowdd remained running. Snapshot:
+  `runtime\duckdb_snapshots\raw_btc15m_full_20260530_071126\btc15m_live_capture.duckdb`
+  plus `.wal`, stored only under remote ignored `runtime/`. The pause/copy
+  sequence copied `2,074,095,616` bytes of main DB plus `14,184,717` bytes of
+  WAL. Raw capture was restarted under scheduled task
+  `\KalshiBTC_btc15m_live_capture` after the direct SSH child launch proved
+  non-persistent.
+- Verified raw capture recovery at `2026-05-30T07:32:04Z`: PID `6084`,
+  launcher PID `3752`, `failed=false`, `dropped=0`, queue depth `0`,
+  `ws_orderbook_top=17,007,662`, `ws_lifecycle=1,287,103`,
+  `coinbase_ticker=201,804`, latest top-book row
+  `2026-05-30T07:32:02.482783Z`.
+- Patched `scripts/backtest_btc15m_live_holdout.py` so snapshot copying also
+  copies a sibling `.duckdb.wal` when present. This prevents stopped/full
+  snapshots from silently losing the most recent uncheckpointed rows.
+- Added bounded-window support to `scripts/audit_btc15m_sidecar_fidelity.py`
+  via `--start-utc` / `--end-utc` and separated raw-clean verdicts from
+  filtered-top-book replay verdicts.
+- Full raw DuckDB fidelity audit on
+  `2026-05-30T06:00:00Z..07:00:00Z`, compared against the independent lowdd
+  capture in `5s` buckets:
+  - `92,718` raw top-book rows, `4,513` lifecycle rows, `968` real
+    `coinbase_ticker` rows, `117` capture-health rows;
+  - `0` timestamp/null ticker errors, `0` price out-of-range rows, `0`
+    negative quantities, and `0` top-book gaps over `120s`;
+  - `195` rows with null book fields, `340` crossed YES-book rows, and `322`
+    crossed NO-book rows, leaving `92,166 / 92,718` valid top-book rows
+    (`99.4046%`);
+  - audit verdict: raw table is not perfectly clean, but
+    `filtered_top_book_research_grade=true` and
+    `promotion_grade_coinbase_ticks=true`;
+  - independent-capture parity matched `586 / 654` raw buckets and
+    `586 / 608` lowdd buckets; `94.01%` of matched buckets were within `1c`
+    YES-mid, p95 difference `1c`.
+- Official-settled replay on the full raw DuckDB snapshot with real Coinbase
+  ticks for `2026-05-30T06:00:00Z..07:00:00Z`:
+  - `cheap_yes_rr_first`: `2` trades, PnL `-$0.340`;
+  - `cheap_no_rr_first`: `2` trades, PnL `-$0.135`;
+  - `cheap_tail_best_side_first`: `4` trades, PnL `-$0.475`;
+  - `cheap_tail_position_aware`: `4` trades, PnL `-$0.475`;
+  - `cheap_pair_lock_rr`: `0` trades;
+  - `current_lowdd_no_rv`: `0` trades.
+  The sidecar-derived replay for the same window produced the same strategy
+  summary, so synthetic BTC ticks did not change this window's decisions.
+- Lowdd forward shadow produced the first clean post-restart paper fill:
+  `KXBTC15M-26MAY300330-30`, `yes`, `7` contracts at `0.55`, quote age
+  `3.0025ms`, visible quantity `154`, created
+  `2026-05-30T07:25:01.391998Z`. The sidecar showed the selected signal at
+  `2026-05-30T07:24:59.995431Z` and the order decision
+  `paper_fill/filled` at `2026-05-30T07:25:01.599934Z` with
+  `portfolio_available=96.16`; the old `sizing_budget_or_liquidity_zero`
+  blocker did not recur.
+- Kalshi REST official settlement for that lowdd row was `result=yes`,
+  `expiration_value=73474.24`, finalized. Official paper PnL for the row:
+  win, `+$3.02` after the recorded `$0.13` fee on `$3.98` premium.
+- Validation:
+  `python -m py_compile scripts\audit_btc15m_sidecar_fidelity.py scripts\test_btc15m_sidecar_fidelity.py scripts\backtest_btc15m_live_holdout.py scripts\test_btc15m_live_holdout.py`
+  and
+  `python -m pytest scripts\test_btc15m_live_holdout.py scripts\test_btc15m_sidecar_fidelity.py -q --basetemp .pytest-codex-tmp-btc15m-fidelity`
+  passed with `4 passed`.
+- Interpretation:
+  the raw DuckDB now supports promotion-grade Coinbase tick-age replay for
+  paused snapshots, after filtering invalid/crossed top-book rows. The latest
+  full-snapshot strategy window is negative for cheap-tail variants. Lowdd has
+  one clean post-restart official-settled win; keep collecting, but do not
+  promote from a single row.

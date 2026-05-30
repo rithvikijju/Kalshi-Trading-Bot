@@ -62,10 +62,16 @@ def snapshot_capture_db(source: Path, target: Path, attempts: int = 120, sleep_s
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         target.unlink()
+    target_wal = Path(str(target) + ".wal")
+    if target_wal.exists():
+        target_wal.unlink()
+    source_wal = Path(str(source) + ".wal")
     last_exc: Exception | None = None
     for _ in range(attempts):
         try:
             shutil.copy2(source, target)
+            if source_wal.exists():
+                shutil.copy2(source_wal, target_wal)
             return target
         except (OSError, PermissionError) as exc:
             last_exc = exc

@@ -1,7 +1,7 @@
 import pytest
 import pandas as pd
 
-from scripts.backtest_btc15m_live_holdout import enrich
+from scripts.backtest_btc15m_live_holdout import enrich, snapshot_capture_db
 
 
 def test_enrich_filters_crossed_top_book_rows():
@@ -66,3 +66,16 @@ def test_enrich_filters_crossed_top_book_rows():
 
     assert enriched["received_at_ns"].tolist() == [120_000_000_000]
     assert enriched["spread_cents"].tolist() == pytest.approx([1.0])
+
+
+def test_snapshot_capture_db_copies_wal(tmp_path):
+    source = tmp_path / "source.duckdb"
+    source_wal = tmp_path / "source.duckdb.wal"
+    target = tmp_path / "nested" / "target.duckdb"
+    source.write_bytes(b"duckdb-main")
+    source_wal.write_bytes(b"duckdb-wal")
+
+    snapshot_capture_db(source, target)
+
+    assert target.read_bytes() == b"duckdb-main"
+    assert (tmp_path / "nested" / "target.duckdb.wal").read_bytes() == b"duckdb-wal"
