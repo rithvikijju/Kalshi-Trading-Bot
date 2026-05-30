@@ -15708,3 +15708,59 @@ artifacts:
   replace lifecycle `determined` parsing with official REST settlement or
   settled-event parsing, and redesign the market model for BTC15M up/down
   binaries rather than cumulative strike (`-T`) markets.
+
+### 2026-05-30 - BTC15M diagnostic candidate quality and robustness refresh
+
+- Tightened `scripts\audit_btc15m_replay_candidate_robustness.py` so candidate
+  summaries now include row-quality gates before any "promising" verdict:
+  official result rows, executable quote rows, non-executable quote rows,
+  duplicate event rows, observed spread/visible quantity, and
+  `row_quality_blockers`.
+- Row-quality semantics:
+  a candidate is rejected before bootstrap if it lacks official settlement,
+  has duplicate event exposure, lacks executable quote fields, has visible
+  quantity below `1`, has entry outside `[1c, 99c]`, or has spread above
+  `3.0c`. The spread/entry comparisons include a tiny float tolerance so exact
+  `3.0c` and `99c` rows are not rejected due to representation noise.
+- Validation:
+  `python -m pytest scripts\test_btc15m_replay_candidate_robustness.py -q --basetemp .pytest-codex-tmp-btc15m-robustness-quality`
+  passed with `6` tests. `python -m py_compile
+  scripts\audit_btc15m_replay_candidate_robustness.py
+  scripts\test_btc15m_replay_candidate_robustness.py` also passed before the
+  final report-text-only tweak; the post-tweak test rerun passed again.
+- Built a rolling window grid for the latest materialized raw capture:
+  `backtest_outputs\btc15m_live_holdout_window_grid_20260530_0640_1012`.
+  Input:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1012\btc15m_raw_20260530_0640_1012.duckdb`,
+  window `2026-05-30T06:40:00Z..2026-05-30T10:12:00Z`,
+  `1h` windows, `1h` step. This produced `4` windows. Because each window is
+  scored independently, boundary-sensitive features can make the aggregate
+  trade count differ slightly from the whole-window replay; use it as
+  stability evidence, not as the canonical PnL ledger.
+- Fresh strict robustness artifact:
+  `backtest_outputs\btc15m_replay_candidate_robustness_20260530_1012_quality`.
+  All replay rows had official settlement, executable quote rows, and no
+  duplicate event exposure under the `<=3c` spread / `>=1` visible quantity
+  gate.
+- Results:
+  - `current_lowdd_no_rv`: `6` trades, official replay PnL `+$1.49`,
+    return on premium `42.4501%`, win rate `83.3333%`, max drawdown `-$0.25`,
+    bootstrap p05 `+$0.35`, bootstrap profit probability `99.16%`,
+    `3 / 4` positive rolling windows, verdict
+    `research_promising_insufficient_sample`.
+  - `cheap_yes_rr_first`: `11` trades, PnL `+$1.019`, return on premium
+    `25.5966%`, win rate `45.4545%`, max drawdown `-$1.10`, bootstrap p05
+    `-$1.64905`, bootstrap profit probability `73.36%`, `2 / 4` positive
+    windows, verdict
+    `research_promising_insufficient_sample_bootstrap_fragile`.
+  - `cheap_pair_lock_rr`: `6` rows, `+$0.24`, `100%` win rate, bootstrap p05
+    `+$0.08`, but verdict remains
+    `excluded_by_prior_selection_bias_audit`.
+  - `cheap_tail_best_side_first`, `cheap_tail_position_aware`, and
+    `cheap_no_rr_first` were official-PnL negative and rejected.
+- Interpretation:
+  this stricter pass removes `cheap_yes_rr_first` from near-term forward-test
+  consideration despite positive headline PnL; it is sample-small, bootstrap
+  fragile, and window-unstable. Lowdd remains the only quality-clean positive
+  BTC15M replay candidate in the latest slice, but it is still not deployable
+  because its official/paper-forward sample is only `6` rows.

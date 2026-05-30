@@ -30,6 +30,10 @@ def test_audit_dataset_marks_small_positive_sample_research_only(tmp_path):
             {"strategy": "current_lowdd_no_rv", "event_ticker": "C", "received_at_utc": "2026-05-30T00:30:00Z", "pnl": 0.4, "premium": 0.6},
         ]
     )
+    trades["result"] = ["yes", "no", "yes"]
+    trades["visible_qty"] = [10, 10, 10]
+    trades["spread_cents"] = [1, 1, 1]
+    trades["entry_price"] = [0.5, 0.5, 0.5]
     path = tmp_path / "trades.csv"
     trades.to_csv(path, index=False)
 
@@ -45,6 +49,7 @@ def test_audit_dataset_marks_small_positive_sample_research_only(tmp_path):
     assert len(rows) == 1
     assert rows[0]["pnl"] == pytest.approx(0.8)
     assert rows[0]["trades"] == 3
+    assert rows[0]["row_quality_blockers"] == ""
     assert rows[0]["verdict"] == "research_promising_insufficient_sample"
 
 
@@ -56,6 +61,10 @@ def test_small_positive_sample_reports_bootstrap_fragility_when_ci_crosses_zero(
             {"strategy": "cheap_yes_rr_first", "event_ticker": "C", "received_at_utc": "2026-05-30T00:30:00Z", "pnl": 0.1, "premium": 0.1},
         ]
     )
+    trades["result"] = ["yes", "no", "yes"]
+    trades["visible_qty"] = [10, 10, 10]
+    trades["spread_cents"] = [1, 1, 1]
+    trades["entry_price"] = [0.5, 0.5, 0.5]
     path = tmp_path / "trades.csv"
     trades.to_csv(path, index=False)
 
@@ -71,6 +80,35 @@ def test_small_positive_sample_reports_bootstrap_fragility_when_ci_crosses_zero(
     assert rows[0]["pnl"] > 0
     assert rows[0]["bootstrap_pnl_p05"] <= 0
     assert rows[0]["verdict"] == "research_promising_insufficient_sample_bootstrap_fragile"
+
+
+def test_row_quality_rejects_missing_official_and_executable_fields(tmp_path):
+    trades = pd.DataFrame(
+        [
+            {
+                "strategy": "cheap_yes_rr_first",
+                "event_ticker": "A",
+                "received_at_utc": "2026-05-30T00:00:00Z",
+                "pnl": 1.0,
+                "premium": 1.0,
+            }
+        ]
+    )
+    path = tmp_path / "trades.csv"
+    trades.to_csv(path, index=False)
+
+    rows = audit_dataset(
+        DatasetSpec("sample", path),
+        iters=100,
+        seed=3,
+        min_trades=10,
+        min_prob=0.95,
+        excluded=set(),
+    )
+
+    assert "missing_official_result_column" in rows[0]["row_quality_blockers"]
+    assert "missing_executable_quote_fields" in rows[0]["row_quality_blockers"]
+    assert rows[0]["verdict"] == "reject_execution_or_settlement_quality"
 
 
 def test_verdict_excludes_prior_rejected_pair_lock():

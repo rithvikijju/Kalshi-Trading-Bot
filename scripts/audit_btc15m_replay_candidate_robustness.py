@@ -52,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260530)
     parser.add_argument("--min-trades", type=int, default=50)
     parser.add_argument("--min-bootstrap-profit-prob", type=float, default=0.95)
+    parser.add_argument("--min-visible-qty", type=float, default=1.0)
+    parser.add_argument("--max-spread-cents", type=float, default=3.0)
     parser.add_argument("--excluded-strategy", action="append", default=sorted(DEFAULT_EXCLUDED))
     return parser.parse_args()
 
@@ -72,6 +74,18 @@ def load_trades(path: Path) -> pd.DataFrame:
         df["received_at_utc"] = pd.to_datetime(df["received_at_utc"], utc=True, errors="coerce")
     else:
         df["received_at_utc"] = pd.NaT
+    for col in ["result", "status", "event_ticker"]:
+        df[f"_had_{col}_column"] = col in df.columns
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+        else:
+            df[col] = ""
+    for col in ["visible_qty", "spread_cents", "entry_price"]:
+        df[f"_had_{col}_column"] = col in df.columns
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
     return df
 
 
@@ -145,9 +159,81 @@ def window_metrics(window_summary: pd.DataFrame, strategy: str) -> dict[str, Any
     }
 
 
+def row_quality_metrics(subset: pd.DataFrame, min_visible_qty: float, max_spread_cents: float) -> dict[str, Any]:
+    trades = int(len(subset))
+    if trades == 0:
+        return {
+            "official_settled_rows": 0,
+            "duplicate_event_rows": 0,
+            "executable_quote_rows": 0,
+            "non_executable_quote_rows": 0,
+            "max_spread_cents_observed": 0.0,
+            "min_visible_qty_observed": 0.0,
+            "row_quality_blockers": "",
+        }
+
+    blockers: list[str] = []
+    had_result = bool(subset["_had_result_column"].all()) if "_had_result_column" in subset.columns else False
+    had_event = bool(subset["_had_event_ticker_column"].all()) if "_had_event_ticker_column" in subset.columns else False
+    had_visible = bool(subset["_had_visible_qty_column"].all()) if "_had_visible_qty_column" in subset.columns else False
+    had_spread = bool(subset["_had_spread_cents_column"].all()) if "_had_spread_cents_column" in subset.columns else False
+    had_entry = bool(subset["_had_entry_price_column"].all()) if "_had_entry_price_column" in subset.columns else False
+
+    if had_result:
+        official_settled = int(subset["result"].str.lower().isin(["yes", "no"]).sum())
+        if official_settled != trades:
+            blockers.append("unsettled_or_missing_official_result")
+    else:
+        official_settled = 0
+        blockers.append("missing_official_result_column")
+
+    if had_event:
+        duplicate_event_rows = trades - int(subset["event_ticker"].astype(str).nunique())
+        if duplicate_event_rows > 0:
+            blockers.append("duplicate_event_rows")
+    else:
+        duplicate_event_rows = 0
+        blockers.append("missing_event_ticker_column")
+
+    if had_visible and had_spread and had_entry:
+        visible = pd.to_numeric(subset["visible_qty"], errors="coerce")
+        spread = pd.to_numeric(subset["spread_cents"], errors="coerce")
+        entry = pd.to_numeric(subset["entry_price"], errors="coerce")
+        executable_mask = (
+            visible.ge(float(min_visible_qty) - 1e-9)
+            & spread.le(float(max_spread_cents) + 1e-9)
+            & entry.ge(0.01 - 1e-9)
+            & entry.le(0.99 + 1e-9)
+        )
+        executable_rows = int(executable_mask.sum())
+        non_executable_rows = trades - executable_rows
+        max_spread = float(spread.max()) if spread.notna().any() else 0.0
+        min_visible = float(visible.min()) if visible.notna().any() else 0.0
+        if non_executable_rows > 0:
+            blockers.append("non_executable_or_wide_quote_rows")
+    else:
+        executable_rows = 0
+        non_executable_rows = trades
+        max_spread = 0.0
+        min_visible = 0.0
+        blockers.append("missing_executable_quote_fields")
+
+    return {
+        "official_settled_rows": official_settled,
+        "duplicate_event_rows": duplicate_event_rows,
+        "executable_quote_rows": executable_rows,
+        "non_executable_quote_rows": non_executable_rows,
+        "max_spread_cents_observed": max_spread,
+        "min_visible_qty_observed": min_visible,
+        "row_quality_blockers": ";".join(sorted(set(blockers))),
+    }
+
+
 def robustness_verdict(row: dict[str, Any], min_trades: int, min_prob: float, excluded: set[str]) -> str:
     if row["strategy"] in excluded:
         return "excluded_by_prior_selection_bias_audit"
+    if row.get("row_quality_blockers"):
+        return "reject_execution_or_settlement_quality"
     if row["trades"] == 0:
         return "no_trades"
     if row["pnl"] <= 0:
@@ -173,6 +259,8 @@ def summarize_strategy(
     min_trades: int,
     min_prob: float,
     excluded: set[str],
+    min_visible_qty: float,
+    max_spread_cents: float,
 ) -> dict[str, Any]:
     subset = trades[trades["strategy"].eq(strategy)].copy()
     subset = subset.sort_values([c for c in ["received_at_utc", "event_ticker", "side"] if c in subset.columns])
@@ -194,6 +282,7 @@ def summarize_strategy(
     }
     row.update(bootstrap_pnl(pnl_series.to_numpy(dtype=float), iters, rng))
     row.update(window_metrics(window_summary, strategy))
+    row.update(row_quality_metrics(subset, min_visible_qty, max_spread_cents))
     row["verdict"] = robustness_verdict(row, min_trades, min_prob, excluded)
     return row
 
@@ -205,6 +294,8 @@ def audit_dataset(
     min_trades: int,
     min_prob: float,
     excluded: set[str],
+    min_visible_qty: float = 1.0,
+    max_spread_cents: float = 3.0,
 ) -> list[dict[str, Any]]:
     trades = load_trades(spec.trades_path)
     windows = load_window_summary(spec.window_summary_path)
@@ -212,7 +303,21 @@ def audit_dataset(
     rows = []
     for idx, strategy in enumerate(strategies):
         rng = np.random.default_rng(seed + idx)
-        rows.append(summarize_strategy(spec.label, trades, windows, strategy, rng, iters, min_trades, min_prob, excluded))
+        rows.append(
+            summarize_strategy(
+                spec.label,
+                trades,
+                windows,
+                strategy,
+                rng,
+                iters,
+                min_trades,
+                min_prob,
+                excluded,
+                min_visible_qty,
+                max_spread_cents,
+            )
+        )
     return rows
 
 
@@ -236,6 +341,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 min_trades=args.min_trades,
                 min_prob=args.min_bootstrap_profit_prob,
                 excluded=excluded,
+                min_visible_qty=args.min_visible_qty,
+                max_spread_cents=args.max_spread_cents,
             )
         )
     summary = pd.DataFrame(rows)
@@ -254,6 +361,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "seed": args.seed,
         "min_trades": args.min_trades,
         "min_bootstrap_profit_prob": args.min_bootstrap_profit_prob,
+        "min_visible_qty": args.min_visible_qty,
+        "max_spread_cents": args.max_spread_cents,
         "excluded_strategy": sorted(excluded),
     }
     (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -265,6 +374,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "return_on_premium",
         "win_rate",
         "max_dd",
+        "official_settled_rows",
+        "executable_quote_rows",
+        "non_executable_quote_rows",
+        "duplicate_event_rows",
+        "row_quality_blockers",
         "bootstrap_pnl_p05",
         "bootstrap_prob_profit",
         "windows",
@@ -283,7 +397,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "",
         "## Gate Meaning",
         "",
-        "A positive replay candidate remains research-only when it lacks enough trades, has a non-positive 5th-percentile trade-bootstrap PnL, or shows unstable rolling windows. Excluded strategies were rejected by separate causal/execution audits.",
+        "A positive replay candidate remains research-only when it lacks enough trades, has a non-positive 5th-percentile trade-bootstrap PnL, shows unstable rolling windows, or fails official-settlement / one-event / executable-quote row-quality checks. Excluded strategies were rejected by separate causal/execution audits.",
     ]
     (args.out_dir / "report.md").write_text("\n".join(report), encoding="utf-8")
     return {"out_dir": str(args.out_dir), "rows": len(summary)}
