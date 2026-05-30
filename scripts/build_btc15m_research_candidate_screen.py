@@ -427,6 +427,55 @@ def screen_ml(root: Path, min_official_rows: int) -> list[dict[str, Any]]:
     return rows
 
 
+def screen_ml_remote_sidecar(root: Path) -> list[dict[str, Any]]:
+    out_dir = latest_dir(root, "btc15m_ml_sidecar_remote_raw_score_*")
+    summary = read_json(out_dir / "ml_sidecar_remote_score_summary.json" if out_dir else None)
+    if not summary:
+        return []
+
+    blockers = clean_text(summary.get("blockers"))
+    proxy_rows = as_int(summary.get("proxy_rows"))
+    official_rows = as_int(summary.get("official_rows"))
+    proxy_pnl = as_float(summary.get("proxy_pnl_2c"))
+    official_pnl = as_float(summary.get("official_pnl_2c"))
+    if proxy_rows == 0:
+        status = "forward_raw_metric_no_selection"
+        action = "score_later_raw_capture_snapshot;do_not_start_ordering_shadow"
+    elif blockers:
+        status = "forward_raw_metric_collect_more"
+        action = "score_later_raw_capture_snapshot;do_not_start_ordering_shadow"
+    else:
+        status = "forward_raw_metric_ready_for_review_not_deployment"
+        action = "run_manual_review_before_any_paper_ordering"
+
+    return [
+        row(
+            "btc15m_lightgbm_tabular_nontrading_sidecar",
+            "ml_sidecar_forward",
+            "remote_raw_ml_sidecar_score",
+            out_dir,
+            status,
+            action,
+            deployable_now=False,
+            can_start_new_forward=False,
+            trades=proxy_rows,
+            official_rows=official_rows,
+            pnl=proxy_pnl,
+            premium=as_float(summary.get("proxy_premium")),
+            max_dd=as_float(summary.get("proxy_max_drawdown")),
+            win_rate=as_float(summary.get("proxy_win_rate_pct")) / 100.0,
+            blockers=blockers,
+            notes=(
+                f"candidate_rows={summary.get('candidate_rows')};"
+                f"candidate_events={summary.get('candidate_events')};"
+                f"official_pnl_2c={official_pnl};"
+                f"window={summary.get('start_utc')}..{summary.get('end_utc')};"
+                f"advisories={summary.get('advisories')}"
+            ),
+        )
+    ]
+
+
 def screen_v2(root: Path, min_official_rows: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     robustness_dirs = all_dirs(root, "btc15m_v2_binary_adapter_robustness_*")
@@ -525,6 +574,7 @@ def build_report(screen: pd.DataFrame, info: dict[str, Any]) -> str:
             [
                 "btc15m_lowdd_current_wrapper",
                 "ml_lightgbm_tabular",
+                "btc15m_lightgbm_tabular_nontrading_sidecar",
                 "ml_xgboost_tabular",
                 "branch_inventory",
             ]
@@ -540,7 +590,7 @@ def build_report(screen: pd.DataFrame, info: dict[str, Any]) -> str:
         f"- Deployable candidates now: `{deployable}`.",
         "- Keep the raw collector and lowdd forward shadow running; lowdd is positive but still below the official/parity sample gate.",
         "- Do not start a new trading or paper-ordering shadow from the current branch/regime/ML/v2 evidence.",
-        "- `lightgbm_tabular` is the only non-lowdd item worth freezing as a non-trading diagnostic sidecar metric, because it has clean rows and positive proxy plus tiny official-subset PnL. It is not tradeable evidence.",
+        "- `lightgbm_tabular` is frozen only as a non-trading diagnostic metric; the latest remote raw score selected zero trades, so it is not a paper-ordering candidate.",
         "",
         "## Priority Rows",
         "",
@@ -593,6 +643,7 @@ def main() -> int:
     rows.extend(screen_walkforward(root))
     rows.extend(screen_regime(root, args.min_official_rows))
     rows.extend(screen_ml(root, args.min_official_rows))
+    rows.extend(screen_ml_remote_sidecar(root))
     rows.extend(screen_v2(root, args.min_official_rows))
     screen = pd.DataFrame(rows)
     if not screen.empty:

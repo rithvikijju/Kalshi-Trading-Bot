@@ -16777,3 +16777,31 @@ artifacts:
   `python -m py_compile scripts\score_btc15m_ml_sidecar_remote_raw.py scripts\test_score_btc15m_ml_sidecar_remote_raw.py`
   passed. `python -m pytest scripts\test_score_btc15m_ml_sidecar_remote_raw.py -q --basetemp .pytest-codex-tmp-ml-remote-score-2`
   passed with `3` tests.
+
+### 2026-05-30 - Candidate screen includes forward raw ML sidecar evidence
+
+- Updated `scripts\build_btc15m_research_candidate_screen.py` so the latest
+  `btc15m_ml_sidecar_remote_raw_score_*` artifact is included as a first-class
+  `ml_sidecar_forward` row. This prevents the older positive full-raw
+  `lightgbm_tabular` diagnostic from being misread as current permission to
+  start a paper-ordering shadow.
+- Fresh screen artifact:
+  `backtest_outputs\btc15m_research_candidate_screen_20260530_1245`.
+  It screened `44` rows and again found `0` deployable candidates.
+- Priority result:
+  `btc15m_lowdd_current_wrapper` remains the only active forward path:
+  `10` official/parity rows, official PnL `+$26.96`, still blocked by the
+  `50`-row selected/order/paper official sample gates. The screen action is
+  still to keep raw capture and lowdd running.
+- ML sidecar result:
+  `btc15m_lightgbm_tabular_nontrading_sidecar` now appears in the priority
+  table with status `forward_raw_metric_no_selection`, `0` proxy rows,
+  `0` official rows, and blockers
+  `no_selected_proxy_rows;clean_proxy_rows_below_min;official_rows_below_min`.
+  The action is
+  `score_later_raw_capture_snapshot;do_not_start_ordering_shadow`.
+- Validation:
+  `python scripts\build_btc15m_research_candidate_screen.py --out-dir backtest_outputs\btc15m_research_candidate_screen_20260530_1245`
+  ran successfully. `python -m py_compile scripts\build_btc15m_research_candidate_screen.py scripts\test_btc15m_research_candidate_screen.py`
+  passed. `python -m pytest scripts\test_btc15m_research_candidate_screen.py -q --basetemp .pytest-codex-tmp-candidate-screen`
+  passed with `1` test.
