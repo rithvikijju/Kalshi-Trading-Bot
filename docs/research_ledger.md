@@ -16403,3 +16403,59 @@ artifacts:
   next step is to keep the raw collector and lowdd paper-forward collection
   running and to treat the `btc3_3_6bps` filter as a future, preregistered
   sidecar metric rather than a promoted trading rule.
+
+### 2026-05-30 - Full raw walk-forward filter audit
+
+- Added a reproducible chronological walk-forward audit:
+  `scripts\audit_btc15m_live_replay_walkforward_filters.py`, with regression
+  coverage in `scripts\test_btc15m_live_replay_walkforward_filters.py`.
+  The audit consumes replay `all_trades.csv` artifacts, creates simple
+  decision-time feature bins, selects filters only on train folds, scores the
+  next chronological test fold, and carries event-bootstrap and row-quality
+  blockers into the aggregate output. It explicitly flags duplicate-event rows,
+  non-executable or wide-quote rows, and pair-lock/position-aware rows.
+- Lead lowdd artifact:
+  `backtest_outputs\btc15m_live_replay_walkforward_filters_20260522_0530_1300`.
+  Input quality was clean: `310` rows, `310` events, `0` duplicate events,
+  `0` nonfinal rows, `0` non-executable or wide-quote rows, and `0` pair-lock
+  rows.
+- Lowdd strict walk-forward setup:
+  4-day expanding train window, 24-hour test window, 24-hour step,
+  `min_train_rows=40`, train event-bootstrap p05 `> 0`, and train profit
+  probability `>= 90%`. The late-period unfiltered baseline had `157` OOS
+  rows for PnL `+$7.49`, return on premium `+7.60%`, win rate `67.52%`, and
+  profit probability `93.28%`, but event-bootstrap p05 was still negative at
+  `-$0.6205`.
+- Lowdd train-selected filters failed OOS: `28` adaptive-selected OOS rows,
+  PnL `-$0.37`, return on premium `-2.01%`, event-bootstrap p05 `-$3.63`,
+  and profit probability `43.48%`. The fixed preregistration candidate
+  `btc3_abs_bin=btc3_3_6bps` was positive but weak: `41` OOS rows, PnL
+  `+$1.17`, return on premium `+4.36%`, event-bootstrap p05 `-$2.73`, and
+  profit probability `69.96%`.
+- Sensitivity artifact:
+  `backtest_outputs\btc15m_live_replay_walkforward_filters_20260522_0530_1300_min30`.
+  Reducing the train row screen to `30` did not rescue the result:
+  adaptive-selected OOS was `39` rows, PnL `+$0.59`, but event-bootstrap p05
+  stayed negative at `-$3.3905` and profit probability was only `60.14%`.
+- Other non-excluded replay strategies were screened with the same audit at
+  `min_train_rows=80`:
+  `cheap_yes_rr_first`, `cheap_no_rr_first`, and
+  `cheap_tail_best_side_first` selected no eligible adaptive OOS filters and
+  their baseline OOS rows remained negative. `cheap_tail_position_aware`
+  produced a superficially strong adaptive OOS row (`174` rows, PnL `+$11.956`,
+  event-bootstrap p05 `+$10.1238`, profit probability `100%`), but every
+  selected row was a pair-lock/position-aware row and the aggregate also had
+  duplicate-event and non-executable/wide-quote blockers. That path remains
+  excluded as execution/selection-bias research, not strategy edge.
+- Validation:
+  `python -m py_compile scripts\audit_btc15m_live_replay_walkforward_filters.py scripts\test_btc15m_live_replay_walkforward_filters.py`
+  passed, and
+  `python -m pytest scripts\test_btc15m_live_replay_walkforward_filters.py -q --basetemp .pytest-codex-tmp-btc15m-walkforward-filter`
+  passed with `5` tests.
+- Interpretation:
+  the stronger walk-forward audit lowers confidence in the clean lowdd subfilter
+  idea. There is still a mild late-window positive drift in the unfiltered lowdd
+  policy, so continued forward collection is justified, but no new live policy
+  or shadow should be promoted from these filters. If pair-lock economics are
+  ever revisited, they need a separate simultaneous two-leg FOK execution audit
+  and should not be mixed into directional BTC15M strategy evidence.
