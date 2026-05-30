@@ -8,6 +8,8 @@ import unittest
 import pandas as pd
 
 from scripts.build_btc_gpt_pro_action_status import (
+    btc1h_candidate_promotion_deficit_gate_summary,
+    btc1h_remote_provenance_gate_summary,
     candidate_row,
     execution_realism_gate_summary,
     process_hygiene_gate_summary,
@@ -185,6 +187,49 @@ class BtcGptProActionStatusTests(unittest.TestCase):
         self.assertTrue(summary["passes"])
         self.assertEqual(summary["status"], "REVIEW_REQUIRED")
 
+    def test_btc1h_remote_provenance_gate_blocks_stale_remote_status(self) -> None:
+        summary = btc1h_remote_provenance_gate_summary(
+            {
+                "btc1h_remote_provenance_verdict": "REMOTE_STATUS_STALE_OR_UNAVAILABLE",
+                "btc1h_remote_status_age_minutes": 289.4,
+                "btc1h_remote_status_fresh": False,
+                "btc1h_remote_official_rows": 11,
+                "btc1h_remote_official_pnl": 0.5,
+                "btc1h_remote_proxy_official_mismatches": 1,
+                "btc1h_clean_clock_status": "BLOCKED_CONTROLLED_RESTART_REQUIRED",
+                "btc1h_clean_clock_ready": False,
+                "blocking_reasons": "btc1h_remote_status_stale_or_unavailable;btc1h_clean_evidence_clock_not_ready",
+            }
+        )
+
+        self.assertFalse(summary["passes"])
+        self.assertEqual(summary["status"], "BLOCKS_BTC1H_PROMOTION")
+        self.assertEqual(summary["verdict"], "REMOTE_STATUS_STALE_OR_UNAVAILABLE")
+        self.assertEqual(summary["official_rows"], 11)
+        self.assertIn("remote_proxy_official_mismatches=1", summary["evidence"])
+        self.assertIn("clean_clock_ready=False", summary["evidence"])
+
+    def test_btc1h_candidate_promotion_deficit_blocks_current_artifacts(self) -> None:
+        summary = btc1h_candidate_promotion_deficit_gate_summary(
+            {
+                "objective_complete": "False",
+                "candidates_current_artifacts_can_make_near_deployable": 0,
+                "candidates_with_no_promotion_countable_data": 4,
+                "clean_official_row_deficit": 50,
+                "active_proxy_official_mismatch_rate_excess": 0.0709,
+                "active_replay_exact_match_rate_deficit": 0.181818,
+                "active_execution_field_complete_rate_deficit": 1.0,
+                "faithful_replay_missing_required_field_count": 17,
+                "faithful_replay_current_artifacts_can_support": "False",
+            }
+        )
+
+        self.assertFalse(summary["passes"])
+        self.assertEqual(summary["status"], "BLOCKS_BTC1H_PROMOTION")
+        self.assertEqual(summary["clean_row_deficit"], 50)
+        self.assertIn("active_mismatch_excess=0.0709", summary["evidence"])
+        self.assertIn("faithful_missing_fields=17", summary["evidence"])
+
     def test_candidate_row_prefers_current_shadow_pids_over_stale_restart_packet(self) -> None:
         row = candidate_row(
             candidate="q250_firstskip_qty500",
@@ -215,6 +260,44 @@ class BtcGptProActionStatusTests(unittest.TestCase):
 
         self.assertEqual(row["current_pids"], "7052,10524")
         self.assertEqual(row["duplicate_process_count"], 1)
+
+    def test_candidate_row_surfaces_btc1h_remote_provenance_status(self) -> None:
+        row = candidate_row(
+            candidate="btc1h_high_conf80_entry70_no_chase",
+            pro_rank="observe_only",
+            pro_instruction="observe",
+            restart_row={},
+            kill_row={},
+            shadow_row={
+                "running": False,
+                "process_count": 0,
+                "source_freshness_status": "NOT_RUNNING_OR_PROCESS_TIME_MISSING",
+            },
+            official_since={},
+            freeze_row={},
+            starvation_row={},
+            reconciliation_row={},
+            policy_row={"policy_parity_pass": True},
+            evidence_clock_ready=False,
+            consistency_row={
+                "agreement_status": "btc1h_remote_status_stale_or_unavailable",
+                "blocking_reasons": "btc1h_remote_status_stale_or_unavailable",
+                "btc1h_remote_provenance_verdict": "REMOTE_STATUS_STALE_OR_UNAVAILABLE",
+                "btc1h_remote_status_age_minutes": 289.4,
+                "btc1h_remote_status_fresh": False,
+                "btc1h_remote_official_rows": 11,
+                "btc1h_remote_official_pnl": 0.5,
+                "btc1h_remote_proxy_official_mismatches": 1,
+                "btc1h_clean_clock_status": "BLOCKED_CONTROLLED_RESTART_REQUIRED",
+                "btc1h_clean_clock_ready": False,
+            },
+        )
+
+        self.assertEqual(row["current_status"], "BTC1H_REMOTE_STATUS_STALE_OR_UNAVAILABLE")
+        self.assertEqual(row["forward_consistency_status"], "btc1h_remote_status_stale_or_unavailable")
+        self.assertEqual(row["btc1h_remote_official_rows"], 11)
+        self.assertEqual(row["btc1h_remote_official_pnl"], 0.5)
+        self.assertFalse(row["btc1h_clean_clock_ready"])
 
 
 if __name__ == "__main__":

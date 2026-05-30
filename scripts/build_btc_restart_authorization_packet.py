@@ -29,7 +29,7 @@ TARGETS = [
         "family": "BTC15M",
         "script": r"scripts\btc15m_f2_q250_qty500_firstskip_shadow.py",
         "min_post_restart_official_rows": 100,
-        "requires_existing_process": True,
+        "process_state_policy": "start_or_restart_allowed",
     },
     {
         "ledger": "btc15m_q250_qty500_firstskip_yes_shadow",
@@ -37,7 +37,7 @@ TARGETS = [
         "family": "BTC15M",
         "script": r"scripts\btc15m_f2_q250_qty500_firstskip_yes_shadow.py",
         "min_post_restart_official_rows": 100,
-        "requires_existing_process": False,
+        "process_state_policy": "start_or_restart_allowed",
     },
     {
         "ledger": "btc15m_q1000_yes_shadow",
@@ -45,7 +45,7 @@ TARGETS = [
         "family": "BTC15M",
         "script": r"scripts\btc15m_f2_q1000_yes_shadow.py",
         "min_post_restart_official_rows": 100,
-        "requires_existing_process": True,
+        "process_state_policy": "start_or_restart_allowed",
     },
     {
         "ledger": "btc1h_high_conf80_entry70_no_chase_shadow",
@@ -53,7 +53,7 @@ TARGETS = [
         "family": "BTC1H",
         "script": r"scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py",
         "min_post_restart_official_rows": 50,
-        "requires_existing_process": True,
+        "process_state_policy": "start_or_restart_allowed",
     },
 ]
 
@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--post-restart-gate-dir", type=Path, default=BACKTEST_ROOT / "btc_post_restart_collection_gate_latest_codex")
     p.add_argument("--kill-continue-dir", type=Path, default=BACKTEST_ROOT / "btc_kill_continue_latest_codex")
     p.add_argument("--forward-status-dir", type=Path, default=BACKTEST_ROOT / "btc_forward_shadow_status_latest_codex")
+    p.add_argument("--max-forward-status-age-minutes", type=float, default=60.0)
     return p.parse_args()
 
 
@@ -151,6 +152,28 @@ def intish(value: Any, default: int = 0) -> int:
     except (TypeError, ValueError):
         return default
     return out
+
+
+def parse_utc(value: Any) -> datetime | None:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        out = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if out.tzinfo is None:
+        out = out.replace(tzinfo=timezone.utc)
+    return out.astimezone(timezone.utc)
+
+
+def forward_status_age_minutes(forward_info: dict[str, Any]) -> float | None:
+    created = parse_utc(forward_info.get("created_at_utc"))
+    if created is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - created).total_seconds() / 60.0)
 
 
 def split_pids(value: Any) -> list[int]:
@@ -243,6 +266,8 @@ def build_rows(
     forward = load_forward_status(args.forward_status_dir)
     unmanaged_count = intish(forward_info.get("unmanaged_matching_process_count", 0))
     duplicate_target_names = str(forward_info.get("duplicate_target_names", "") or "")
+    status_age = forward_status_age_minutes(forward_info)
+    status_fresh = status_age is not None and status_age <= args.max_forward_status_age_minutes
 
     rows: list[dict[str, Any]] = []
     plan_targets = {
@@ -279,20 +304,47 @@ def build_rows(
         )
         plan_target = plan_targets.get(ledger, {})
         plan_safety_pass = boolish(plan_target.get("script_safety_pass", False))
-        requires_existing_process = bool(target.get("requires_existing_process", True))
+        process_state_policy = str(target.get("process_state_policy", "existing_process_required"))
+        allows_absent_start = process_state_policy == "start_or_restart_allowed"
+        will_stop_existing_processes = process_count > 0
+        will_start_process = True
+        observed_process_action = (
+            "start_absent_target"
+            if process_count == 0
+            else "restart_single_target"
+            if process_count == 1
+            else "restart_with_duplicate_cleanup"
+        )
+        expected_process_state = (
+            "start_or_restart_allowed"
+            if allows_absent_start
+            else "existing_process_required"
+            if process_state_policy == "existing_process_required"
+            else "target_absent_required"
+        )
         script_path = PROJECT_ROOT / str(target["script"])
         active_schema_status = str(scalar(sch, "preflight_status", ""))
-        active_schema_ok_for_authorization = boolish(
-            scalar(sch, "restart_required_for_deployable_ledger", False)
-        ) or active_schema_status == "DB_MISSING"
+        active_schema_ok_for_authorization = active_schema_status in {
+            "PASS_SCHEMA_READY",
+            "FAIL_REALISM_SCHEMA_RESTART_REQUIRED",
+            "DB_MISSING",
+        }
+        if allows_absent_start:
+            target_process_state_ok = process_count >= 0
+        elif process_state_policy == "target_absent_required":
+            target_process_state_ok = process_count == 0
+        else:
+            target_process_state_ok = process_count > 0
         checks = {
-            "target_process_state_expected": process_count > 0 if requires_existing_process else process_count == 0,
+            "target_process_state_expected": target_process_state_ok,
             "target_script_exists": script_path.exists(),
             "restart_path_ready": scalar(pre, "restart_path_status") == "PASS_RESTART_PATH_READY",
             "fresh_schema_ready": scalar(pre, "fresh_schema_status") == "PASS_SCHEMA_READY",
             "fresh_insert_ready": scalar(pre, "fresh_insert_status") == "PASS_INSERT_REALISM_FIELDS",
             "fresh_capture_sidecar_ready": scalar(pre, "fresh_capture_sidecar_status") == "PASS_CAPTURE_SIDECAR",
-            "active_schema_requires_restart_or_new_db": active_schema_ok_for_authorization,
+            "fresh_capture_replay_schema_ready": scalar(pre, "fresh_capture_replay_schema_status")
+            == "PASS_REPLAY_SIDECAR_SCHEMA",
+            "active_ledger_schema_state_acceptable": active_schema_ok_for_authorization,
             "post_restart_gate_waiting": scalar(gat, "gate_status") == "PENDING_CONTROLLED_RESTART",
             "no_post_restart_rows_counted": int(float(scalar(gat, "post_restart_official_rows", 0) or 0)) == 0,
             "not_production_ready": not boolish(scalar(kil, "production_ready", False)),
@@ -302,6 +354,9 @@ def build_rows(
         warnings: list[str] = []
         if duplicate_process_count:
             warnings.append("duplicate_target_processes_would_be_stopped_by_restart")
+        if not status_fresh:
+            blockers.append("forward_process_hygiene_snapshot_stale")
+            warnings.append("refresh_forward_shadow_status_before_restart_authorization")
         if unmanaged_count:
             blockers.append("unmanaged_matching_processes_require_explicit_decision")
             warnings.append("unmanaged_matching_processes_not_touched_by_restart")
@@ -311,7 +366,11 @@ def build_rows(
         elif all(checks.values()) and duplicate_process_count:
             status = "READY_FOR_USER_AUTHORIZATION_WITH_DUPLICATE_CLEANUP"
         elif all(checks.values()):
-            status = "READY_FOR_USER_AUTHORIZATION" if requires_existing_process else "READY_FOR_USER_AUTHORIZATION_TO_START"
+            status = (
+                "READY_FOR_USER_AUTHORIZATION_TO_START"
+                if process_count == 0
+                else "READY_FOR_USER_AUTHORIZATION"
+            )
         else:
             status = "NEEDS_REVIEW_BEFORE_START_RESTART"
         rows.append(
@@ -330,11 +389,20 @@ def build_rows(
                 "authorization_packet_status": status,
                 "pre_authorization_blockers": ";".join(blockers),
                 "process_cleanup_warnings": ";".join(warnings),
+                "forward_status_created_at_utc": forward_info.get("created_at_utc", ""),
+                "forward_status_age_minutes": round(status_age, 2) if status_age is not None else "",
+                "forward_status_fresh": status_fresh,
                 "user_permission_required": True,
                 "latest_restart_plan_script_safety_pass": plan_target.get("script_safety_pass", ""),
                 "latest_restart_plan_script_safety_reasons": plan_target.get("script_safety_reasons", ""),
-                "will_restart_process": requires_existing_process,
-                "will_start_new_process": not requires_existing_process,
+                "process_state_policy": process_state_policy,
+                "allows_absent_start": allows_absent_start,
+                "expected_process_state": expected_process_state,
+                "observed_process_action": observed_process_action,
+                "will_stop_existing_processes": will_stop_existing_processes,
+                "will_start_process": will_start_process,
+                "will_restart_process": will_stop_existing_processes,
+                "will_start_new_process": process_count == 0,
                 "will_archive_trade_db_by_default": True,
                 "live_capture_untouched": True,
                 "restart_path_status": scalar(pre, "restart_path_status", ""),
@@ -342,6 +410,14 @@ def build_rows(
                 "fresh_insert_status": scalar(pre, "fresh_insert_status", ""),
                 "fresh_capture_sidecar_status": scalar(pre, "fresh_capture_sidecar_status", ""),
                 "fresh_capture_sidecar_error": scalar(pre, "fresh_capture_sidecar_error", ""),
+                "fresh_capture_replay_schema_status": scalar(pre, "fresh_capture_replay_schema_status", ""),
+                "fresh_capture_replay_schema_error": scalar(pre, "fresh_capture_replay_schema_error", ""),
+                "fresh_capture_replay_signal_missing_fields": scalar(
+                    pre, "fresh_capture_replay_signal_missing_fields", ""
+                ),
+                "fresh_capture_replay_order_missing_fields": scalar(
+                    pre, "fresh_capture_replay_order_missing_fields", ""
+                ),
                 "copy_after_schema_status": scalar(pre, "copy_after_schema_status", ""),
                 "copy_insert_status": scalar(pre, "copy_insert_status", ""),
                 "active_ledger_schema_status": scalar(sch, "preflight_status", ""),
@@ -368,6 +444,7 @@ def build_rows(
 
 
 def checklist_rows(
+    args: argparse.Namespace,
     summary: pd.DataFrame,
     capture_pids: list[int],
     restart_plan_dir: Path | None,
@@ -380,17 +457,30 @@ def checklist_rows(
     duplicate_process_count = int(summary["duplicate_process_count"].fillna(0).astype(int).sum()) if "duplicate_process_count" in summary.columns else 0
     duplicate_target_names = str(forward_info.get("duplicate_target_names", "") or "")
     unmanaged_count = intish(forward_info.get("unmanaged_matching_process_count", 0))
+    max_age = float(getattr(args, "max_forward_status_age_minutes", 60.0))
+    status_age = forward_status_age_minutes(forward_info)
+    status_fresh = status_age is not None and status_age <= max_age
+    capture_script_targeted = any(str(target.get("script", "")) == CAPTURE_SCRIPT for target in TARGETS)
     checks = [
         {
             "check": "capture_process_untouched_by_workflow",
-            "pass": len(capture_pids) > 0,
-            "evidence": ";".join(str(pid) for pid in capture_pids),
+            "pass": not capture_script_targeted,
+            "evidence": (
+                f"targeted={capture_script_targeted}; "
+                f"running_pids={';'.join(str(pid) for pid in capture_pids)}"
+            ),
             "required_before_execute": True,
         },
         {
             "check": "forward_process_hygiene_snapshot_loaded",
             "pass": bool(forward_info),
             "evidence": f"created_at_utc={forward_info.get('created_at_utc', '')}",
+            "required_before_execute": True,
+        },
+        {
+            "check": "forward_process_hygiene_snapshot_fresh",
+            "pass": status_fresh,
+            "evidence": f"age_minutes={round(status_age, 2) if status_age is not None else ''}; max_age_minutes={max_age}",
             "required_before_execute": True,
         },
         {
@@ -412,11 +502,26 @@ def checklist_rows(
             "required_before_execute": True,
         },
         {
-            "check": "all_active_ledgers_need_restart_or_new_db_for_deployable_evidence",
+            "check": "replay_sidecar_model_input_preflight_passed",
             "pass": bool(
-                summary["active_ledger_schema_status"].astype(str).isin(
-                    ["FAIL_REALISM_SCHEMA_RESTART_REQUIRED", "DB_MISSING"]
-                ).all()
+                "fresh_capture_replay_schema_status" in summary.columns
+                and summary["fresh_capture_replay_schema_status"]
+                .astype(str)
+                .eq("PASS_REPLAY_SIDECAR_SCHEMA")
+                .all()
+            ),
+            "evidence": ";".join(
+                summary.get("fresh_capture_replay_schema_status", pd.Series(dtype=str)).astype(str).tolist()
+            ),
+            "required_before_execute": True,
+        },
+        {
+            "check": "active_ledger_schema_state_acceptable_for_restart",
+            "pass": bool(
+                summary["active_ledger_schema_status"]
+                .astype(str)
+                .isin(["PASS_SCHEMA_READY", "FAIL_REALISM_SCHEMA_RESTART_REQUIRED", "DB_MISSING"])
+                .all()
             ),
             "evidence": ";".join(summary["active_ledger_schema_status"].astype(str).tolist()),
             "required_before_execute": True,
@@ -471,7 +576,7 @@ def main() -> int:
     summary = build_rows(args, processes, restart_plan, forward_info)
     capture_row = first_row(forward, name="btc15m_live_capture")
     capture_pids = split_pids(scalar(capture_row, "pids", "")) or pids_for(processes, CAPTURE_SCRIPT)
-    checklist = checklist_rows(summary, capture_pids, restart_plan_dir, restart_plan, forward_info)
+    checklist = checklist_rows(args, summary, capture_pids, restart_plan_dir, restart_plan, forward_info)
     ready_statuses = {
         "READY_FOR_USER_AUTHORIZATION",
         "READY_FOR_USER_AUTHORIZATION_TO_START",
@@ -503,7 +608,11 @@ def main() -> int:
         "latest_restart_plan_execute": boolish(restart_plan.get("execute", False)) if restart_plan else "",
         "execute_command_requires_explicit_user_authorization": EXECUTE_COMMAND,
         "execute_command_after_explicit_unmanaged_decision": EXECUTE_COMMAND_AFTER_UNMANAGED_DECISION,
-        "note": "Non-disruptive authorization packet only. This script did not stop, start, archive, migrate, or deploy anything. The q250 YES candidate is a new paper-only start target.",
+        "note": (
+            "Non-disruptive authorization packet only. This script did not stop, start, archive, migrate, or deploy "
+            "anything. Observed start/restart action is reported per target from current process state; absent paper "
+            "shadows can be start-ready only after explicit user authorization."
+        ),
     }
     (args.out_dir / "run_info.json").write_text(json.dumps(run_info, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -515,8 +624,15 @@ def main() -> int:
         "process_count",
         "duplicate_process_count",
         "process_hygiene_status",
+        "expected_process_state",
+        "observed_process_action",
+        "will_stop_existing_processes",
+        "will_start_process",
+        "will_restart_process",
+        "will_start_new_process",
         "restart_path_status",
         "fresh_capture_sidecar_status",
+        "fresh_capture_replay_schema_status",
         "active_ledger_schema_status",
         "post_restart_gate_status",
         "post_restart_official_rows",
@@ -544,7 +660,7 @@ def main() -> int:
             else "At least one pre-authorization check needs review before a controlled restart."
         ),
         "",
-        "No live deployment is authorized. The workflow starts/restarts paper shadows only and intentionally leaves BTC15M capture running.",
+        "No live deployment is authorized. The workflow starts/restarts paper shadows only and does not target BTC15M capture.",
         f"Duplicate target processes currently disclosed: `{duplicate_process_count}`.",
         f"Unmanaged matching processes currently disclosed: `{unmanaged_count}`.",
         "",

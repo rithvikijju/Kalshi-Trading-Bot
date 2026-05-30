@@ -64,6 +64,11 @@ from scripts.risk_adjusted_research import RiskSizingConfig, choose_risk_adjuste
 
 EXECUTOR_NAME = os.getenv("BTC_1HR_EXECUTOR_NAME", "btc_1hr_research_live")
 SIGNAL_STRATEGY = os.getenv("BTC_1HR_SIGNAL_STRATEGY", "research").strip().lower() or "research"
+MODEL_TTL_POLICY = os.getenv("BTC_1HR_MODEL_TTL_POLICY", "scan_time_close_minus_now_v1").strip() or "scan_time_close_minus_now_v1"
+MODEL_POLICY_VERSION = (
+    os.getenv("BTC_1HR_MODEL_POLICY_VERSION", "btc1h_live_model_20260522_scan_ttl_v1").strip()
+    or "btc1h_live_model_20260522_scan_ttl_v1"
+)
 SUPPORTED_SIGNAL_STRATEGIES = {
     "research",
     "js_guarded",
@@ -156,6 +161,12 @@ CAPTURE_FLUSH_SEC = 1.0
 CAPTURE_HIGH_WATERMARKS = (0.50, 0.75, 0.90, 0.95)
 CAPTURE_LOW_PRIORITY_TABLES = {"ws_orderbook_delta", "ws_orderbook_snapshot_level"}
 CAPTURE_RAW_WS_DEFAULT = os.getenv("BTC_1HR_CAPTURE_RAW_WS", "").strip().lower() in {"1", "true", "yes", "on"}
+CAPTURE_SEED_STATUS_FROM_DB = os.getenv("BTC_CAPTURE_SEED_STATUS_FROM_DB", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 REST_MAX_RETRIES = 5
 REST_BASE_BACKOFF_SEC = 0.5
 REST_MAX_BACKOFF_SEC = 20.0
@@ -353,6 +364,9 @@ class TradeSignal:
     quote_received_at_ns: int | None = None
     quote_age_ms: float | None = None
     top_visible_qty: float | None = None
+    signal_strategy: str = ""
+    model_ttl_policy: str = MODEL_TTL_POLICY
+    model_policy_version: str = MODEL_POLICY_VERSION
 
 
 @dataclass(frozen=True)
@@ -1066,10 +1080,24 @@ CAPTURE_SCHEMAS: dict[str, list[tuple[str, str]]] = {
         ("candidate_count", "INTEGER"),
         ("selected_market", "VARCHAR"),
         ("selected_side", "VARCHAR"),
+        ("signal_strategy", "VARCHAR"),
+        ("model_ttl_policy", "VARCHAR"),
+        ("model_policy_version", "VARCHAR"),
         ("entry_price", "DOUBLE"),
         ("net_edge_cents", "DOUBLE"),
         ("model_p_yes", "DOUBLE"),
+        ("edge_threshold_cents", "DOUBLE"),
+        ("spread_cents", "DOUBLE"),
+        ("top_visible_qty", "DOUBLE"),
+        ("quote_received_at_ns", "BIGINT"),
+        ("quote_age_ms", "DOUBLE"),
+        ("ttl_min", "DOUBLE"),
+        ("close_time", "VARCHAR"),
         ("btc_spot", "DOUBLE"),
+        ("btc_candle_time", "VARCHAR"),
+        ("btc_candle_age_sec", "DOUBLE"),
+        ("btc_rv60", "DOUBLE"),
+        ("btc_ret_10m_usd", "DOUBLE"),
         ("latency_ms", "DOUBLE"),
         ("blocked_events", "INTEGER"),
         ("action", "VARCHAR"),
@@ -1080,6 +1108,9 @@ CAPTURE_SCHEMAS: dict[str, list[tuple[str, str]]] = {
         ("received_at_utc", "VARCHAR"),
         ("mode", "VARCHAR"),
         ("action", "VARCHAR"),
+        ("signal_strategy", "VARCHAR"),
+        ("model_ttl_policy", "VARCHAR"),
+        ("model_policy_version", "VARCHAR"),
         ("event_ticker", "VARCHAR"),
         ("market_ticker", "VARCHAR"),
         ("side", "VARCHAR"),
@@ -1230,9 +1261,70 @@ class LiveCaptureWriter:
         for table, columns in CAPTURE_SCHEMAS.items():
             defs = ", ".join(f"{name} {typ}" for name, typ in columns)
             con.execute(f"CREATE TABLE IF NOT EXISTS {table} ({defs})")
+            existing = {
+                str(row[1])
+                for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()
+            }
+            for name, typ in columns:
+                if name not in existing:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+
+    def _load_previous_sidecar_state(self) -> bool:
+        try:
+            data = json.loads(self.status_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return False
+        rows_by_table = data.get("rows_by_table")
+        if isinstance(rows_by_table, dict):
+            self._sidecar_rows_by_table = defaultdict(
+                int,
+                {
+                    str(table): int(count)
+                    for table, count in rows_by_table.items()
+                    if str(count).strip().lstrip("-").isdigit()
+                },
+            )
+        latest_by_table = data.get("latest_utc_by_table")
+        if isinstance(latest_by_table, dict):
+            self._sidecar_latest_utc_by_table = {
+                str(table): str(latest)
+                for table, latest in latest_by_table.items()
+                if latest not in (None, "")
+            }
+        replay_rows = data.get("replay_sidecar_rows_by_table")
+        if isinstance(replay_rows, dict):
+            self._replay_sidecar_rows_by_table = defaultdict(
+                int,
+                {
+                    str(table): int(count)
+                    for table, count in replay_rows.items()
+                    if str(count).strip().lstrip("-").isdigit()
+                },
+            )
+        self._sidecar_signal_nonzero_rows = int(data.get("signal_scan_nonzero_candidate_rows") or 0)
+        action_counts = data.get("signal_scan_action_counts")
+        if isinstance(action_counts, dict):
+            self._sidecar_signal_action_counts = defaultdict(
+                int,
+                {
+                    str(action): int(count)
+                    for action, count in action_counts.items()
+                    if str(count).strip().lstrip("-").isdigit()
+                },
+            )
+        self._sidecar_signal_latest_action = str(data.get("signal_scan_latest_action") or "")
+        self._sidecar_signal_latest_detail = str(data.get("signal_scan_latest_detail") or "")
+        return True
 
     def _init_sidecar_state(self, con) -> None:
-        """Seed the lock-free status sidecar from the capture DB at writer start."""
+        """Seed lock-free status counters without blocking live capture startup."""
+        seeded_from_sidecar = self._load_previous_sidecar_state()
+        if seeded_from_sidecar:
+            log.info("capture status seeded from existing sidecar: %s", self.status_path)
+        if not CAPTURE_SEED_STATUS_FROM_DB:
+            return
+        started = time.monotonic()
+        log.info("capture status DB seed requested; scanning capture tables once at startup")
         for table, columns in CAPTURE_SCHEMAS.items():
             column_names = {name for name, _ in columns}
             try:
@@ -1271,6 +1363,7 @@ class LiveCaptureWriter:
                 self._sidecar_signal_latest_detail = str(latest[1] or "")
         except Exception as exc:
             log.debug("capture status sidecar signal seed skipped error=%r", exc)
+        log.info("capture status DB seed finished in %.1fs", time.monotonic() - started)
 
     def _observe_flushed_rows(self, table: str, rows: list[dict[str, Any]]) -> None:
         self._sidecar_rows_by_table[table] += len(rows)
@@ -1371,8 +1464,7 @@ class LiveCaptureWriter:
             pending[table].clear()
             flushed_any = True
         self.last_flush_ms = (time.monotonic() - started) * 1000.0
-        if flushed_any:
-            self._write_status_sidecar()
+        self._write_status_sidecar()
 
     def _run(self) -> None:
         import duckdb
@@ -1380,6 +1472,8 @@ class LiveCaptureWriter:
         con = None
         pending: dict[str, list[dict[str, Any]]] = defaultdict(list)
         try:
+            self._load_previous_sidecar_state()
+            self._write_status_sidecar(force=True)
             con = duckdb.connect(str(self.path))
             self._init_schema(con)
             self._init_sidecar_state(con)
@@ -2471,9 +2565,23 @@ def latest_rv60(btc_1m) -> float | None:
     return float(values.iloc[-1])
 
 
-def model_probability(event: dict, market: dict, btc_1m, emp_cache: dict, spot: float) -> tuple[float, float]:
+def model_probability(
+    event: dict,
+    market: dict,
+    btc_1m,
+    emp_cache: dict,
+    spot: float,
+    now: datetime | None = None,
+) -> tuple[float, float]:
     parsed = base_strategy.parse_market(market)
-    ttl_min = float(event["ttl_hours"]) * 60.0
+    ttl_min: float | None = None
+    if now is not None:
+        close_time = utc_dt(market.get("close_time") or event.get("close_time"))
+        if close_time is not None:
+            now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+            ttl_min = max(0.0, (close_time - now_utc).total_seconds() / 60.0)
+    if ttl_min is None:
+        ttl_min = float(event["ttl_hours"]) * 60.0
     current_vol = latest_rv60(btc_1m)
     horizons = sorted(emp_cache.keys())
     if not horizons:
@@ -2525,12 +2633,14 @@ def signal_from_book(
     parsed = base_strategy.parse_market(market)
     ticker = str(parsed.get("ticker") or "").upper()
     event_ticker = str(event.get("event_ticker") or "").upper()
+    scan_time = now or datetime.now(timezone.utc)
+    scan_time = scan_time.astimezone(timezone.utc) if scan_time.tzinfo else scan_time.replace(tzinfo=timezone.utc)
     if not ticker or str(market.get("status") or "").lower() not in {"open", "active"}:
         return None
     event_close = utc_dt(event.get("close_time"))
     if event_close is None or not market_is_research_cumulative(event_ticker, market, event_close):
         return None
-    p_yes, ttl_min = model_probability(event, market, btc_1m, emp_cache, spot)
+    p_yes, ttl_min = model_probability(event, market, btc_1m, emp_cache, spot, now=scan_time)
     if not math.isfinite(p_yes):
         return None
     floor = optional_float(parsed.get("floor"))
@@ -2541,8 +2651,7 @@ def signal_from_book(
         if quote.yes_bid is None or quote.yes_ask is None:
             return None
         if signal_strategy == "js_guarded":
-            now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-            if now_utc.hour in JS_GUARDED_EXCLUDED_UTC_HOURS:
+            if scan_time.hour in JS_GUARDED_EXCLUDED_UTC_HOURS:
                 return None
             moneyness_bps = 10000.0 * (spot - floor) / max(1.0, spot)
             if abs(moneyness_bps) > JS_GUARDED_MAX_ABS_MONEYNESS_BPS:
@@ -2627,7 +2736,6 @@ def signal_from_book(
     if not strong_prob:
         return None
     if strategy_uses_no_chase_guard(signal_strategy):
-        scan_time = now or datetime.now(timezone.utc)
         ret_10m = btc_usd_return_lookback(btc_1m, scan_time, 10)
         side_ret_10m = ret_10m if side == "yes" else (-ret_10m if ret_10m is not None else None)
         if side_ret_10m is not None and math.isfinite(side_ret_10m) and side_ret_10m >= HIGH_CONF_80_NO_CHASE_10M_USD:
@@ -2676,6 +2784,9 @@ def signal_from_book(
         quote_received_at_ns=quote_received_at_ns,
         quote_age_ms=quote_age_ms,
         top_visible_qty=float(best["available_qty"]),
+        signal_strategy=signal_strategy,
+        model_ttl_policy=MODEL_TTL_POLICY,
+        model_policy_version=MODEL_POLICY_VERSION,
     )
 
 
@@ -2692,6 +2803,9 @@ TRADE_REALISM_COLUMNS = [
     ("yes_ask", "REAL"),
     ("no_bid", "REAL"),
     ("no_ask", "REAL"),
+    ("signal_strategy", "TEXT"),
+    ("model_ttl_policy", "TEXT"),
+    ("model_policy_version", "TEXT"),
 ]
 
 
@@ -2721,6 +2835,9 @@ def db_connect(path: Path | str) -> sqlite3.Connection:
             created_at TEXT NOT NULL,
             mode TEXT NOT NULL,
             status TEXT NOT NULL,
+            signal_strategy TEXT,
+            model_ttl_policy TEXT,
+            model_policy_version TEXT,
             event_ticker TEXT NOT NULL,
             market_ticker TEXT NOT NULL,
             side TEXT NOT NULL,
@@ -2969,7 +3086,8 @@ def record_trade(
     cur = conn.execute(
         """
         INSERT INTO research_live_trades (
-            created_at, mode, status, event_ticker, market_ticker, side,
+            created_at, mode, status, signal_strategy, model_ttl_policy,
+            model_policy_version, event_ticker, market_ticker, side,
             contracts, entry_price, yes_order_side, yes_limit_price,
             entry_fee_estimate, model_p_yes, edge_gross_cents, net_edge_cents,
             spread_cents, btc_spot, close_time, client_order_id, order_id,
@@ -2978,12 +3096,15 @@ def record_trade(
             signal_received_at_ns, quote_age_ms, edge_threshold_cents, strike,
             ttl_min, yes_bid, yes_ask, no_bid, no_ask, raw_response
         )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
             mode,
             status,
+            signal.signal_strategy or SIGNAL_STRATEGY,
+            signal.model_ttl_policy or MODEL_TTL_POLICY,
+            signal.model_policy_version or MODEL_POLICY_VERSION,
             signal.event_ticker,
             signal.market_ticker,
             signal.side,
@@ -3501,6 +3622,7 @@ def shape_adjacent_context_for_event(
     emp_cache: dict,
     spot: float,
     signal_strategy: str,
+    now: datetime | None = None,
 ) -> dict[str, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for market in event.get("markets", []):
@@ -3519,7 +3641,7 @@ def shape_adjacent_context_for_event(
         yes_spread = quote.yes_spread_cents
         if yes_spread is None or not math.isfinite(yes_spread):
             continue
-        p_yes, _ttl_min = model_probability(event, market, btc_1m, emp_cache, spot)
+        p_yes, _ttl_min = model_probability(event, market, btc_1m, emp_cache, spot, now=now)
         if not math.isfinite(p_yes):
             continue
         market_mid = 0.5 * (quote.yes_bid + quote.yes_ask)
@@ -3582,6 +3704,7 @@ def apply_shape_adjacent_filter(
     cache_by_event: dict[str, dict],
     spot: float,
     signal_strategy: str,
+    now: datetime | None = None,
 ) -> list[TradeSignal]:
     if not signals or signal_strategy != "market_shrink_no_cautious_shape_adjacent":
         return signals
@@ -3591,7 +3714,7 @@ def apply_shape_adjacent_filter(
         emp_cache = cache_by_event.get(event_ticker)
         if not emp_cache:
             continue
-        contexts[event_ticker] = shape_adjacent_context_for_event(event, quotes, btc_1m, emp_cache, spot, signal_strategy)
+        contexts[event_ticker] = shape_adjacent_context_for_event(event, quotes, btc_1m, emp_cache, spot, signal_strategy, now=now)
 
     passed: list[TradeSignal] = []
     for signal in signals:
@@ -3716,6 +3839,7 @@ def find_signals_from_quotes(
     spot: float,
     executor: ThreadPoolExecutor | None = None,
     signal_strategy: str | None = None,
+    now: datetime | None = None,
 ) -> list[TradeSignal]:
     signal_strategy = str(signal_strategy or SIGNAL_STRATEGY).strip().lower()
     jobs: list[tuple[dict, dict, BookQuote, dict]] = []
@@ -3742,6 +3866,7 @@ def find_signals_from_quotes(
             min_edge_cents=RESEARCH_MIN_EDGE_CENTS,
             max_spread_cents=RESEARCH_MAX_SPREAD_CENTS,
             signal_strategy=signal_strategy,
+            now=now,
         )
 
     if not jobs:
@@ -3751,7 +3876,7 @@ def find_signals_from_quotes(
     else:
         signals = [evaluate(job) for job in jobs]
     out = sorted([signal for signal in signals if signal is not None], key=lambda s: s.net_edge_cents, reverse=True)
-    out = apply_shape_adjacent_filter(out, events, quotes, btc_1m, cache_by_event, spot, signal_strategy)
+    out = apply_shape_adjacent_filter(out, events, quotes, btc_1m, cache_by_event, spot, signal_strategy, now=now)
     return sorted(out, key=lambda s: s.net_edge_cents, reverse=True)
 
 
@@ -3764,8 +3889,10 @@ def reprice_signal_from_state(
     emp_cache: dict,
     spot: float,
     signal_strategy: str | None = None,
+    now: datetime | None = None,
 ) -> TradeSignal | None:
     signal_strategy = str(signal_strategy or SIGNAL_STRATEGY).strip().lower()
+    reprice_time = now or datetime.now(timezone.utc)
     event = events_by_ticker.get(signal.event_ticker)
     market = markets_by_ticker.get(signal.market_ticker)
     if not event or not market:
@@ -3788,9 +3915,19 @@ def reprice_signal_from_state(
         min_edge_cents=RESEARCH_MIN_EDGE_CENTS,
         max_spread_cents=RESEARCH_MAX_SPREAD_CENTS,
         signal_strategy=signal_strategy,
+        now=reprice_time,
     )
     if fresh and strategy_requires_full_chain(signal_strategy):
-        filtered = apply_shape_adjacent_filter([fresh], [event], quotes, btc_1m, {signal.event_ticker: emp_cache}, spot, signal_strategy)
+        filtered = apply_shape_adjacent_filter(
+            [fresh],
+            [event],
+            quotes,
+            btc_1m,
+            {signal.event_ticker: emp_cache},
+            spot,
+            signal_strategy,
+            now=reprice_time,
+        )
         fresh = filtered[0] if filtered else None
     if fresh and fresh.side == signal.side:
         return fresh
@@ -3904,6 +4041,7 @@ class WsResearchExecutor:
 
     def scan(self, changed_tickers: set[str] | None, reason: str) -> None:
         started_ns = utc_now_ns()
+        scan_dt = datetime.fromtimestamp(started_ns / 1_000_000_000, tz=timezone.utc)
         if self.btc_1m is None:
             return
         if self.args.mode == "live" and not self.recorder.is_healthy():
@@ -3950,6 +4088,7 @@ class WsResearchExecutor:
             spot,
             executor=self.executor,
             signal_strategy=SIGNAL_STRATEGY,
+            now=scan_dt,
         )
         if not signals:
             now = time.monotonic()
@@ -4149,6 +4288,9 @@ class WsResearchExecutor:
     ) -> None:
         selected_signal = selected[0] if selected else None
         event_ticker = selected_signal.event_ticker if selected_signal else (self.events[0]["event_ticker"] if self.events else None)
+        scan_dt = datetime.fromtimestamp(started_ns / 1_000_000_000, tz=timezone.utc)
+        candle_time = btc_last_candle_time(self.btc_1m)
+        btc_ret_10m = btc_usd_return_lookback(self.btc_1m, scan_dt, 10)
         self.recorder.record(
             "signal_scan",
             {
@@ -4162,10 +4304,24 @@ class WsResearchExecutor:
                 "candidate_count": len(signals),
                 "selected_market": selected_signal.market_ticker if selected_signal else None,
                 "selected_side": selected_signal.side if selected_signal else None,
+                "signal_strategy": selected_signal.signal_strategy if selected_signal else SIGNAL_STRATEGY,
+                "model_ttl_policy": selected_signal.model_ttl_policy if selected_signal else MODEL_TTL_POLICY,
+                "model_policy_version": selected_signal.model_policy_version if selected_signal else MODEL_POLICY_VERSION,
                 "entry_price": selected_signal.entry_price if selected_signal else None,
                 "net_edge_cents": selected_signal.net_edge_cents if selected_signal else None,
                 "model_p_yes": selected_signal.model_p_yes if selected_signal else None,
+                "edge_threshold_cents": selected_signal.edge_threshold_cents if selected_signal else None,
+                "spread_cents": selected_signal.spread_cents if selected_signal else None,
+                "top_visible_qty": selected_signal.top_visible_qty if selected_signal else None,
+                "quote_received_at_ns": selected_signal.quote_received_at_ns if selected_signal else None,
+                "quote_age_ms": selected_signal.quote_age_ms if selected_signal else None,
+                "ttl_min": selected_signal.ttl_min if selected_signal else None,
+                "close_time": selected_signal.close_time if selected_signal else None,
                 "btc_spot": spot if spot else None,
+                "btc_candle_time": candle_time.isoformat() if candle_time else None,
+                "btc_candle_age_sec": btc_candle_age_sec(self.btc_1m, now=scan_dt),
+                "btc_rv60": latest_rv60(self.btc_1m),
+                "btc_ret_10m_usd": btc_ret_10m,
                 "latency_ms": (utc_now_ns() - started_ns) / 1_000_000,
                 "blocked_events": len(db_active_events(self.conn, datetime.now(timezone.utc))),
                 "action": action,
@@ -4190,6 +4346,9 @@ class WsResearchExecutor:
                 "received_at_utc": ns_to_utc_iso(received_at_ns),
                 "mode": self.args.mode,
                 "action": action,
+                "signal_strategy": signal.signal_strategy or SIGNAL_STRATEGY,
+                "model_ttl_policy": signal.model_ttl_policy or MODEL_TTL_POLICY,
+                "model_policy_version": signal.model_policy_version or MODEL_POLICY_VERSION,
                 "event_ticker": signal.event_ticker,
                 "market_ticker": signal.market_ticker,
                 "side": signal.side,

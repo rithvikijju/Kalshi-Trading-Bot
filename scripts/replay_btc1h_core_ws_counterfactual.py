@@ -15,8 +15,10 @@ import math
 import re
 import sys
 import time
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -114,6 +116,15 @@ def parse_args() -> argparse.Namespace:
         help="Reject model evaluations when the latest captured BTC spot tick is older than this many seconds.",
     )
     parser.add_argument(
+        "--model-ttl-override-min",
+        type=float,
+        help=(
+            "Diagnostic-only: use this TTL horizon for model probabilities while "
+            "still enforcing the real event TTL entry window. This is for "
+            "old cached-TTL parity checks, not forward scan-time policy evidence."
+        ),
+    )
+    parser.add_argument(
         "--recompute-btc-rv",
         action="store_true",
         help="Recompute rv_15m/rv_60m/rv_1d from closes instead of preserving the live BTC cache volatility columns.",
@@ -136,12 +147,39 @@ def parse_args() -> argparse.Namespace:
             "This is the closest mode for comparing against a live/paper bot ledger."
         ),
     )
+    parser.add_argument(
+        "--candidate-scan-only",
+        action="store_true",
+        help=(
+            "With --use-signal-scan-log, evaluate only scans whose captured active-policy "
+            "signal_scan row had candidate_count > 0. Use this for active-policy parity "
+            "diagnostics, not for discovering new variants."
+        ),
+    )
+    parser.add_argument(
+        "--selected-scan-only",
+        action="store_true",
+        help=(
+            "With --use-signal-scan-log, evaluate only scans where the captured active "
+            "policy action was selected. This is stricter than --candidate-scan-only and "
+            "prevents later dedupe/blocked scans from creating replacement trades."
+        ),
+    )
+    parser.add_argument(
+        "--selected-market-only",
+        action="store_true",
+        help=(
+            "When a signal_scan row has selected_market, restrict replay evaluation to "
+            "that market. This is an active-policy parity diagnostic, not a discovery mode."
+        ),
+    )
     parser.add_argument("--signal-table", help="Override signal scan table name when --use-signal-scan-log is set.")
     parser.add_argument("--no-public-fallback", action="store_true", help="Do not query public Kalshi for missing settlements.")
     parser.add_argument("--public-sleep-sec", type=float, default=0.10)
     return parser.parse_args()
 
 
+@lru_cache(maxsize=4096)
 def event_close_from_ticker(event_ticker: str) -> pd.Timestamp | None:
     match = EVENT_RE.match(str(event_ticker or "").upper())
     if not match:
@@ -159,6 +197,7 @@ def event_close_from_ticker(event_ticker: str) -> pd.Timestamp | None:
     return pd.Timestamp(local.astimezone(timezone.utc))
 
 
+@lru_cache(maxsize=32768)
 def strike_from_market_ticker(market_ticker: str) -> float:
     match = STRIKE_RE.search(str(market_ticker or "").upper())
     if not match:
@@ -193,7 +232,10 @@ def ns_to_utc(ns: int) -> pd.Timestamp:
 
 
 def load_btc_cache(path: Path, recompute_btc_rv: bool = False) -> pd.DataFrame:
-    btc = pd.read_parquet(path)
+    try:
+        btc = pd.read_parquet(path)
+    except Exception:
+        btc = duckdb.connect().execute("SELECT * FROM read_parquet(?)", [str(path)]).fetchdf()
     if "time" not in btc.columns and "available_at" in btc.columns:
         btc = btc.rename(columns={"available_at": "time"})
     if "time" not in btc.columns:
@@ -212,11 +254,10 @@ def load_btc_cache(path: Path, recompute_btc_rv: bool = False) -> pd.DataFrame:
     return out
 
 
-def btc_idx_at_or_before(btc: pd.DataFrame, ts: pd.Timestamp) -> int | None:
-    values = btc["time"].dt.tz_localize(None).to_numpy()
+def btc_idx_at_or_before(btc_time_values: np.ndarray, ts: pd.Timestamp) -> int | None:
     lookup = ts.tz_convert("UTC").tz_localize(None).to_datetime64()
-    idx = int(np.searchsorted(values, lookup, side="right")) - 1
-    return idx if 0 <= idx < len(btc) else None
+    idx = int(np.searchsorted(btc_time_values, lookup, side="right")) - 1
+    return idx if 0 <= idx < len(btc_time_values) else None
 
 
 def detect_table(con: duckdb.DuckDBPyConnection, candidates: list[str], override: str | None = None) -> str | None:
@@ -264,33 +305,46 @@ def load_signal_scans(
     table: str | None,
     start: str | None,
     end: str | None,
+    *,
+    use_replay_windows: bool = False,
+    candidate_scan_only: bool = False,
+    selected_scan_only: bool = False,
 ) -> pd.DataFrame:
     if table is None:
         return pd.DataFrame()
-    where = ["event_ticker LIKE 'KXBTCD-%'"]
+    alias = "s" if use_replay_windows else ""
+    prefix = f"{alias}." if alias else ""
+    from_clause = table
+    if use_replay_windows:
+        from_clause = f"{table} s JOIN replay_windows w ON s.event_ticker = w.event_ticker AND s.received_at_ns > w.replay_start_ns AND s.received_at_ns <= w.replay_end_ns"
+    where = [f"{prefix}event_ticker LIKE 'KXBTCD-%'"]
     params: list[Any] = []
     start_ns = parse_utc_ns(start)
     end_ns = parse_utc_ns(end)
     if start_ns is not None:
-        where.append("received_at_ns >= ?")
+        where.append(f"{prefix}received_at_ns >= ?")
         params.append(start_ns)
     if end_ns is not None:
-        where.append("received_at_ns < ?")
+        where.append(f"{prefix}received_at_ns < ?")
         params.append(end_ns)
+    if candidate_scan_only:
+        where.append(f"TRY_CAST({prefix}candidate_count AS BIGINT) > 0")
+    if selected_scan_only:
+        where.append(f"lower(coalesce({prefix}action, '')) = 'selected'")
     query = f"""
-        SELECT received_at_ns,
-               TRY_CAST(received_at_utc AS TIMESTAMPTZ) AS received_at_utc,
-               reason,
-               event_ticker,
-               changed_markets,
-               evaluated_markets,
-               candidate_count,
-               selected_market,
-               action,
-               detail
-        FROM {table}
+        SELECT {prefix}received_at_ns AS received_at_ns,
+               TRY_CAST({prefix}received_at_utc AS TIMESTAMPTZ) AS received_at_utc,
+               {prefix}reason AS reason,
+               {prefix}event_ticker AS event_ticker,
+               {prefix}changed_markets AS changed_markets,
+               {prefix}evaluated_markets AS evaluated_markets,
+               {prefix}candidate_count AS candidate_count,
+               {prefix}selected_market AS selected_market,
+               {prefix}action AS action,
+               {prefix}detail AS detail
+        FROM {from_clause}
         WHERE {' AND '.join(where)}
-        ORDER BY received_at_ns
+        ORDER BY {prefix}received_at_ns
     """
     df = con.execute(query, params).fetchdf()
     if df.empty:
@@ -303,6 +357,7 @@ def load_signal_scans(
     df["action"] = df["action"].fillna("").astype(str)
     df["changed_markets"] = pd.to_numeric(df["changed_markets"], errors="coerce").fillna(0).astype(int)
     df["evaluated_markets"] = pd.to_numeric(df["evaluated_markets"], errors="coerce").fillna(0).astype(int)
+    df["candidate_count"] = pd.to_numeric(df["candidate_count"], errors="coerce").fillna(0).astype(int)
     return df.sort_values("received_at_ns").reset_index(drop=True)
 
 
@@ -629,6 +684,72 @@ def choose_trade(
     return hits.iloc[0].to_dict()
 
 
+def variant_needs_full_surface(variant: ModelVariant) -> bool:
+    return bool(float(getattr(variant, "market_weight", 0.0) or 0.0) or float(getattr(variant, "event_iv_weight", 0.0) or 0.0))
+
+
+def static_book_candidate_mask(q: pd.DataFrame, variants: list[ModelVariant]) -> pd.Series:
+    """Rows that could pass at least one variant's static execution gates."""
+    if q.empty:
+        return pd.Series(False, index=q.index)
+    yes_entry = pd.to_numeric(q["yes_ask_exe"], errors="coerce")
+    yes_qty = pd.to_numeric(q["yes_ask_qty"], errors="coerce")
+    yes_spread = pd.to_numeric(q["yes_spread_cents"], errors="coerce")
+    no_entry = pd.to_numeric(q["no_ask_exe"], errors="coerce")
+    no_qty = pd.to_numeric(q["no_ask_qty"], errors="coerce")
+    no_spread = pd.to_numeric(q["no_spread_cents"], errors="coerce")
+    mask = pd.Series(False, index=q.index)
+    for variant in variants:
+        mask |= (
+            yes_entry.between(float(variant.min_entry), float(variant.max_entry), inclusive="both")
+            & (yes_spread <= float(variant.max_spread_cents))
+            & (yes_qty >= 1.0)
+        )
+        mask |= (
+            no_entry.between(float(variant.min_entry), float(variant.max_entry), inclusive="both")
+            & (no_spread <= float(variant.max_spread_cents))
+            & (no_qty >= 1.0)
+        )
+    return mask.fillna(False).astype(bool)
+
+
+def quote_state_matches_static_book(quote_state: QuoteState, variants: list[ModelVariant]) -> bool:
+    yes_entry = quote_state.yes_ask
+    yes_qty = quote_state.yes_ask_qty
+    yes_spread = (quote_state.yes_ask - quote_state.yes_bid) * 100.0
+    no_entry = quote_state.no_ask
+    no_qty = quote_state.no_ask_qty
+    no_spread = (quote_state.no_ask - quote_state.no_bid) * 100.0
+    for variant in variants:
+        min_entry = float(variant.min_entry)
+        max_entry = float(variant.max_entry)
+        max_spread = float(variant.max_spread_cents)
+        if (
+            math.isfinite(yes_entry)
+            and min_entry <= yes_entry <= max_entry
+            and math.isfinite(yes_spread)
+            and yes_spread <= max_spread
+            and math.isfinite(yes_qty)
+            and yes_qty >= 1.0
+        ):
+            return True
+        if (
+            math.isfinite(no_entry)
+            and min_entry <= no_entry <= max_entry
+            and math.isfinite(no_spread)
+            and no_spread <= max_spread
+            and math.isfinite(no_qty)
+            and no_qty >= 1.0
+        ):
+            return True
+    return False
+
+
+def stat_add(stats: MutableMapping[str, int] | None, key: str, value: int = 1) -> None:
+    if stats is not None:
+        stats[key] = int(stats.get(key, 0)) + int(value)
+
+
 def evaluate_event(
     event_ticker: str,
     state: dict[str, QuoteState],
@@ -636,26 +757,61 @@ def evaluate_event(
     variants: list[ModelVariant],
     traded_events: set[tuple[str, str]],
     btc: pd.DataFrame,
+    btc_time_values: np.ndarray,
     event_cache: dict[tuple[str, int], dict],
     coinbase_ns: np.ndarray,
     coinbase_prices: np.ndarray,
     fallback_btc_spot: float | None,
     max_btc_spot_age_sec: float,
+    model_ttl_override_min: float | None = None,
     market_filter: set[str] | None = None,
+    static_candidate_markets: set[str] | None = None,
+    stats: MutableMapping[str, int] | None = None,
 ) -> list[dict[str, Any]]:
+    stat_add(stats, "evaluate_event_calls")
     close_time = event_close_from_ticker(event_ticker)
     if close_time is None:
+        stat_add(stats, "evaluate_event_no_close_time")
         return []
     scan_ts = ns_to_utc(scan_ns)
     ttl_min = (close_time - scan_ts).total_seconds() / 60.0
     if ttl_min < MIN_TTL_MIN or ttl_min > MAX_TTL_MIN:
+        stat_add(stats, "evaluate_event_ttl_outside_window")
         return []
+    model_ttl_min = ttl_min
+    if model_ttl_override_min is not None:
+        model_ttl_min = float(model_ttl_override_min)
+        if not math.isfinite(model_ttl_min) or model_ttl_min <= 0.0:
+            stat_add(stats, "evaluate_event_bad_model_ttl_override")
+            return []
     if all((variant.name, event_ticker) in traded_events for variant in variants):
+        stat_add(stats, "evaluate_event_all_variants_already_traded")
         return []
+    if static_candidate_markets is not None:
+        candidate_markets = set(static_candidate_markets)
+        if market_filter is not None:
+            candidate_markets &= {str(t).upper() for t in market_filter}
+        if not candidate_markets:
+            stat_add(stats, "evaluate_event_static_book_no_candidate_state")
+            return []
+        if not any(variant_needs_full_surface(variant) for variant in variants):
+            market_filter = candidate_markets
     q = quote_df_from_state(event_ticker, state, scan_ts, market_filter=market_filter)
     if q.empty:
+        stat_add(stats, "evaluate_event_empty_quote_surface")
         return []
     q = q[np.isfinite(pd.to_numeric(q["floor_strike"], errors="coerce"))].copy()
+    if q.empty:
+        stat_add(stats, "evaluate_event_no_finite_strikes")
+        return []
+    stat_add(stats, "static_book_rows_before", len(q))
+    static_mask = static_book_candidate_mask(q, variants)
+    if not bool(static_mask.any()):
+        stat_add(stats, "evaluate_event_static_book_no_candidate")
+        return []
+    if not any(variant_needs_full_surface(variant) for variant in variants):
+        q = q.loc[static_mask].copy()
+    stat_add(stats, "static_book_rows_after", len(q))
     if q.empty:
         return []
     live_spot, live_spot_age_sec = asof_price(coinbase_ns, coinbase_prices, scan_ns)
@@ -665,15 +821,18 @@ def evaluate_event(
         and live_spot_age_sec is not None
         and float(live_spot_age_sec) > float(max_btc_spot_age_sec)
     ):
+        stat_add(stats, "evaluate_event_stale_btc_spot")
         return []
     if live_spot is None:
         live_spot = fallback_btc_spot
         live_spot_age_sec = None
         spot_source = "ws_orderbook_top.btc_spot"
     if live_spot is None or not math.isfinite(float(live_spot)) or float(live_spot) <= 0.0:
+        stat_add(stats, "evaluate_event_missing_btc_spot")
         return []
-    btc_idx = btc_idx_at_or_before(btc, scan_ts)
+    btc_idx = btc_idx_at_or_before(btc_time_values, scan_ts)
     if btc_idx is None or btc_idx < 1440:
+        stat_add(stats, "evaluate_event_missing_btc_cache")
         return []
     event_open = close_time - pd.Timedelta(hours=1)
     trades: list[dict[str, Any]] = []
@@ -686,9 +845,12 @@ def evaluate_event(
         if emp_cache is None:
             emp_cache = build_event_cache(btc, event_open, variant.train_days)
             if emp_cache is None:
+                stat_add(stats, "evaluate_event_missing_emp_cache")
                 continue
             event_cache[cache_key] = emp_cache
-        p_yes = model_probabilities(variant, q, btc, btc_idx, float(live_spot), ttl_min, emp_cache, {})
+        stat_add(stats, "model_probability_calls")
+        stat_add(stats, "model_probability_rows", len(q))
+        p_yes = model_probabilities(variant, q, btc, btc_idx, float(live_spot), model_ttl_min, emp_cache, {})
         btc_ret_10m_usd = None
         if btc_idx >= 10:
             prior_spot = finite_float(btc.iloc[btc_idx - 10]["close"])
@@ -696,6 +858,7 @@ def evaluate_event(
                 btc_ret_10m_usd = float(live_spot) - prior_spot
         chosen = choose_trade(variant, q, p_yes, emp_cache, btc_ret_10m_usd=btc_ret_10m_usd)
         if chosen is None:
+            stat_add(stats, "evaluate_event_no_trade_after_model")
             continue
         traded_events.add(event_key)
         trades.append(
@@ -709,6 +872,8 @@ def evaluate_event(
                 "entry_received_at_ns": int(scan_ns),
                 "close_time": close_time.isoformat(),
                 "ttl_min": float(ttl_min),
+                "model_ttl_min": float(model_ttl_min),
+                "model_ttl_override_min": model_ttl_override_min,
                 "floor_strike": float(chosen["floor_strike"]),
                 "entry_price": float(chosen["entry_price"]),
                 "entry_fee": float(chosen["entry_fee"]),
@@ -1024,6 +1189,7 @@ def main() -> int:
         if not variants:
             raise ValueError(f"--variant-regex matched no variants: {args.variant_regex!r}")
     btc = load_btc_cache(args.btc_cache, recompute_btc_rv=args.recompute_btc_rv)
+    btc_time_values = btc["time"].dt.tz_localize(None).to_numpy()
 
     con = duckdb.connect(str(args.capture_db), read_only=True)
     top_table = detect_table(con, ["ws_orderbook_top_dedup", "ws_orderbook_top_all", "ws_orderbook_top"], args.top_table)
@@ -1036,9 +1202,10 @@ def main() -> int:
     lifecycle_table = detect_table(con, ["ws_lifecycle_all", "ws_lifecycle"])
     private_table = detect_table(con, ["ws_private_event_all", "ws_private_event"])
     coinbase_ns, coinbase_prices = load_coinbase_asof(con, coinbase_table, args.start, args.end)
-    signal_scans = load_signal_scans(con, signal_table, args.start, args.end) if args.use_signal_scan_log else pd.DataFrame()
+    signal_scans = pd.DataFrame()
 
     event_states: dict[str, dict[str, QuoteState]] = {}
+    static_candidate_markets_by_event: dict[str, set[str]] = {}
     event_cache: dict[tuple[str, int], dict] = {}
     traded_events: set[tuple[str, str]] = set()
     trade_rows: list[dict[str, Any]] = []
@@ -1051,6 +1218,8 @@ def main() -> int:
     rows_seen = 0
     groups_seen = 0
     windows_used = pd.DataFrame()
+    replay_stats: dict[str, int] = {}
+    stopped_early_by_max_rows = False
 
     def apply_row_to_state(row: Any) -> tuple[str | None, float | None]:
         event_ticker = str(row.event_ticker or "").upper()
@@ -1061,9 +1230,9 @@ def main() -> int:
             return None, None
         btc_spot = finite_float(row.btc_spot)
         state = event_states.setdefault(event_ticker, {})
-        state[market_ticker] = QuoteState(
+        quote_state = QuoteState(
             received_at_ns=int(row.received_at_ns),
-            received_at_utc=pd.Timestamp(row.received_at_utc).tz_convert("UTC"),
+            received_at_utc=row.received_at_utc,
             market_ticker=market_ticker,
             event_ticker=event_ticker,
             seq=int(row.seq) if pd.notna(row.seq) else None,
@@ -1080,6 +1249,12 @@ def main() -> int:
             floor_strike=strike,
             close_time=close_time,
         )
+        state[market_ticker] = quote_state
+        static_candidate_markets = static_candidate_markets_by_event.setdefault(event_ticker, set())
+        if quote_state_matches_static_book(quote_state, variants):
+            static_candidate_markets.add(market_ticker)
+        else:
+            static_candidate_markets.discard(market_ticker)
         return event_ticker, btc_spot if math.isfinite(btc_spot) else None
 
     def flush_group(rows: list[Any], scan_ns: int) -> None:
@@ -1107,12 +1282,16 @@ def main() -> int:
                 variants,
                 traded_events,
                 btc,
+                btc_time_values,
                 event_cache,
                 coinbase_ns,
                 coinbase_prices,
                 last_top_spot,
                 args.max_btc_spot_age_sec,
+                model_ttl_override_min=args.model_ttl_override_min,
                 market_filter=changed_markets_by_event.get(event_ticker) if args.live_scan_semantics else None,
+                static_candidate_markets=static_candidate_markets_by_event.get(event_ticker, set()),
+                stats=replay_stats,
             )
             trade_rows.extend(new_trades)
 
@@ -1127,12 +1306,23 @@ def main() -> int:
             # The live loop consumed that update batch even if it skipped trading.
             changed_since_signal_scan.pop(event_ticker, None)
             return
+        if args.selected_scan_only and action != "selected":
+            changed_since_signal_scan.pop(event_ticker, None)
+            return
+        if args.candidate_scan_only and int(getattr(row, "candidate_count", 0) or 0) <= 0:
+            changed_since_signal_scan.pop(event_ticker, None)
+            return
+        selected_market = str(getattr(row, "selected_market", "") or "").upper()
         if signal_scan_is_full(row):
             market_filter = None
+        elif args.selected_market_only and selected_market:
+            market_filter = {selected_market}
         else:
             market_filter = changed_since_signal_scan.get(event_ticker, set())
             if not market_filter:
                 return
+        if args.selected_market_only and selected_market:
+            market_filter = {selected_market}
         new_trades = evaluate_event(
             event_ticker,
             event_states.get(event_ticker, {}),
@@ -1140,24 +1330,56 @@ def main() -> int:
             variants,
             traded_events,
             btc,
+            btc_time_values,
             event_cache,
             coinbase_ns,
             coinbase_prices,
             last_top_spot,
             args.max_btc_spot_age_sec,
+            model_ttl_override_min=args.model_ttl_override_min,
             market_filter=market_filter,
+            static_candidate_markets=static_candidate_markets_by_event.get(event_ticker, set()),
+            stats=replay_stats,
         )
         trade_rows.extend(new_trades)
         changed_since_signal_scan.pop(event_ticker, None)
 
     if args.full_stream:
         row_chunks = stream_top_rows(con, top_table, args.start, args.end, args.max_events, args.chunk_vectors)
+        if args.use_signal_scan_log:
+            signal_scans = load_signal_scans(
+                con,
+                signal_table,
+                args.start,
+                args.end,
+                candidate_scan_only=args.candidate_scan_only,
+                selected_scan_only=args.selected_scan_only,
+            )
     else:
         windows_used = discover_replay_windows(con, top_table, args.start, args.end, args.max_events)
         if windows_used.empty:
             row_chunks = iter(())
+            if args.use_signal_scan_log:
+                signal_scans = pd.DataFrame()
         else:
             install_replay_windows(con, windows_used)
+            if args.use_signal_scan_log:
+                signal_scans = load_signal_scans(
+                    con,
+                    signal_table,
+                    args.start,
+                    args.end,
+                    use_replay_windows=True,
+                    candidate_scan_only=args.candidate_scan_only,
+                    selected_scan_only=args.selected_scan_only,
+                )
+                if (args.candidate_scan_only or args.selected_scan_only) and not signal_scans.empty:
+                    scan_events = set(signal_scans["event_ticker"].astype(str).str.upper())
+                    windows_used = windows_used[windows_used["event_ticker"].astype(str).str.upper().isin(scan_events)].copy()
+                    install_replay_windows(con, windows_used)
+                elif args.candidate_scan_only or args.selected_scan_only:
+                    windows_used = windows_used.iloc[0:0].copy()
+                    install_replay_windows(con, windows_used)
             seed = load_seed_rows(con, top_table)
             for row in seed.itertuples(index=False):
                 event_ticker, btc_spot = apply_row_to_state(row)
@@ -1193,10 +1415,11 @@ def main() -> int:
                         flush=True,
                     )
                 if args.max_rows and rows_seen >= args.max_rows:
+                    stopped_early_by_max_rows = True
                     break
             if args.max_rows and rows_seen >= args.max_rows:
                 break
-        while scan_idx < len(scan_rows):
+        while not stopped_early_by_max_rows and scan_idx < len(scan_rows):
             process_signal_scan(scan_rows[scan_idx])
             groups_seen += 1
             scan_idx += 1
@@ -1215,6 +1438,7 @@ def main() -> int:
                 if args.progress_every_rows and rows_seen % args.progress_every_rows == 0:
                     print(f"streamed_rows={rows_seen} groups={groups_seen} trades={len(trade_rows)}", flush=True)
                 if args.max_rows and rows_seen >= args.max_rows:
+                    stopped_early_by_max_rows = True
                     break
             if args.max_rows and rows_seen >= args.max_rows:
                 break
@@ -1249,17 +1473,29 @@ def main() -> int:
         "full_stream": bool(args.full_stream),
         "live_scan_semantics": bool(args.live_scan_semantics),
         "use_signal_scan_log": bool(args.use_signal_scan_log),
+        "candidate_scan_only": bool(args.candidate_scan_only),
+        "selected_scan_only": bool(args.selected_scan_only),
+        "selected_market_only": bool(args.selected_market_only),
         "signal_scans_loaded": int(len(signal_scans)) if isinstance(signal_scans, pd.DataFrame) else 0,
+        "signal_scans_sql_window_pruned": bool(args.use_signal_scan_log and not args.full_stream),
+        "signal_scans_sql_candidate_pruned": bool(args.use_signal_scan_log and args.candidate_scan_only),
+        "signal_scans_sql_selected_pruned": bool(args.use_signal_scan_log and args.selected_scan_only),
         "scan_stride_sec": float(args.scan_stride_sec),
         "max_btc_spot_age_sec": float(args.max_btc_spot_age_sec),
+        "model_ttl_override_min": args.model_ttl_override_min,
         "event_windows": int(len(windows_used)) if isinstance(windows_used, pd.DataFrame) else 0,
+        "event_windows_pruned_to_signal_events": bool(
+            args.use_signal_scan_log and not args.full_stream and (args.candidate_scan_only or args.selected_scan_only)
+        ),
         "event_window_start": ns_to_utc(int(windows_used["replay_start_ns"].min())).isoformat()
         if isinstance(windows_used, pd.DataFrame) and not windows_used.empty
         else None,
         "event_window_end": ns_to_utc(int(windows_used["replay_end_ns"].max())).isoformat()
         if isinstance(windows_used, pd.DataFrame) and not windows_used.empty
         else None,
+        "replay_stats": dict(sorted(replay_stats.items())),
         "signals": int(len(trades)),
+        "stopped_early_by_max_rows": bool(stopped_early_by_max_rows),
         "settled_signals": int(trades["settled"].sum()) if "settled" in trades else 0,
         "captured_result_markets": int(len(captured_results)),
         "variants": [v.name for v in variants],
@@ -1267,12 +1503,23 @@ def main() -> int:
             "min_ttl_min": MIN_TTL_MIN,
             "max_ttl_min": MAX_TTL_MIN,
             "variant_specific_spread_entry_edge_thresholds": True,
+            "static_executable_book_prefilter": True,
             "visible_top_qty_min": 1.0,
             "one_trade_per_event_per_variant": True,
             "causal_order": "received_at_ns",
             "scan_stride_sec": float(args.scan_stride_sec),
+            "model_ttl_override_min": args.model_ttl_override_min,
             "scan_clock": "captured_signal_scan" if args.use_signal_scan_log else "orderbook_top_receive_groups",
             "changed_ticker_filter": bool(args.live_scan_semantics or args.use_signal_scan_log),
+            "candidate_scan_only": bool(args.candidate_scan_only),
+            "selected_scan_only": bool(args.selected_scan_only),
+            "selected_market_only": bool(args.selected_market_only),
+            "signal_scans_sql_window_pruned": bool(args.use_signal_scan_log and not args.full_stream),
+            "signal_scans_sql_candidate_pruned": bool(args.use_signal_scan_log and args.candidate_scan_only),
+            "signal_scans_sql_selected_pruned": bool(args.use_signal_scan_log and args.selected_scan_only),
+            "event_windows_pruned_to_signal_events": bool(
+                args.use_signal_scan_log and not args.full_stream and (args.candidate_scan_only or args.selected_scan_only)
+            ),
             "max_btc_spot_age_sec": float(args.max_btc_spot_age_sec),
         },
     }

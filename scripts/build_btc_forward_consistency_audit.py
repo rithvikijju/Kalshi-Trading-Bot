@@ -418,7 +418,103 @@ def kill_continue_metrics(kill_continue: pd.DataFrame, spec: CandidateSpec) -> d
     }
 
 
+def btc1h_remote_provenance_metrics(provenance: pd.DataFrame, spec: CandidateSpec) -> dict[str, Any]:
+    if spec.family != "BTC1H":
+        return {}
+    row = first_row(provenance, ledger=spec.shadow_name)
+    if row.empty:
+        return {
+            "btc1h_remote_provenance_verdict": "MISSING",
+            "btc1h_remote_deployable_now": False,
+            "btc1h_remote_status_fresh": False,
+            "btc1h_remote_official_rows": 0,
+            "btc1h_remote_official_pnl": 0.0,
+            "btc1h_remote_proxy_official_mismatches": 0,
+            "btc1h_clean_clock_status": "MISSING",
+            "btc1h_clean_clock_ready": False,
+            "btc1h_clean_clock_blocker_count": 0,
+        }
+    return {
+        "btc1h_remote_provenance_verdict": as_text(scalar(row, "provenance_verdict", "MISSING")),
+        "btc1h_remote_deployable_now": as_bool(scalar(row, "deployable_now", False)),
+        "btc1h_remote_local_shadow_running": as_bool(scalar(row, "local_shadow_running", False)),
+        "btc1h_remote_local_source_freshness_status": as_text(
+            scalar(row, "local_shadow_source_freshness_status", "")
+        ),
+        "btc1h_remote_local_process_hygiene_status": as_text(
+            scalar(row, "local_shadow_process_hygiene_status", "")
+        ),
+        "btc1h_remote_status_updated_at_utc": as_text(scalar(row, "remote_status_updated_at_utc", "")),
+        "btc1h_remote_status_age_minutes": as_float(scalar(row, "remote_status_age_minutes", 0.0)),
+        "btc1h_remote_status_fresh": as_bool(scalar(row, "remote_status_fresh", False)),
+        "btc1h_remote_status_enabled": as_bool(scalar(row, "remote_status_enabled", False)),
+        "btc1h_remote_status_failed": as_bool(scalar(row, "remote_status_failed", False)),
+        "btc1h_remote_status_queue_depth": as_int(scalar(row, "remote_status_queue_depth", 0)),
+        "btc1h_remote_db_signal_scan_rows": as_int(scalar(row, "remote_db_signal_scan_rows", 0)),
+        "btc1h_remote_db_order_decision_rows": as_int(scalar(row, "remote_db_order_decision_rows", 0)),
+        "btc1h_remote_sidecar_signal_scan_rows": as_int(
+            scalar(row, "remote_sidecar_signal_scan_rows", 0)
+        ),
+        "btc1h_remote_sidecar_order_decision_rows": as_int(
+            scalar(row, "remote_sidecar_order_decision_rows", 0)
+        ),
+        "btc1h_remote_official_created_at_utc": as_text(
+            scalar(row, "remote_official_created_at_utc", "")
+        ),
+        "btc1h_remote_official_age_minutes": as_float(
+            scalar(row, "remote_official_age_minutes", 0.0)
+        ),
+        "btc1h_remote_official_rows": as_int(scalar(row, "remote_official_rows", 0)),
+        "btc1h_remote_official_pnl": as_float(scalar(row, "remote_official_pnl", 0.0)),
+        "btc1h_remote_proxy_pnl": as_float(scalar(row, "remote_proxy_pnl", 0.0)),
+        "btc1h_remote_official_minus_proxy_pnl": as_float(
+            scalar(row, "remote_official_minus_proxy_pnl", 0.0)
+        ),
+        "btc1h_remote_proxy_official_mismatches": as_int(
+            scalar(row, "remote_proxy_official_mismatches", 0)
+        ),
+        "btc1h_remote_max_abs_basis": as_float(scalar(row, "remote_max_abs_basis", 0.0)),
+        "btc1h_clean_clock_status": as_text(scalar(row, "clean_clock_status", "")),
+        "btc1h_clean_clock_ready": as_bool(scalar(row, "clean_clock_ready", False)),
+        "btc1h_clean_clock_status_source": as_text(scalar(row, "clean_clock_status_source", "")),
+        "btc1h_clean_clock_status_age_minutes": as_float(
+            scalar(row, "clean_clock_status_age_minutes", 0.0)
+        ),
+        "btc1h_clean_clock_blocker_count": as_int(scalar(row, "clean_clock_blocker_count", 0)),
+        "btc1h_clean_clock_blank_policy_official_rows": as_int(
+            scalar(row, "clean_clock_blank_policy_official_rows", 0)
+        ),
+        "btc1h_clean_clock_official_rows": as_int(scalar(row, "clean_clock_official_rows", 0)),
+        "btc1h_clean_clock_official_proxy_mismatches": as_int(
+            scalar(row, "clean_clock_official_proxy_mismatches", 0)
+        ),
+    }
+
+
+def btc1h_remote_status(row: dict[str, Any]) -> str:
+    verdict = as_text(row.get("btc1h_remote_provenance_verdict", ""))
+    if not verdict:
+        return ""
+    if verdict == "REMOTE_STATUS_STALE_OR_UNAVAILABLE":
+        return "btc1h_remote_status_stale_or_unavailable"
+    if verdict == "REMOTE_EVIDENCE_BLOCKED_BY_CLEAN_CLOCK":
+        return "btc1h_remote_evidence_blocked_by_clean_clock"
+    if verdict == "REMOTE_OFFICIAL_ROWS_MISSING":
+        return "btc1h_remote_official_rows_missing"
+    if verdict == "MISSING":
+        return "btc1h_remote_provenance_missing"
+    if verdict == "REMOTE_CLEAN_CLOCK_READY" and not as_bool(
+        row.get("btc1h_remote_deployable_now", False)
+    ):
+        return "btc1h_remote_clean_clock_ready_but_not_deployable"
+    return ""
+
+
 def agreement_status(row: dict[str, Any], spec: CandidateSpec) -> str:
+    if spec.family == "BTC1H":
+        remote_status = btc1h_remote_status(row)
+        if remote_status:
+            return remote_status
     if not row.get("ready_running", False):
         return "not_running_or_status_missing"
     if as_int(row.get("shadow_duplicate_process_count", 0)) > 0 or row.get("shadow_process_hygiene_status") == "DUPLICATE_TARGET_PROCESSES":
@@ -476,6 +572,7 @@ def build_row(
     health: pd.DataFrame,
     kill_continue: pd.DataFrame,
     reconciliation: pd.DataFrame,
+    btc1h_remote_provenance: pd.DataFrame,
 ) -> dict[str, Any]:
     replay_dir = getattr(args, spec.replay_dir_arg) if spec.replay_dir_arg else None
     row: dict[str, Any] = {
@@ -493,6 +590,7 @@ def build_row(
     row.update(replay_metrics(replay_dir))
     row.update(row_reconciliation_metrics(reconciliation, spec))
     row.update(kill_continue_metrics(kill_continue, spec))
+    row.update(btc1h_remote_provenance_metrics(btc1h_remote_provenance, spec))
     row["agreement_status"] = agreement_status(row, spec)
 
     blockers: list[str] = []
@@ -538,6 +636,18 @@ def build_row(
             for token in row_reconciliation_blockers.split(";")
             if token
         )
+    if spec.family == "BTC1H":
+        remote_status = btc1h_remote_status(row)
+        if remote_status:
+            blockers.append(remote_status)
+        if not as_bool(row.get("btc1h_clean_clock_ready", False)):
+            blockers.append("btc1h_clean_evidence_clock_not_ready")
+        if as_int(row.get("btc1h_remote_official_rows", 0)) < spec.min_official_rows:
+            blockers.append("btc1h_too_few_remote_official_rows")
+        if as_int(row.get("btc1h_remote_proxy_official_mismatches", 0)) > 0:
+            blockers.append("btc1h_remote_proxy_official_mismatch")
+        if as_float(row.get("btc1h_remote_official_pnl", 0.0)) < 0:
+            blockers.append("btc1h_remote_official_pnl_negative")
     if row["agreement_status"] == "consistent_no_signal_no_promotion":
         blockers.append("consistent_no_signal_is_not_promotion_evidence")
 
@@ -594,6 +704,18 @@ def preferred_columns() -> list[str]:
         "health_top_detail_family",
         "health_btc_spot_age_p95_sec_since",
         "control_action",
+        "btc1h_remote_provenance_verdict",
+        "btc1h_remote_status_age_minutes",
+        "btc1h_remote_status_fresh",
+        "btc1h_remote_official_rows",
+        "btc1h_remote_official_pnl",
+        "btc1h_remote_proxy_pnl",
+        "btc1h_remote_official_minus_proxy_pnl",
+        "btc1h_remote_proxy_official_mismatches",
+        "btc1h_clean_clock_status",
+        "btc1h_clean_clock_ready",
+        "btc1h_clean_clock_blocker_count",
+        "btc1h_clean_clock_blank_policy_official_rows",
         "blocking_reasons",
         "next_step",
     ]
@@ -657,6 +779,7 @@ def main() -> int:
     basis_gates = read_csv(args.basis_risk_dir / "settlement_basis_risk_gates.csv")
     health = read_csv(args.signal_health_dir / "shadow_signal_health_summary.csv")
     kill_continue = read_csv(args.kill_continue_dir / "kill_continue_summary.csv")
+    btc1h_remote_provenance = read_csv(args.forward_report_dir / "btc1h_remote_provenance.csv")
 
     rows = [
         build_row(
@@ -669,6 +792,7 @@ def main() -> int:
             health=health,
             kill_continue=kill_continue,
             reconciliation=reconciliation,
+            btc1h_remote_provenance=btc1h_remote_provenance,
         )
         for spec in specs
     ]
@@ -687,6 +811,7 @@ def main() -> int:
     ]
     out = out[ordered]
     out.to_csv(args.out_dir / "forward_consistency_summary.csv", index=False)
+    btc1h_row = first_row(out, candidate="btc1h_high_conf80_entry70_no_chase")
 
     info = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -704,6 +829,20 @@ def main() -> int:
         "basis_risk_dir": str(args.basis_risk_dir),
         "signal_health_dir": str(args.signal_health_dir),
         "kill_continue_dir": str(args.kill_continue_dir),
+        "btc1h_remote_provenance_file": str(args.forward_report_dir / "btc1h_remote_provenance.csv"),
+        "btc1h_remote_provenance_verdict": as_text(
+            scalar(btc1h_row, "btc1h_remote_provenance_verdict", "MISSING")
+        ),
+        "btc1h_remote_status_age_minutes": as_float(
+            scalar(btc1h_row, "btc1h_remote_status_age_minutes", 0.0)
+        ),
+        "btc1h_remote_official_rows": as_int(scalar(btc1h_row, "btc1h_remote_official_rows", 0)),
+        "btc1h_remote_official_pnl": as_float(scalar(btc1h_row, "btc1h_remote_official_pnl", 0.0)),
+        "btc1h_remote_proxy_official_mismatches": as_int(
+            scalar(btc1h_row, "btc1h_remote_proxy_official_mismatches", 0)
+        ),
+        "btc1h_clean_clock_status": as_text(scalar(btc1h_row, "btc1h_clean_clock_status", "")),
+        "btc1h_clean_clock_ready": as_bool(scalar(btc1h_row, "btc1h_clean_clock_ready", False)),
         "q250_postfreeze_dir": str(args.q250_postfreeze_dir),
         "q250_yes_postfreeze_dir": str(args.q250_yes_postfreeze_dir),
         "q1000_postfreeze_dir": str(args.q1000_postfreeze_dir),
@@ -734,6 +873,11 @@ def main() -> int:
         "postfreeze_replay_official_source",
         "postfreeze_replay_official_trades",
         "health_signal_nonzero_rows_since",
+        "btc1h_remote_provenance_verdict",
+        "btc1h_remote_official_rows",
+        "btc1h_remote_official_pnl",
+        "btc1h_remote_proxy_official_mismatches",
+        "btc1h_clean_clock_status",
         "blocking_reasons",
     ]
     compact = out[[col for col in compact_cols if col in out.columns]].copy()
@@ -769,7 +913,14 @@ def main() -> int:
         "",
         "- No candidate has enough agreement evidence for promotion.",
         btc15m_interpretation,
-        "- BTC1H remains blocked even if recent official PnL is positive: the official sample is tiny, proxy settlement disagrees on at least one row, source freshness is stale, and readiness still fails.",
+        (
+            "- BTC1H remote official evidence is explicit in this audit: "
+            f"`{info['btc1h_remote_official_rows']}` remote official row(s), "
+            f"PnL `{info['btc1h_remote_official_pnl']}`, provenance "
+            f"`{info['btc1h_remote_provenance_verdict']}`, clean-clock status "
+            f"`{info['btc1h_clean_clock_status']}`."
+        ),
+        "- BTC1H remains blocked even if recent official PnL is positive: the official sample is tiny, proxy settlement disagrees on at least one row, clean-clock provenance is blocked/stale, and readiness still fails.",
         "- Any future promotion discussion must start from official-settlement rows gathered after the freeze, without retuning thresholds on the same window.",
         "",
         "Full fields are in `forward_consistency_summary.csv`.",

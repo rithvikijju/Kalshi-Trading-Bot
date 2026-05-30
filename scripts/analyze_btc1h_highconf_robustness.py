@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import sys
+import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -24,7 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config.btc_1hr_config import kalshi_fee_dollars  # noqa: E402
 
-OUT_DIR = PROJECT_ROOT / "backtest_outputs" / f"btc1h_highconf_robustness_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+DEFAULT_OUT_DIR = PROJECT_ROOT / "backtest_outputs" / f"btc1h_highconf_robustness_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 MODELS = [
     "current_1h_late_loss_guard",
     "research_original_late",
@@ -33,6 +34,12 @@ MODELS = [
     "high_conf_80_entry70_no_chase",
     "high_conf_80_entry59_70_no_chase",
 ]
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    return p.parse_args()
 
 
 def latest_dir(pattern: str) -> Path | None:
@@ -172,13 +179,15 @@ def markdown_table(df: pd.DataFrame) -> str:
 
 
 def main() -> int:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
     files = default_trade_files()
     frames = [read_trades(path, dataset, source, cadence) for path, dataset, source, cadence in files]
     trades = pd.concat([f for f in frames if not f.empty], ignore_index=True) if frames else pd.DataFrame()
     if trades.empty:
         raise SystemExit("No BTC1H high-confidence trade files found.")
-    trades.to_csv(OUT_DIR / "all_input_trades.csv", index=False)
+    trades.to_csv(out_dir / "all_input_trades.csv", index=False)
 
     stress_levels = [0.0, 1.0, 2.0, 3.0]
     split_rows = []
@@ -194,9 +203,9 @@ def main() -> int:
     source_summary = pd.concat(source_rows, ignore_index=True)
     cadence_summary = pd.concat(cadence_rows, ignore_index=True) if cadence_rows else pd.DataFrame()
 
-    split_summary.to_csv(OUT_DIR / "split_stress_summary.csv", index=False)
-    source_summary.to_csv(OUT_DIR / "source_stress_summary.csv", index=False)
-    cadence_summary.to_csv(OUT_DIR / "ws_cadence_stress_summary.csv", index=False)
+    split_summary.to_csv(out_dir / "split_stress_summary.csv", index=False)
+    source_summary.to_csv(out_dir / "source_stress_summary.csv", index=False)
+    cadence_summary.to_csv(out_dir / "ws_cadence_stress_summary.csv", index=False)
 
     base = source_summary[source_summary["extra_stress_cents"].eq(0.0)].copy()
     extra2 = source_summary[source_summary["extra_stress_cents"].eq(2.0)].copy()
@@ -249,8 +258,8 @@ def main() -> int:
         "- Extra stress tests are adverse-entry approximations; they do not replace live FOK fill validation.",
         "",
     ]
-    (OUT_DIR / "report.md").write_text("\n".join(report), encoding="utf-8")
-    print(f"Wrote {OUT_DIR}")
+    (out_dir / "report.md").write_text("\n".join(report), encoding="utf-8")
+    print(f"Wrote {out_dir}")
     print(base.sort_values(["source", "pnl"], ascending=[True, False]).to_string(index=False))
     return 0
 

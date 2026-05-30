@@ -3,14 +3,37 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 
 import pandas as pd
 
-from scripts.check_btc_deployment_readiness import apply_execution_and_schema_gates, apply_settlement_basis_gates
+from scripts import check_btc_deployment_readiness as readiness
+from scripts.check_btc_deployment_readiness import (
+    apply_btc1h_basis_mismatch_audit,
+    apply_execution_and_schema_gates,
+    apply_settlement_basis_gates,
+)
 
 
 class BtcReadinessRowReconciliationTests(unittest.TestCase):
+    def test_btc1h_replay_reconciliation_prefers_stable_latest_dir(self) -> None:
+        old_root = readiness.BACKTEST_ROOT
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                readiness.BACKTEST_ROOT = Path(tmp)
+                stable = readiness.BACKTEST_ROOT / "btc1h_replay_vs_ledger_reconciliation_latest_codex"
+                fullscan = (
+                    readiness.BACKTEST_ROOT
+                    / "btc1h_replay_vs_ledger_reconciliation_fullscan_prefilter_highconf_latest_codex"
+                )
+                stable.mkdir()
+                fullscan.mkdir()
+                self.assertEqual(readiness.latest_btc1h_replay_reconciliation_dir(), stable)
+        finally:
+            readiness.BACKTEST_ROOT = old_root
+
     def test_running_shadow_predating_source_blocks_readiness(self) -> None:
         summary = pd.DataFrame(
             [
@@ -388,6 +411,96 @@ class BtcReadinessRowReconciliationTests(unittest.TestCase):
         self.assertEqual(row["row_reconciliation_status"], "REPLAY_ROWS_WITHOUT_PAPER_SHADOW")
         self.assertIn("paper_replay_row_reconciliation_not_passing", row["failure_reasons"])
         self.assertIn("row_reconciliation_replay_rows_without_paper_match", row["failure_reasons"])
+
+    def test_btc1h_blank_model_policy_epoch_blocks_readiness(self) -> None:
+        summary = pd.DataFrame(
+            [
+                {
+                    "family": "BTC1H",
+                    "candidate": "high_conf_80_entry70_no_chase",
+                    "source": "btc1h_multi_holdout_research",
+                    "production_ready": True,
+                    "failure_reasons": "",
+                }
+            ]
+        )
+        policy_summary = pd.DataFrame(
+            [
+                {
+                    "ledger": "btc1h_high_conf80_entry70_no_chase_shadow",
+                    "scope": "since",
+                    "signal_strategy": "",
+                    "model_ttl_policy": "",
+                    "model_policy_version": "",
+                    "official_filled_rows": 11,
+                    "official_pnl": 0.5,
+                    "official_proxy_result_mismatches": 1,
+                }
+            ]
+        )
+
+        out = apply_execution_and_schema_gates(
+            summary,
+            execution_df=pd.DataFrame(),
+            schema_df=pd.DataFrame(),
+            post_restart_df=pd.DataFrame(),
+            row_reconciliation_df=pd.DataFrame(),
+            shadow_official_policy_df=policy_summary,
+            btc1h_expected_ttl_policy="scan_time_close_minus_now_v1",
+            btc1h_expected_policy_version="btc1h_live_model_20260522_scan_ttl_v1",
+            min_live_official_trades=30,
+        )
+
+        row = out.iloc[0]
+        self.assertFalse(bool(row["production_ready"]))
+        self.assertEqual(row["shadow_official_policy_status"], "EXPECTED_POLICY_MISSING")
+        self.assertEqual(row["shadow_official_policy_blank_rows"], 11)
+        self.assertIn("shadow_official_expected_policy_missing", row["failure_reasons"])
+        self.assertIn("shadow_official_blank_policy_rows_present", row["failure_reasons"])
+
+    def test_btc1h_basis_mismatch_audit_blocks_near_deployable_candidate(self) -> None:
+        summary = pd.DataFrame(
+            [
+                {
+                    "family": "BTC1H",
+                    "candidate": "high_conf_80_entry70_no_chase",
+                    "source": "btc1h_multi_holdout_research",
+                    "production_ready": True,
+                    "failure_reasons": "",
+                }
+            ]
+        )
+        basis = pd.DataFrame(
+            [
+                {
+                    "audit_status": "TOO_FEW_OFFICIAL_ROWS;OBSERVED_PROXY_OFFICIAL_MISMATCH;PROXY_WIN_OFFICIAL_LOSS_FLIP",
+                    "deployable_guard_now": False,
+                    "guard_recommendation": "diagnostic_only_collect_clean_post_restart_rows",
+                    "official_rows": 11,
+                    "official_pnl": 0.5,
+                    "proxy_pnl": 1.5,
+                    "official_minus_proxy_pnl": -1.0,
+                    "official_proxy_mismatches": 1,
+                    "official_proxy_mismatch_rate": 0.0909,
+                    "proxy_win_official_loss_flips": 1,
+                    "near_proxy_boundary_rows": 4,
+                    "near_official_boundary_rows": 4,
+                    "p95_abs_official_minus_proxy_spot": 78.915,
+                    "max_abs_official_minus_proxy_spot": 87.42,
+                    "max_adverse_basis_usd": 87.42,
+                }
+            ]
+        )
+
+        out = apply_btc1h_basis_mismatch_audit(summary, basis, min_official_rows=30)
+
+        row = out.iloc[0]
+        self.assertFalse(bool(row["production_ready"]))
+        self.assertEqual(row["btc1h_basis_official_proxy_mismatches"], 1)
+        self.assertEqual(row["btc1h_basis_proxy_win_official_loss_flips"], 1)
+        self.assertIn("btc1h_basis_proxy_official_mismatch_present", row["failure_reasons"])
+        self.assertIn("btc1h_basis_proxy_win_official_loss_flip", row["failure_reasons"])
+        self.assertIn("btc1h_basis_guard_not_deployable", row["failure_reasons"])
 
     def test_settlement_basis_gate_blocks_q250_no_side_basis_risk(self) -> None:
         summary = pd.DataFrame(

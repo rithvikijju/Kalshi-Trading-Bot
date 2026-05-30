@@ -26,6 +26,27 @@ if str(PROJECT_ROOT) not in sys.path:
 
 BACKTEST_ROOT = PROJECT_ROOT / "backtest_outputs"
 DEFAULT_OUT = BACKTEST_ROOT / f"btc_shadow_restart_preflight_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+REQUIRED_REPLAY_SIGNAL_SCAN_FIELDS = [
+    "signal_strategy",
+    "model_ttl_policy",
+    "model_policy_version",
+    "edge_threshold_cents",
+    "spread_cents",
+    "top_visible_qty",
+    "quote_received_at_ns",
+    "quote_age_ms",
+    "ttl_min",
+    "close_time",
+    "btc_candle_time",
+    "btc_candle_age_sec",
+    "btc_rv60",
+    "btc_ret_10m_usd",
+]
+REQUIRED_REPLAY_ORDER_DECISION_FIELDS = [
+    "signal_strategy",
+    "model_ttl_policy",
+    "model_policy_version",
+]
 
 from scripts import btc_1hr_research_live as live  # noqa: E402
 from scripts.build_btc_ledger_schema_preflight import (  # noqa: E402
@@ -210,17 +231,76 @@ def sample_capture_rows(ledger: str) -> list[tuple[str, dict[str, Any]]]:
                 "candidate_count": 1,
                 "selected_market": market_ticker,
                 "selected_side": "yes",
+                "signal_strategy": "high_conf_80_entry70_no_chase" if ledger.startswith("btc1h") else "preflight",
+                "model_ttl_policy": live.MODEL_TTL_POLICY,
+                "model_policy_version": live.MODEL_POLICY_VERSION,
                 "entry_price": 0.42,
                 "net_edge_cents": 20.0,
                 "model_p_yes": 0.64,
+                "edge_threshold_cents": 12.0,
+                "spread_cents": 1.0,
+                "top_visible_qty": 321.0,
+                "quote_received_at_ns": now_ns,
+                "quote_age_ms": 2.0,
+                "ttl_min": 11.0,
+                "close_time": now.isoformat(),
                 "btc_spot": 100050.0,
+                "btc_candle_time": now.isoformat(),
+                "btc_candle_age_sec": 0.5,
+                "btc_rv60": 0.25,
+                "btc_ret_10m_usd": 12.34,
                 "latency_ms": 1.0,
                 "blocked_events": 0,
                 "action": "preflight_candidate",
                 "detail": "capture_sidecar_preflight",
             },
         ),
+        (
+            "order_decision",
+            {
+                "received_at_ns": now_ns + 3,
+                "received_at_utc": iso,
+                "mode": "paper",
+                "action": "paper_filled",
+                "signal_strategy": "high_conf_80_entry70_no_chase" if ledger.startswith("btc1h") else "preflight",
+                "model_ttl_policy": live.MODEL_TTL_POLICY,
+                "model_policy_version": live.MODEL_POLICY_VERSION,
+                "event_ticker": event_ticker,
+                "market_ticker": market_ticker,
+                "side": "yes",
+                "contracts": 1,
+                "entry_price": 0.42,
+                "yes_limit_price": 0.42,
+                "net_edge_cents": 20.0,
+                "btc_spot": 100050.0,
+                "estimated_cost": 0.44,
+                "portfolio_available": 100.0,
+                "portfolio_value": 100.0,
+                "client_order_id": "preflight",
+                "detail": "capture_sidecar_preflight",
+            },
+        ),
     ]
+
+
+def replay_sidecar_fields(path: Path) -> dict[str, set[str]]:
+    replay_path = path.with_name(path.name + ".replay.jsonl")
+    fields: dict[str, set[str]] = {}
+    if not replay_path.exists():
+        return fields
+    with replay_path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            table = str(row.get("table") or "")
+            if not table or table in fields:
+                continue
+            fields[table] = {str(key) for key in row if key != "table"}
+            if {"signal_scan", "order_decision"}.issubset(fields):
+                break
+    return fields
 
 
 def check_fresh_capture_sidecar(ledger: str, path: Path) -> dict[str, Any]:
@@ -229,6 +309,9 @@ def check_fresh_capture_sidecar(ledger: str, path: Path) -> dict[str, Any]:
     status_path = path.with_name(path.name + ".status.json")
     if status_path.exists():
         status_path.unlink()
+    replay_path = path.with_name(path.name + ".replay.jsonl")
+    if replay_path.exists():
+        replay_path.unlink()
     recorder = live.LiveCaptureWriter(path, enabled=True, capture_raw_ws=True)
     try:
         for table, row in sample_capture_rows(ledger):
@@ -246,17 +329,29 @@ def check_fresh_capture_sidecar(ledger: str, path: Path) -> dict[str, Any]:
         "fresh_capture_signal_rows": 0,
         "fresh_capture_signal_nonzero_rows": 0,
         "fresh_capture_sidecar_updated_at_utc": "",
+        "fresh_capture_replay_schema_status": "FAIL_REPLAY_SIDECAR_SCHEMA",
+        "fresh_capture_replay_schema_error": "",
+        "fresh_capture_replay_signal_missing_fields": "",
+        "fresh_capture_replay_order_missing_fields": "",
     }
     try:
         payload = json.loads(status_path.read_text(encoding="utf-8-sig"))
         rows_by_table = payload.get("rows_by_table") if isinstance(payload.get("rows_by_table"), dict) else {}
+        replay_rows_by_table = (
+            payload.get("replay_sidecar_rows_by_table")
+            if isinstance(payload.get("replay_sidecar_rows_by_table"), dict)
+            else {}
+        )
         latest_by_table = payload.get("latest_utc_by_table") if isinstance(payload.get("latest_utc_by_table"), dict) else {}
         result.update(
             {
                 "fresh_capture_health_rows": int(rows_by_table.get("capture_health") or 0),
                 "fresh_capture_top_rows": int(rows_by_table.get("ws_orderbook_top") or 0),
                 "fresh_capture_signal_rows": int(rows_by_table.get("signal_scan") or 0),
+                "fresh_capture_order_decision_rows": int(rows_by_table.get("order_decision") or 0),
                 "fresh_capture_signal_nonzero_rows": int(payload.get("signal_scan_nonzero_candidate_rows") or 0),
+                "fresh_capture_replay_signal_rows": int(replay_rows_by_table.get("signal_scan") or 0),
+                "fresh_capture_replay_order_decision_rows": int(replay_rows_by_table.get("order_decision") or 0),
                 "fresh_capture_sidecar_updated_at_utc": str(payload.get("updated_at_utc") or ""),
             }
         )
@@ -272,12 +367,32 @@ def check_fresh_capture_sidecar(ledger: str, path: Path) -> dict[str, Any]:
             failures.append("missing_ws_orderbook_top_rows")
         if result["fresh_capture_signal_rows"] < 1:
             failures.append("missing_signal_scan_rows")
+        if result["fresh_capture_order_decision_rows"] < 1:
+            failures.append("missing_order_decision_rows")
         if result["fresh_capture_signal_nonzero_rows"] < 1:
             failures.append("missing_nonzero_candidate_rows")
         if missing_latest:
             failures.append("missing_latest_utc_for_" + ";".join(missing_latest))
         if payload.get("failed"):
             failures.append("writer_failed")
+        replay_fields = replay_sidecar_fields(path)
+        signal_missing = sorted(set(REQUIRED_REPLAY_SIGNAL_SCAN_FIELDS) - replay_fields.get("signal_scan", set()))
+        order_missing = sorted(set(REQUIRED_REPLAY_ORDER_DECISION_FIELDS) - replay_fields.get("order_decision", set()))
+        result["fresh_capture_replay_signal_missing_fields"] = ";".join(signal_missing)
+        result["fresh_capture_replay_order_missing_fields"] = ";".join(order_missing)
+        replay_failures = []
+        if result["fresh_capture_replay_signal_rows"] < 1:
+            replay_failures.append("missing_replay_signal_scan_rows")
+        if result["fresh_capture_replay_order_decision_rows"] < 1:
+            replay_failures.append("missing_replay_order_decision_rows")
+        if signal_missing:
+            replay_failures.append("missing_replay_signal_fields:" + ";".join(signal_missing))
+        if order_missing:
+            replay_failures.append("missing_replay_order_fields:" + ";".join(order_missing))
+        if replay_failures:
+            result["fresh_capture_replay_schema_error"] = "|".join(replay_failures)
+        else:
+            result["fresh_capture_replay_schema_status"] = "PASS_REPLAY_SIDECAR_SCHEMA"
         if failures:
             result["fresh_capture_sidecar_error"] = ";".join(failures)
         else:
@@ -401,6 +516,7 @@ def compact_table(rows: list[dict[str, Any]]) -> str:
         "copy_after_schema_status",
         "copy_insert_status",
         "fresh_capture_sidecar_status",
+        "fresh_capture_replay_schema_status",
         "copy_rows_before",
         "copy_rows_with_realism_before",
         "copy_rows_with_realism_after_insert",
@@ -416,6 +532,8 @@ def compact_table(rows: list[dict[str, Any]]) -> str:
 
 def row_status(row: dict[str, Any]) -> str:
     if row.get("fresh_capture_sidecar_status") != "PASS_CAPTURE_SIDECAR":
+        return "FAIL_RESTART_PATH"
+    if row.get("fresh_capture_replay_schema_status") != "PASS_REPLAY_SIDECAR_SCHEMA":
         return "FAIL_RESTART_PATH"
     if not row.get("active_db_exists", False):
         required = [
@@ -485,7 +603,10 @@ def main() -> int:
         "note": "Non-destructive preflight only. Active live/paper processes were not stopped, restarted, or migrated.",
         "required_base_columns": REQUIRED_BASE_COLUMNS,
         "required_realism_columns": REQUIRED_REALISM_COLUMNS,
+        "required_replay_signal_scan_fields": REQUIRED_REPLAY_SIGNAL_SCAN_FIELDS,
+        "required_replay_order_decision_fields": REQUIRED_REPLAY_ORDER_DECISION_FIELDS,
         "requires_capture_status_sidecar": True,
+        "requires_replay_sidecar_model_input_fields": True,
     }
     (args.out_dir / "run_info.json").write_text(json.dumps(info, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -503,6 +624,7 @@ def main() -> int:
         "- This is a non-destructive preflight; it uses fresh DBs and copies of active DBs.",
         "- A PASS means the current code can create or migrate the required schema after an explicit user-authorized restart/migration.",
         "- A PASS also requires the current capture writer to emit a lock-free status sidecar from a fresh capture DB.",
+        "- A PASS also requires the lock-free replay sidecar to preserve exact model-input fields needed by BTC1H clean evidence-clock replay.",
         "- It does not make the currently running shadows deployable, because their live ledger handles still point at stale schemas.",
         "",
         "## Run Info",

@@ -9,6 +9,7 @@ from scripts.build_btc_post_restart_collection_gate import LEDGER_SPECS, gate_le
 from scripts.build_btc_post_restart_collection_gate import read_json as read_gate_json
 from scripts.check_btc_shadow_official_settlement import (
     SHADOW_OFFICIAL_TRADE_COLUMNS,
+    summarize_by_policy,
     write_csv,
 )
 
@@ -59,6 +60,45 @@ class BtcShadowOfficialEmptyOutputTests(unittest.TestCase):
 
         self.assertEqual(row["gate_status"], "NO_POST_RESTART_ROWS")
         self.assertEqual(row["failure_reasons"], "no_post_restart_paper_rows;too_few_post_restart_official_rows")
+
+    def test_policy_summary_accepts_null_policy_fields(self) -> None:
+        rows = [
+            {
+                "ledger": "btc1h_high_conf80_entry70_no_chase_shadow",
+                "signal_strategy": None,
+                "model_ttl_policy": None,
+                "model_policy_version": None,
+                "status": "paper_filled",
+                "official_result": "yes",
+                "official_pnl": 0.24,
+                "official_premium": 0.76,
+                "official_win": True,
+            },
+            {
+                "ledger": "btc1h_high_conf80_entry70_no_chase_shadow",
+                "signal_strategy": "high_conf_80_entry70_no_chase",
+                "model_ttl_policy": "scan_time_close_minus_now_v1",
+                "model_policy_version": "btc1h_live_model_20260522_scan_ttl_v1",
+                "status": "paper_filled",
+                "official_result": "no",
+                "official_pnl": -0.61,
+                "official_premium": 0.61,
+                "official_win": False,
+            },
+        ]
+
+        summary = summarize_by_policy(rows, since_utc="")
+
+        self.assertEqual(len(summary), 4)
+        blank_policy = [
+            row
+            for row in summary
+            if row["scope"] == "all"
+            and row["signal_strategy"] == ""
+            and row["model_ttl_policy"] == ""
+            and row["model_policy_version"] == ""
+        ][0]
+        self.assertEqual(blank_policy["official_filled_rows"], 1)
 
 
 if __name__ == "__main__":

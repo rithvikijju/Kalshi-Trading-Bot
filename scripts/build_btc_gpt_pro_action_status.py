@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--starvation-dir", type=Path, default=BACKTEST_ROOT / "btc15m_signal_starvation_latest_codex")
     p.add_argument("--side-semantics-dir", type=Path, default=BACKTEST_ROOT / "btc15m_first_signal_side_semantics_latest_codex")
     p.add_argument("--btc1h-coverage-dir", type=Path, default=BACKTEST_ROOT / "btc1h_replay_coverage_audit_latest_codex")
+    p.add_argument(
+        "--btc1h-promotion-deficit-dir",
+        type=Path,
+        default=BACKTEST_ROOT / "btc1h_candidate_promotion_deficit_latest_codex",
+    )
     p.add_argument("--basis-model-dir", type=Path, default=BACKTEST_ROOT / "btc_settlement_basis_model_feasibility_latest_codex")
     p.add_argument("--official-feature-dir", type=Path, default=BACKTEST_ROOT / "btc_official_settlement_feature_table_latest_codex")
     p.add_argument("--drawdown-dir", type=Path, default=BACKTEST_ROOT / "btc_drawdown_sequence_audit_latest_codex")
@@ -358,6 +363,118 @@ def process_hygiene_gate_summary(shadow_info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def btc1h_remote_provenance_gate_summary(consistency_row: dict[str, Any]) -> dict[str, Any]:
+    if not consistency_row:
+        return {
+            "passes": False,
+            "status": "BLOCKS_BTC1H_PROMOTION",
+            "evidence": "btc1h consistency row missing",
+            "verdict": "MISSING",
+            "status_age_minutes": 0.0,
+            "official_rows": 0,
+            "official_pnl": 0.0,
+            "proxy_official_mismatches": 0,
+            "clean_clock_status": "MISSING",
+            "clean_clock_ready": False,
+        }
+    verdict = text(consistency_row.get("btc1h_remote_provenance_verdict", "MISSING"))
+    status_age = num(consistency_row.get("btc1h_remote_status_age_minutes", 0), 0)
+    status_fresh = boolish(consistency_row.get("btc1h_remote_status_fresh", False))
+    official_rows = int(num(consistency_row.get("btc1h_remote_official_rows", 0), 0))
+    official_pnl = num(consistency_row.get("btc1h_remote_official_pnl", 0), 0)
+    mismatches = int(num(consistency_row.get("btc1h_remote_proxy_official_mismatches", 0), 0))
+    clean_status = text(consistency_row.get("btc1h_clean_clock_status", ""))
+    clean_ready = boolish(consistency_row.get("btc1h_clean_clock_ready", False))
+    blockers = text(consistency_row.get("blocking_reasons", ""))
+    passes = (
+        verdict == "REMOTE_CLEAN_CLOCK_READY"
+        and status_fresh
+        and clean_ready
+        and official_rows >= 50
+        and mismatches == 0
+        and official_pnl > 0
+    )
+    evidence = (
+        f"verdict={verdict}; "
+        f"remote_status_age_minutes={status_age}; "
+        f"remote_status_fresh={status_fresh}; "
+        f"remote_official_rows={official_rows}; "
+        f"remote_official_pnl={official_pnl}; "
+        f"remote_proxy_official_mismatches={mismatches}; "
+        f"clean_clock_status={clean_status}; "
+        f"clean_clock_ready={clean_ready}"
+    )
+    if blockers:
+        evidence = f"{evidence}; blockers={blockers}"
+    return {
+        "passes": passes,
+        "status": "REVIEW_REQUIRED" if passes else "BLOCKS_BTC1H_PROMOTION",
+        "evidence": evidence,
+        "verdict": verdict,
+        "status_age_minutes": status_age,
+        "official_rows": official_rows,
+        "official_pnl": official_pnl,
+        "proxy_official_mismatches": mismatches,
+        "clean_clock_status": clean_status,
+        "clean_clock_ready": clean_ready,
+    }
+
+
+def btc1h_candidate_promotion_deficit_gate_summary(deficit_row: dict[str, Any]) -> dict[str, Any]:
+    if not deficit_row:
+        return {
+            "passes": False,
+            "status": "BLOCKS_BTC1H_PROMOTION",
+            "evidence": "btc1h candidate promotion deficit summary missing",
+            "near_deployable_count": 0,
+            "clean_row_deficit": 0,
+            "mismatch_excess": 0.0,
+            "replay_exact_deficit": 0.0,
+            "execution_field_deficit": 0.0,
+        }
+    near_count = int(num(deficit_row.get("candidates_current_artifacts_can_make_near_deployable", 0), 0))
+    no_countable = int(num(deficit_row.get("candidates_with_no_promotion_countable_data", 0), 0))
+    clean_deficit = int(num(deficit_row.get("clean_official_row_deficit", 0), 0))
+    mismatch_excess = num(deficit_row.get("active_proxy_official_mismatch_rate_excess", 0), 0)
+    replay_deficit = num(deficit_row.get("active_replay_exact_match_rate_deficit", 0), 0)
+    execution_deficit = num(deficit_row.get("active_execution_field_complete_rate_deficit", 0), 0)
+    missing_fields = int(num(deficit_row.get("faithful_replay_missing_required_field_count", 0), 0))
+    faithful_support = boolish(deficit_row.get("faithful_replay_current_artifacts_can_support", False))
+    objective_complete = boolish(deficit_row.get("objective_complete", False))
+    passes = (
+        objective_complete
+        and near_count > 0
+        and no_countable == 0
+        and clean_deficit == 0
+        and mismatch_excess == 0
+        and replay_deficit == 0
+        and execution_deficit == 0
+        and missing_fields == 0
+        and faithful_support
+    )
+    return {
+        "passes": passes,
+        "status": "REVIEW_REQUIRED" if passes else "BLOCKS_BTC1H_PROMOTION",
+        "evidence": (
+            f"current_artifacts_near_deployable_candidates={near_count}; "
+            f"no_promotion_countable_candidates={no_countable}; "
+            f"clean_row_deficit={clean_deficit}; "
+            f"active_mismatch_excess={mismatch_excess}; "
+            f"active_replay_exact_deficit={replay_deficit}; "
+            f"active_execution_field_deficit={execution_deficit}; "
+            f"faithful_missing_fields={missing_fields}; "
+            f"faithful_artifacts_support={faithful_support}"
+        ),
+        "near_deployable_count": near_count,
+        "clean_row_deficit": clean_deficit,
+        "mismatch_excess": mismatch_excess,
+        "replay_exact_deficit": replay_deficit,
+        "execution_field_deficit": execution_deficit,
+        "missing_fields": missing_fields,
+        "faithful_artifacts_support": faithful_support,
+    }
+
+
 def latest_review_excerpt(path: Path) -> str:
     if not path.exists():
         return "missing_gpt_pro_review"
@@ -391,7 +508,9 @@ def candidate_row(
     reconciliation_row: dict[str, Any],
     policy_row: dict[str, Any],
     evidence_clock_ready: bool,
+    consistency_row: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    consistency_row = consistency_row or {}
     running = boolish(shadow_row.get("running", False))
     source_freshness_status = text(shadow_row.get("source_freshness_status", ""))
     process_predates_latest_source = boolish(shadow_row.get("process_predates_latest_source", False))
@@ -421,6 +540,10 @@ def candidate_row(
         status = "DEPLOYMENT_REVIEW_POSSIBLE"
     elif source_freshness_stale:
         status = "RUNNING_SOURCE_STALE_RESTART_REQUIRED"
+    elif candidate.startswith("btc1h_") and text(
+        consistency_row.get("agreement_status", "")
+    ).startswith("btc1h_remote_"):
+        status = text(consistency_row.get("agreement_status", "")).upper()
     elif can_collect_after_auth:
         status = "WAITING_FOR_EXPLICIT_PAPER_RESTART_AUTHORIZATION"
     elif not running and "yes" in candidate:
@@ -474,6 +597,24 @@ def candidate_row(
         "row_reconciliation_promotion_usable": row_reconciliation_promotion_usable,
         "row_reconciliation_matched_rows": num(reconciliation_row.get("matched_rows", 0), 0),
         "row_reconciliation_blockers": text(reconciliation_row.get("blocking_reasons", "")),
+        "forward_consistency_status": text(consistency_row.get("agreement_status", "")),
+        "forward_consistency_blockers": text(consistency_row.get("blocking_reasons", "")),
+        "btc1h_remote_provenance_verdict": text(
+            consistency_row.get("btc1h_remote_provenance_verdict", "")
+        ),
+        "btc1h_remote_status_age_minutes": num(
+            consistency_row.get("btc1h_remote_status_age_minutes", 0), 0
+        ),
+        "btc1h_remote_status_fresh": boolish(
+            consistency_row.get("btc1h_remote_status_fresh", False)
+        ),
+        "btc1h_remote_official_rows": num(consistency_row.get("btc1h_remote_official_rows", 0), 0),
+        "btc1h_remote_official_pnl": num(consistency_row.get("btc1h_remote_official_pnl", 0), 0),
+        "btc1h_remote_proxy_official_mismatches": num(
+            consistency_row.get("btc1h_remote_proxy_official_mismatches", 0), 0
+        ),
+        "btc1h_clean_clock_status": text(consistency_row.get("btc1h_clean_clock_status", "")),
+        "btc1h_clean_clock_ready": boolish(consistency_row.get("btc1h_clean_clock_ready", False)),
         "freeze_status": text(freeze_row.get("status", "")),
         "freeze_min_future_official_rows": text(freeze_row.get("min_future_official_rows", "")),
         "next_allowed_action": text(
@@ -513,6 +654,9 @@ def main() -> int:
     starvation = read_csv(args.starvation_dir / "signal_starvation_summary.csv")
     side_semantics = read_csv(args.side_semantics_dir / "first_signal_side_semantics_summary.csv")
     btc1h_coverage = read_csv(args.btc1h_coverage_dir / "btc1h_replay_coverage_summary.csv")
+    btc1h_promotion_deficit = read_csv(
+        args.btc1h_promotion_deficit_dir / "btc1h_candidate_promotion_deficit_summary.csv"
+    )
     feature_summary = read_csv(args.official_feature_dir / "official_settlement_feature_summary.csv")
     guard = read_csv(args.basis_model_dir / "basis_guard_deployment_verdict.csv")
     drawdown = read_csv(args.drawdown_dir / "drawdown_sequence_summary.csv")
@@ -558,6 +702,10 @@ def main() -> int:
     btc1h_replayable_rows = int(num(btc1h_since_coverage.get("replayable_rows", 0), 0))
     btc1h_paper_rows = int(num(btc1h_since_coverage.get("paper_rows", 0), 0))
     btc1h_locked_rows = int(num(btc1h_since_coverage.get("locked_blocked_rows", 0), 0))
+    btc1h_consistency_row = first_row(consistency, candidate="btc1h_high_conf80_entry70_no_chase")
+    btc1h_remote_gate = btc1h_remote_provenance_gate_summary(btc1h_consistency_row)
+    btc1h_deficit_row = btc1h_promotion_deficit.iloc[0].to_dict() if not btc1h_promotion_deficit.empty else {}
+    btc1h_deficit_gate = btc1h_candidate_promotion_deficit_gate_summary(btc1h_deficit_row)
     target_shadow_names = {
         "btc15m_q250_qty500_firstskip_shadow",
         "btc15m_q250_qty500_firstskip_yes_shadow",
@@ -748,6 +896,20 @@ def main() -> int:
             ),
             "next_action": "BTC1H needs a readable causal replay capture for since-freeze paper rows before row reconciliation can count.",
         },
+        {
+            "check": "btc1h_remote_provenance",
+            "status": btc1h_remote_gate["status"],
+            "passes_for_deployment": bool(btc1h_remote_gate["passes"]),
+            "evidence": btc1h_remote_gate["evidence"],
+            "next_action": "BTC1H remote official rows cannot count toward promotion until remote status is fresh, the clean evidence clock is ready, proxy/official mismatches are cleared or below gate, and at least 50 official rows exist.",
+        },
+        {
+            "check": "btc1h_candidate_promotion_deficit",
+            "status": btc1h_deficit_gate["status"],
+            "passes_for_deployment": bool(btc1h_deficit_gate["passes"]),
+            "evidence": btc1h_deficit_gate["evidence"],
+            "next_action": "Keep BTC1H observe-only until the numeric deficit audit shows clean rows, official/proxy agreement, execution fields, faithful replay, and policy identity all at zero deficit.",
+        },
     ]
     checks_df = pd.DataFrame(checks)
 
@@ -797,6 +959,7 @@ def main() -> int:
                 reconciliation_row=first_row(row_reconciliation, candidate=candidate),
                 policy_row=first_row(frozen_policy, candidate=candidate),
                 evidence_clock_ready=evidence_clock_ready,
+                consistency_row=first_row(consistency, candidate=candidate),
             )
         )
     candidates_df = pd.DataFrame(candidate_rows)
@@ -852,6 +1015,22 @@ def main() -> int:
         "btc1h_paper_rows_since": btc1h_paper_rows,
         "btc1h_locked_blocked_rows_since": btc1h_locked_rows,
         "btc1h_coverage_gate_pass": btc1h_coverage_gate_pass,
+        "btc1h_remote_provenance_gate_pass": btc1h_remote_gate["passes"],
+        "btc1h_remote_provenance_verdict": btc1h_remote_gate["verdict"],
+        "btc1h_remote_status_age_minutes": btc1h_remote_gate["status_age_minutes"],
+        "btc1h_remote_official_rows": btc1h_remote_gate["official_rows"],
+        "btc1h_remote_official_pnl": btc1h_remote_gate["official_pnl"],
+        "btc1h_remote_proxy_official_mismatches": btc1h_remote_gate["proxy_official_mismatches"],
+        "btc1h_clean_clock_status": btc1h_remote_gate["clean_clock_status"],
+        "btc1h_clean_clock_ready": btc1h_remote_gate["clean_clock_ready"],
+        "btc1h_candidate_promotion_deficit_gate_pass": btc1h_deficit_gate["passes"],
+        "btc1h_candidates_current_artifacts_can_make_near_deployable": btc1h_deficit_gate[
+            "near_deployable_count"
+        ],
+        "btc1h_clean_official_row_deficit": btc1h_deficit_gate["clean_row_deficit"],
+        "btc1h_active_proxy_official_mismatch_rate_excess": btc1h_deficit_gate["mismatch_excess"],
+        "btc1h_active_replay_exact_match_rate_deficit": btc1h_deficit_gate["replay_exact_deficit"],
+        "btc1h_active_execution_field_complete_rate_deficit": btc1h_deficit_gate["execution_field_deficit"],
     }
 
     checks_df.to_csv(args.out_dir / "gpt_pro_action_checklist.csv", index=False)
@@ -889,6 +1068,8 @@ def main() -> int:
         "- q1000 YES remains a sparse cleaner control.",
         "- BTC1H remains observe-only because the clean-schema official forward sample does not exist.",
         "- BTC1H since-freeze replay coverage is blocked while the active capture DB is locked and lacks a readable sidecar.",
+        "- BTC1H remote official rows are shown separately from local process status; stale remote status and the blocked clean evidence clock keep them out of promotion evidence.",
+        "- BTC1H promotion deficits are explicit: current artifacts must show zero clean-row, mismatch, execution-field, replay, faithful-capture, and policy-identity deficits before near-deployable discussion.",
         "- This artifact does not execute processes, deploy strategies, or tune thresholds.",
     ]
     (args.out_dir / "report.md").write_text("\n".join(report) + "\n", encoding="utf-8")

@@ -41,7 +41,36 @@ class BtcEvidenceStackRefreshTests(unittest.TestCase):
             "btc15m_next_forward_candidate_packet",
             "frozen_policy_parity",
             "btc1h_replay_coverage",
+            "btc1h_replay_root_cause_audit",
+            "btc1h_order_decision_replay_baseline",
+            "btc1h_order_decision_replay_baseline_reconciliation",
+            "btc1h_replay_repair_feasibility",
+            "btc1h_replay_repair_target_matrix",
+            "btc1h_replay_repair_prerequisite_audit",
+            "btc1h_replay_repair_attempt_audit",
+            "btc1h_faithful_replay_data_contract",
+            "btc1h_replay_source_contract_readiness",
+            "btc1h_clean_clock_collection_preflight",
+            "btc1h_clean_evidence_clock_gate",
+            "btc1h_basis_stress_audit",
+            "btc1h_variant_basis_stress_ranking",
+            "btc1h_decision_distance_guard_audit",
+            "btc1h_side_entry_profile_audit",
+            "btc1h_holdout_independence_audit",
+            "btc1h_statistical_confidence_audit",
+            "btc1h_replay_variant_overlap_audit",
+            "btc1h_entry59_floor_filter_audit",
+            "btc1h_no_chase_extra_row_audit",
+            "btc1h_research_priority_matrix",
             "deployment_readiness",
+            "btc1h_promotion_gap_matrix",
+            "btc1h_snapshot_execution_realism_audit",
+            "btc1h_execution_filter_impact_audit",
+            "btc1h_execution_filtered_basis_mismatch_audit",
+            "btc1h_official_pnl_path_audit",
+            "btc1h_objective_completion_audit",
+            "btc1h_candidate_promotion_deficit_audit",
+            "btc1h_remaining_evidence_manifest",
             "forward_evidence_report",
             "gpt_pro_action_status",
         ]:
@@ -65,12 +94,184 @@ class BtcEvidenceStackRefreshTests(unittest.TestCase):
         self.assertLess(names.index("post_restart_verification"), names.index("deployment_readiness"))
         self.assertLess(names.index("post_restart_verification"), names.index("gpt_pro_action_status"))
         self.assertLess(names.index("post_restart_verification"), names.index("gpt_pro_strategy_packet"))
+        self.assertLess(names.index("btc1h_multi_holdout_research"), names.index("btc1h_clean_evidence_clock_gate"))
+        self.assertLess(names.index("btc1h_clean_evidence_clock_gate"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_clean_evidence_clock_gate"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_clean_evidence_clock_gate"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_clean_evidence_clock_gate"), names.index("btc1h_replay_root_cause_audit"))
+        self.assertLess(names.index("restart_authorization_packet"), names.index("btc1h_clean_clock_collection_preflight"))
+        self.assertLess(names.index("post_restart_collection_gate"), names.index("btc1h_clean_clock_collection_preflight"))
+        self.assertLess(names.index("btc1h_clean_evidence_clock_gate"), names.index("btc1h_clean_clock_collection_preflight"))
+        self.assertLess(names.index("btc1h_replay_root_cause_audit"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_replay_root_cause_audit"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_replay_root_cause_audit"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_replay_root_cause_audit"), names.index("btc1h_order_decision_replay_baseline"))
+        self.assertLess(
+            names.index("btc1h_order_decision_replay_baseline"),
+            names.index("btc1h_order_decision_replay_baseline_reconciliation"),
+        )
+        self.assertLess(
+            names.index("btc1h_order_decision_replay_baseline_reconciliation"),
+            names.index("btc1h_replay_repair_feasibility"),
+        )
+        self.assertLess(names.index("btc1h_replay_root_cause_audit"), names.index("btc1h_replay_repair_feasibility"))
+        self.assertLess(names.index("btc1h_clean_evidence_clock_gate"), names.index("btc1h_replay_repair_feasibility"))
+        self.assertLess(names.index("btc1h_replay_repair_feasibility"), names.index("btc1h_replay_repair_target_matrix"))
+        self.assertLess(
+            names.index("btc1h_replay_repair_target_matrix"),
+            names.index("btc1h_replay_repair_prerequisite_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_replay_repair_prerequisite_audit"),
+            names.index("btc1h_replay_repair_attempt_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_replay_repair_attempt_audit"),
+            names.index("btc1h_faithful_replay_data_contract"),
+        )
+        self.assertLess(
+            names.index("btc1h_clean_evidence_clock_gate"),
+            names.index("btc1h_faithful_replay_data_contract"),
+        )
+        self.assertLess(
+            names.index("btc1h_replay_repair_prerequisite_audit"),
+            names.index("btc1h_faithful_replay_data_contract"),
+        )
+        self.assertLess(
+            names.index("btc1h_faithful_replay_data_contract"),
+            names.index("btc1h_replay_source_contract_readiness"),
+        )
+        self.assertLess(
+            names.index("btc1h_replay_source_contract_readiness"),
+            names.index("btc1h_clean_clock_collection_preflight"),
+        )
+        self.assertLess(
+            names.index("btc1h_clean_clock_collection_preflight"),
+            names.index("btc1h_official_basis_mismatch_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_replay_source_contract_readiness"),
+            names.index("btc1h_remaining_evidence_manifest"),
+        )
+        self.assertLess(
+            names.index("btc1h_clean_clock_collection_preflight"),
+            names.index("btc1h_remaining_evidence_manifest"),
+        )
+        self.assertLess(
+            names.index("btc1h_replay_repair_attempt_audit"),
+            names.index("btc1h_next_forward_candidate_packet"),
+        )
+        self.assertLess(names.index("btc1h_replay_repair_attempt_audit"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_replay_repair_attempt_audit"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_replay_repair_attempt_audit"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_replay_repair_prerequisite_audit"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_replay_repair_prerequisite_audit"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_replay_repair_prerequisite_audit"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_replay_repair_prerequisite_audit"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_replay_repair_target_matrix"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_replay_repair_target_matrix"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_replay_repair_target_matrix"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_replay_repair_target_matrix"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_replay_repair_feasibility"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_replay_repair_feasibility"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_replay_repair_feasibility"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_replay_repair_feasibility"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_multi_holdout_research"), names.index("btc1h_decision_distance_guard_audit"))
+        self.assertLess(names.index("btc1h_official_basis_mismatch_audit"), names.index("btc1h_decision_distance_guard_audit"))
+        self.assertLess(names.index("btc1h_official_basis_mismatch_audit"), names.index("btc1h_basis_stress_audit"))
+        self.assertLess(names.index("btc1h_basis_stress_audit"), names.index("btc1h_variant_basis_stress_ranking"))
+        self.assertLess(names.index("btc1h_variant_basis_stress_ranking"), names.index("btc1h_decision_distance_guard_audit"))
+        self.assertLess(names.index("btc1h_variant_basis_stress_ranking"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_basis_stress_audit"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_decision_distance_guard_audit"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_decision_distance_guard_audit"), names.index("btc1h_side_entry_profile_audit"))
+        self.assertLess(names.index("btc1h_side_entry_profile_audit"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_side_entry_profile_audit"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_side_entry_profile_audit"), names.index("btc1h_holdout_independence_audit"))
+        self.assertLess(names.index("btc1h_holdout_independence_audit"), names.index("btc1h_statistical_confidence_audit"))
+        self.assertLess(names.index("btc1h_holdout_independence_audit"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_holdout_independence_audit"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_holdout_independence_audit"), names.index("btc1h_research_priority_matrix"))
+        self.assertLess(names.index("btc1h_side_entry_profile_audit"), names.index("btc1h_statistical_confidence_audit"))
+        self.assertLess(names.index("btc1h_variant_basis_stress_ranking"), names.index("btc1h_research_priority_matrix"))
+        self.assertLess(names.index("btc1h_statistical_confidence_audit"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_statistical_confidence_audit"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_statistical_confidence_audit"), names.index("btc1h_replay_variant_overlap_audit"))
+        self.assertLess(names.index("btc1h_replay_variant_overlap_audit"), names.index("btc1h_research_priority_matrix"))
+        self.assertLess(names.index("btc1h_replay_variant_overlap_audit"), names.index("btc1h_entry59_floor_filter_audit"))
+        self.assertLess(names.index("btc1h_entry59_floor_filter_audit"), names.index("btc1h_research_priority_matrix"))
+        self.assertLess(names.index("btc1h_entry59_floor_filter_audit"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_entry59_floor_filter_audit"), names.index("btc1h_no_chase_extra_row_audit"))
+        self.assertLess(names.index("btc1h_no_chase_extra_row_audit"), names.index("btc1h_research_priority_matrix"))
+        self.assertLess(names.index("btc1h_no_chase_extra_row_audit"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_statistical_confidence_audit"), names.index("btc1h_research_priority_matrix"))
+        self.assertLess(names.index("btc1h_research_priority_matrix"), names.index("btc1h_next_forward_candidate_packet"))
+        self.assertLess(names.index("btc1h_research_priority_matrix"), names.index("deployment_readiness"))
+        self.assertLess(names.index("btc1h_research_priority_matrix"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_decision_distance_guard_audit"), names.index("deployment_readiness"))
+        self.assertLess(names.index("deployment_readiness"), names.index("btc1h_promotion_gap_matrix"))
+        self.assertLess(names.index("btc1h_next_forward_candidate_packet"), names.index("btc1h_objective_completion_audit"))
+        self.assertLess(names.index("btc1h_research_priority_matrix"), names.index("btc1h_objective_completion_audit"))
+        self.assertLess(names.index("btc1h_promotion_gap_matrix"), names.index("forward_evidence_report"))
+        self.assertLess(names.index("btc1h_promotion_gap_matrix"), names.index("btc1h_snapshot_execution_realism_audit"))
+        self.assertLess(
+            names.index("btc1h_snapshot_execution_realism_audit"),
+            names.index("btc1h_execution_filter_impact_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_execution_filter_impact_audit"),
+            names.index("btc1h_execution_filtered_basis_mismatch_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_execution_filtered_basis_mismatch_audit"),
+            names.index("btc1h_official_pnl_path_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_official_pnl_path_audit"),
+            names.index("btc1h_objective_completion_audit"),
+        )
+        self.assertLess(names.index("btc1h_official_pnl_path_audit"), names.index("btc1h_remaining_evidence_manifest"))
+        self.assertLess(names.index("btc1h_official_pnl_path_audit"), names.index("forward_evidence_report"))
+        self.assertLess(names.index("btc1h_official_pnl_path_audit"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_promotion_gap_matrix"), names.index("btc1h_objective_completion_audit"))
+        self.assertLess(
+            names.index("btc1h_objective_completion_audit"),
+            names.index("btc1h_candidate_promotion_deficit_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_candidate_promotion_deficit_audit"),
+            names.index("btc1h_remaining_evidence_manifest"),
+        )
+        self.assertLess(
+            names.index("btc1h_promotion_gap_matrix"),
+            names.index("btc1h_candidate_promotion_deficit_audit"),
+        )
+        self.assertLess(
+            names.index("btc1h_candidate_promotion_deficit_audit"),
+            names.index("forward_evidence_report"),
+        )
+        self.assertLess(
+            names.index("btc1h_candidate_promotion_deficit_audit"),
+            names.index("gpt_pro_action_status"),
+        )
+        self.assertLess(names.index("btc1h_promotion_gap_matrix"), names.index("btc1h_remaining_evidence_manifest"))
+        self.assertLess(names.index("btc1h_remaining_evidence_manifest"), names.index("forward_evidence_report"))
+        self.assertLess(names.index("btc1h_remaining_evidence_manifest"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_objective_completion_audit"), names.index("forward_evidence_report"))
+        self.assertLess(names.index("btc1h_objective_completion_audit"), names.index("gpt_pro_action_status"))
+        self.assertLess(names.index("btc1h_promotion_gap_matrix"), names.index("gpt_pro_action_status"))
 
     def test_readiness_exit_one_is_expected_but_other_steps_are_strict(self) -> None:
         steps = planned_steps(args(skip_packet=True))
         readiness = next(step for step in steps if step.name == "deployment_readiness")
+        clean_clock = next(step for step in steps if step.name == "btc1h_clean_evidence_clock_gate")
         self.assertEqual(readiness.expected_codes, (0, 1))
-        strict_steps = [step for step in steps if step.name != "deployment_readiness"]
+        self.assertEqual(clean_clock.expected_codes, (0, 1))
+        strict_steps = [
+            step
+            for step in steps
+            if step.name not in {"deployment_readiness", "btc1h_clean_evidence_clock_gate"}
+        ]
         self.assertTrue(all(step.expected_codes == (0,) for step in strict_steps))
 
     def test_uses_current_python_and_can_skip_packet(self) -> None:

@@ -60,6 +60,9 @@ SHADOW_OFFICIAL_TRADE_COLUMNS = [
     "ledger",
     "created_at",
     "status",
+    "signal_strategy",
+    "model_ttl_policy",
+    "model_policy_version",
     "event_ticker",
     "market_ticker",
     "side",
@@ -321,6 +324,70 @@ def summarize(rows: list[dict[str, Any]], since_utc: str) -> list[dict[str, Any]
     return out
 
 
+def summarize_by_policy(rows: list[dict[str, Any]], since_utc: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    def policy_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+        return (
+            str(row.get("ledger") or ""),
+            str(row.get("signal_strategy") or ""),
+            str(row.get("model_ttl_policy") or ""),
+            str(row.get("model_policy_version") or ""),
+        )
+
+    keys = sorted(
+        {policy_key(row) for row in rows}
+    )
+    for ledger, signal_strategy, model_ttl_policy, model_policy_version in keys:
+        group = [
+            row
+            for row in rows
+            if policy_key(row) == (ledger, signal_strategy, model_ttl_policy, model_policy_version)
+        ]
+        filled = [row for row in group if str(row.get("status", "")).lower() == "paper_filled"]
+        official = [row for row in filled if row.get("official_result") in {"yes", "no"}]
+        since = [row for row in official if not since_utc or str(row.get("created_at", "")) >= since_utc]
+        for label, subset in [("all", official), ("since", since)]:
+            pnl_values = numeric_values(subset, "official_pnl")
+            premium_values = numeric_values(subset, "official_premium")
+            proxy_pnl_values = numeric_values(subset, "proxy_pnl")
+            basis_values = numeric_values(subset, "official_minus_proxy_spot")
+            wins = [1.0 if str(row.get("official_win")).lower() == "true" else 0.0 for row in subset]
+            total_pnl = sum(pnl_values)
+            total_premium = sum(premium_values)
+            proxy_pnl = sum(proxy_pnl_values)
+            proxy_mismatches = sum(
+                1
+                for row in subset
+                if row.get("proxy_result") in {"yes", "no"}
+                and row.get("official_result") in {"yes", "no"}
+                and row.get("proxy_result") != row.get("official_result")
+            )
+            out.append(
+                {
+                    "ledger": ledger,
+                    "scope": label,
+                    "signal_strategy": signal_strategy,
+                    "model_ttl_policy": model_ttl_policy,
+                    "model_policy_version": model_policy_version,
+                    "paper_filled_rows": len(filled)
+                    if label == "all"
+                    else len([row for row in filled if not since_utc or str(row.get("created_at", "")) >= since_utc]),
+                    "official_filled_rows": len(subset),
+                    "official_pnl": total_pnl,
+                    "official_premium": total_premium,
+                    "official_rop": total_pnl / total_premium if total_premium > 0 else 0.0,
+                    "official_win_rate": sum(wins) / len(wins) if wins else 0.0,
+                    "proxy_filled_rows": len(proxy_pnl_values),
+                    "proxy_pnl": proxy_pnl,
+                    "official_minus_proxy_pnl": total_pnl - proxy_pnl if proxy_pnl_values else "",
+                    "official_proxy_result_mismatches": proxy_mismatches,
+                    "mean_official_minus_proxy_spot": sum(basis_values) / len(basis_values) if basis_values else "",
+                    "max_abs_official_minus_proxy_spot": max(abs(x) for x in basis_values) if basis_values else "",
+                }
+            )
+    return out
+
+
 def main() -> int:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -355,6 +422,9 @@ def main() -> int:
             "ledger": trade.get("ledger", ""),
             "created_at": trade.get("created_at", ""),
             "status": trade.get("status", ""),
+            "signal_strategy": trade.get("signal_strategy", ""),
+            "model_ttl_policy": trade.get("model_ttl_policy", ""),
+            "model_policy_version": trade.get("model_policy_version", ""),
             "event_ticker": trade.get("event_ticker", ""),
             "market_ticker": ticker,
             "side": trade.get("side", ""),
@@ -402,8 +472,10 @@ def main() -> int:
         rows.append(row)
 
     summary = summarize(rows, args.since_utc)
+    policy_summary = summarize_by_policy(rows, args.since_utc)
     write_csv(args.out_dir / "shadow_official_trades.csv", rows, SHADOW_OFFICIAL_TRADE_COLUMNS)
     write_csv(args.out_dir / "shadow_official_summary.csv", summary)
+    write_csv(args.out_dir / "shadow_official_policy_summary.csv", policy_summary)
     info = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "ledgers": {name: str(path) for name, path in DEFAULT_LEDGERS},
@@ -422,6 +494,10 @@ def main() -> int:
         "## Summary",
         "",
         pd.DataFrame(summary).round(4).to_string(index=False) if summary else "No shadow trades.",
+        "",
+        "## Policy Summary",
+        "",
+        pd.DataFrame(policy_summary).round(4).to_string(index=False) if policy_summary else "No shadow trades.",
         "",
         "## Recent Official Rows",
         "",

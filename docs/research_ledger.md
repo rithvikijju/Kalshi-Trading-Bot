@@ -21,6 +21,58 @@ This ledger tracks strategy research paths so we do not repeatedly rediscover re
 
 ## Ledger Entries
 
+### 2026-05-27 - Remote websocket snapshot backtest and shadow cleanup
+
+Output:
+
+- Remote snapshots:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\backtest_outputs\remote_tick_snapshots_20260527_212327\`.
+- BTC15M replay:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\backtest_outputs\remote_backtest_btc15m_lowdd_20260527_212327\`.
+- BTC1H local replay from downloaded remote snapshot:
+  `backtest_outputs\remote_backtest_btc1h_core_ws_stride60_20260527_212327\`.
+
+Data:
+
+- BTC15M capture-only DB snapshot: `7,515,538` top rows, `85,188` BTC ticks,
+  `361` finalized events, window `2026-05-24 09:10:48Z` to
+  `2026-05-28 03:10:48Z`.
+- BTC1H shadow-capture snapshot: `6,867,691` streamed top rows, `213` event
+  windows, causal `received_at_ns` replay with `60s` scan stride.
+- Raw BTC15M capture remained active after pause/resume: PID `14260`,
+  `failed=false`, `dropped=0`, replay sidecar count matched DB status counts.
+
+Result:
+
+- BTC15M `current_lowdd_no_rv`: `161` official-settled trades, PnL `+3.320`,
+  win rate `66.46%`, max drawdown `-4.870`, Sharpe `0.646`.
+- BTC1H `baseline_emp70_logn_rv60`: `39` settled trades, PnL `+1.98`,
+  win rate `69.23%`, max drawdown `-3.33`.
+- BTC1H `high_conf_80_entry70_no_chase`: `12` settled trades, PnL `+0.89`,
+  win rate `75.00%`, max drawdown `-2.00`.
+- Full May 8 BTC1H loss-guard replay was stopped as impractical on the full
+  tick stream; use the dedicated core websocket replayer for this capture
+  format.
+
+Status:
+
+- BTC15M lowdd: `shadow`, but marginal; not a live deploy candidate.
+- BTC1H: `research-only`; small positive replay does not override the negative
+  official forward ledger and faithful-replay blockers.
+- Stopped bad remote shadows and removed the watchdog/tasks that restarted
+  them: `q250_qty500_firstskip`, `q250_qty500_firstskip_yes`, `q1000_yes`, and
+  `btc1h_high_conf80_entry70_no_chase`.
+- Started BTC15M lowdd paper forward shadow through Task Scheduler:
+  child PID `13720`, launcher PID `13792`, trade DB
+  `C:\Users\ClawService\.btc_kalshi_bot\btc15m_lowdd_forward_shadow_trades.db`.
+
+Next:
+
+- Keep raw BTC15M capture running. Count only future lowdd official-settled
+  paper rows for promotion evidence.
+- Do not restart the stopped shadows unless a new gate explicitly justifies a
+  fresh paper clock.
+
 ### 2026-05-12 - Same-Hour Event Surface / Graph Features
 
 Output:
@@ -10575,3 +10627,3961 @@ artifacts:
   - only future official-settled rows from the clean remote run should count
     toward promotion evidence, and the existing promotion gates still require
     enough official-settled post-restart BTC15M/BTC1H rows.
+
+## 2026-05-21 - Remote DuckDB snapshot parity audit
+
+- User authorized a brief pause/resume of the remote BTC collectors to copy
+  promotion-grade DuckDB snapshots instead of relying on lossy `.replay.jsonl`
+  sidecars.
+- Remote maintenance window:
+  - stopped only the five `KalshiBTC_*` BTC collection/shadow tasks on
+    `ClawService@100.92.9.80`;
+  - copied active DuckDBs and WALs to
+    `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\duckdb_snapshots\snapshot_20260521_145951`;
+  - restarted the same five tasks; new PIDs were BTC15M capture `3852`,
+    q250 firstskip `10324`, q250 YES `5532`, q1000 YES `6992`, and BTC1H
+    high_conf80 entry70 no-chase `6408`;
+  - pause duration was `106.505s`;
+  - post-restart health check showed all five processes alive, fresh status
+    timestamps around `2026-05-21T15:18Z`, zero dropped rows, and low queues.
+- Snapshot contents were readable with raw `coinbase_ticker` tables, so this
+  removed the earlier sidecar limitation. Example row counts:
+  - q250 capture: `5,529,871` `ws_orderbook_top`, `60,581`
+    `coinbase_ticker`, `2,938,325` `signal_scan`, `9` `order_decision`;
+  - q250 YES capture: `5,542,730` top, `60,579` Coinbase, `2,954,660`
+    signal scans, `2` order decisions;
+  - q1000 YES capture: `5,540,396` top, `60,578` Coinbase, `2,954,732`
+    signal scans, `3` order decisions;
+  - BTC1H capture: `2,273,693` top, `60,569` Coinbase, `480,791` signal
+    scans, `13` order decisions.
+- Re-ran the independent BTC15M vector replay on the real snapshots:
+  - artifacts:
+    `backtest_outputs\remote_snapshot_q250_firstskip_qty500_rest_20260521_145951`,
+    `backtest_outputs\remote_snapshot_q250_firstskip_qty500_yes_rest_20260521_145951`,
+    `backtest_outputs\remote_snapshot_q1000_yes_rest_20260521_145951`,
+    and
+    `backtest_outputs\remote_snapshot_row_reconciliation_20260521_145951`;
+  - q250 all-side paper `9` rows vs replay `4` rows, matched `4`,
+    paper official PnL `-$0.34`, replay official actual-fee PnL `+$1.19`;
+  - q1000 YES paper `3` rows vs replay `2`, matched `2`, paper official PnL
+    `+$0.50`, replay actual-fee PnL `+$0.01`;
+  - q250 YES-only paper `2` rows vs replay `0`;
+  - conclusion: the independent replay implementation is still not faithful
+    enough for promotion-grade backtesting.
+- Checked captured live-decision parity directly against the paper ledgers:
+  artifact
+  `backtest_outputs\remote_snapshot_orderdecision_parity_20260521_145951`.
+  Captured `order_decision` rows matched ledger rows `1:1` by market/side and
+  entry price for q250 (`9/9`), q250 YES (`2/2`), q1000 YES (`3/3`), and BTC1H
+  (`11/11`). This means the gathered DuckDB/ledger data is internally
+  consistent; the current failure is the offline replay model/scan semantics,
+  not bad raw collection.
+- Current official-settled forward evidence since the clean remote start:
+  - q250 all-side: `9` official rows, official PnL `-$0.34`, win `44.44%`;
+  - q250 YES-only: `2` official rows, official PnL `+$0.01`, win `50.00%`;
+  - q1000 YES: `3` official rows, official PnL `+$0.50`, win `66.67%`;
+  - BTC1H high_conf80 entry70 no-chase: `11` official rows, official PnL
+    `+$0.50`, win `72.73%`, with `1` proxy/official mismatch.
+- Deployment conclusion unchanged: no BTC15M or BTC1H strategy is production
+  ready. Do not run broad historical promotion claims from the current
+  vectorized BTC15M replay until it reproduces captured `signal_scan` /
+  `order_decision` semantics row-for-row.
+
+## 2026-05-21 late / 2026-05-22 UTC - Remote reboot recovery and safe parity guard
+
+- The always-on laptop rebooted, so the remote BTC collectors/shadows had to be
+  rechecked and restarted on `ClawService@100.92.9.80`.
+- Root causes found and fixed:
+  - stale PID/status files and Windows PID reuse made old stop/status logic
+    unsafe;
+  - venv launcher PIDs were being confused with the actual long-running
+    `C:\Python310\python.exe` workers;
+  - capture writer startup could block on DB-wide status seeding scans over
+    multi-GB DuckDBs before fresh heartbeats were written;
+  - the BTC15M capture-only DuckDB WAL was corrupt and was quarantined under
+    `C:\Users\ClawService\.btc_kalshi_bot\corrupt_archive_20260521_203951`.
+- Operational fixes deployed to the remote:
+  - `scripts\btc_1hr_research_live.py` now seeds lock-free status from the
+    previous sidecar by default, only scans DuckDB status counters when
+    `BTC_CAPTURE_SEED_STATUS_FROM_DB=1`, and writes heartbeat/status sidecars
+    even when no rows are flushed;
+  - remote start/status/stop scripts now prefer direct `C:\Python310\python.exe`
+    workers with the venv site on `PYTHONPATH`, trust fresh capture-status PIDs,
+    validate process type before stopping, and avoid scanning old timestamped
+    PID files that can point at reused system PIDs;
+  - added `scripts\ensure_btc_remote_collectors.ps1` for idempotent remote
+    health/restart checks;
+  - added `scripts\build_btc_shadow_decision_log_parity.py`, but with sidecar
+    fallback disabled by default so it cannot accidentally scan multi-GB replay
+    JSONL files.
+- Current remote health check at `2026-05-22T02:51:07Z`:
+  - status script returned `ALL_RUNNING`;
+  - running workers: BTC15M capture PID `9104`, q250 all-side PID `6748`,
+    q250 YES PID `10076`, q1000 YES PID `10236`, BTC1H high-conf PID `5132`;
+  - fresh sidecar timestamps around `2026-05-22T02:51Z`, zero dropped rows;
+  - queues were small: BTC15M capture `3`, q250 all-side `13`, q250 YES `6`,
+    q1000 YES `17`, BTC1H `61`.
+- Latest remote official-settled paper evidence from
+  `backtest_outputs\btc_shadow_official_settlement_latest_codex`:
+  - BTC15M q250 first-signal qty>=500 all-side: `10` official rows, official
+    PnL `+$0.15`, win `50.00%`, trade Sharpe `0.0886`, max DD `-$1.96`;
+  - BTC15M q250 YES-only: `2` official rows, official PnL `+$0.01`, win
+    `50.00%`, trade Sharpe `0.0099`, max DD `-$0.50`;
+  - BTC15M q1000 YES: `3` official rows, official PnL `+$0.50`, win
+    `66.67%`, trade Sharpe `0.5074`, max DD `-$0.49`;
+  - BTC1H high_conf80 entry70 no-chase: `11` official rows, official PnL
+    `+$0.50`, win `72.73%`, trade Sharpe `0.3155`, max DD `-$1.76`, with
+    `1` proxy/official result mismatch.
+- Interpretation:
+  - the remote collection/shadows are back up, but no strategy is production
+    ready;
+  - q250 all-side is basically flat after fees on the official forward sample,
+    with drawdown much larger than total PnL;
+  - q1000 YES and BTC1H are positive but far too small to trust;
+  - active DuckDB files are locked by live writers, so row-for-row decision
+    parity still requires the authorized pause/snapshot workflow. The safe
+    active-run parity artifact at
+    `backtest_outputs\btc_shadow_decision_log_parity_latest_codex` reports the
+    lock clearly and attaches official ledger PnL without scanning huge
+    sidecars.
+
+## 2026-05-22 - Pivot active research loop to BTC1H
+
+- Decision: BTC15M remains passive shadow/collection only for now; active
+  research focus moves to BTC1H.
+- Remote status at `2026-05-22T03:02:44Z`:
+  - all five collectors/shadows running on `ClawService@100.92.9.80`;
+  - BTC15M shadows remain running;
+  - BTC1H `btc1h_high_conf80_entry70_no_chase_shadow` running with PID `5132`;
+  - BTC1H sidecar fresh at `2026-05-22T03:02:43Z`, queue `0`, dropped `0`;
+  - BTC1H capture counts: `2,628,391` `ws_orderbook_top`, `571,922`
+    `signal_scan`, `14` `order_decision`.
+- Refreshed remote official settlement at `2026-05-22T03:06:38Z`.
+  BTC1H official-settled evidence:
+  - `11` official rows;
+  - official PnL `+$0.50`;
+  - proxy PnL `+$1.50`;
+  - official-minus-proxy PnL `-$1.00`;
+  - official win `72.73%`;
+  - trade Sharpe `0.3155`;
+  - max drawdown `-$1.76`;
+  - `1` proxy/official result mismatch.
+- Re-ran BTC1H robustness audit:
+  `backtest_outputs\btc1h_highconf_robustness_20260521_210410`.
+  At +2c adverse stress:
+  - `high_conf_80_entry70_no_chase`: Predexon `30` trades, `+$4.26`,
+    win `80.0%`, max DD `-$1.41`, Sharpe `1.9384`;
+  - all six May websocket cadences remained positive, worst `+$0.75`.
+- Latest promotion gate artifact:
+  `backtest_outputs\btc1h_promotion_gate_audit_latest_codex`.
+  No BTC1H candidate passes. The current best candidate still fails due to too
+  few post-freeze settled rows and because `entry70_no_chase` was a research
+  extra gate that requires forward shadow evidence.
+- Settlement-basis diagnostics with remote official rows:
+  - `backtest_outputs\btc1h_settlement_basis_risk_remote_latest_codex`;
+  - `backtest_outputs\btc1h_basis_danger_remote_latest_codex`;
+  - `backtest_outputs\btc1h_basis_guard_candidates_remote_latest_codex`.
+  BTC1H has too few official rows for a deployable guard. The current warning is
+  one NO-side proxy-win / official-loss row and large basis magnitude:
+  p95 absolute basis about `$79.77` on NO-side rows.
+- Created `docs\2026-05-22_btc1h_research_loop.md`.
+- Current BTC1H research posture:
+  - primary candidate stays `high_conf_80_entry70_no_chase`;
+  - do not retune or launch a new variant yet;
+  - collect to at least `50` official-settled rows;
+  - investigate settlement-distance/basis risk before changing model features;
+  - use pause/snapshot DuckDB parity for promotion-grade replay evidence.
+
+## 2026-05-22 - BTC1H fixed multi-holdout research artifact
+
+- Goal set in Codex: research BTC1H Kalshi strategies through faithful
+  backtesting on available data, preserve multiple holdout sets, and identify
+  deployable or near-deployable candidates without relaxing official
+  settlement, execution, and live-replay gates.
+- Added `scripts\build_btc1h_multi_holdout_research.py` to consolidate
+  already-frozen BTC1H variants across fixed evidence buckets. This is not a
+  threshold search and does not use the latest forward rows to tune a new
+  rule.
+- Artifact:
+  `backtest_outputs\btc1h_multi_holdout_research_latest_codex`.
+  Inputs:
+  - `backtest_outputs\btc1h_highconf_robustness_20260521_210410\all_input_trades.csv`;
+  - `backtest_outputs\btc1h_highconf_direct_aggregate_feb09_may06_20260516_0433\trades.csv`;
+  - `backtest_outputs\btc1h_entry59_70_derived_20260516_0241\derived_trades.csv`;
+  - `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex\shadow_official_trades.csv`.
+- Historical/proxy rows were restressed with a `+2c` adverse entry assumption.
+  Forward rows use actual REST-official settlement and actual ledger premium.
+- Candidate summary:
+  - `high_conf_80_entry70_no_chase` is the only active forward BTC1H
+    candidate. It was positive in `14 / 14` fixed holdout buckets, positive in
+    all `6 / 6` May live-websocket cadence buckets, and has `11`
+    official-settled forward rows with official PnL `+$0.50`, win `72.73%`,
+    max DD `-$1.76`, and official/proxy mismatch rate `9.09%`.
+  - `high_conf_80_entry59_70_no_chase` is historical-only promising, with
+    `12 / 13` positive buckets and all `6 / 6` websocket cadences positive, but
+    it has no forward official rows and one negative direct holdout
+    (`H2b_direct_apr23_may01_holdout`).
+  - `high_conf_80` is historical-only promising but less stable, with `8 / 9`
+    positive buckets and a negative `H3_predexon_may03_06_external` bucket.
+  - `high_conf_80_no_chase` should stay watch/reject for now despite strong
+    historical totals because it failed the `H4_live_ws_may06_12_stride1s`
+    live-websocket cadence bucket.
+- Deployability conclusion:
+  - `deployable_now = False` for every BTC1H variant;
+  - `production_ready_count` remains `0`;
+  - the best BTC1H candidate is near-deployable research only, not a live
+    strategy.
+- Current blockers for `high_conf_80_entry70_no_chase`:
+  - only `11` official-settled forward rows versus the minimum `50` row gate;
+  - official/proxy mismatch rate `9.09%`, above the `2%` gate;
+  - settlement basis has already reduced the BTC1H forward sample by `-$1.00`;
+  - promotion still needs snapshot row parity and full execution-realism checks
+    on executable ask, spread, visible size, FOK/no-fill behavior, fees, and
+    live/paper ledger agreement.
+- Next honest loop:
+  - keep the current BTC1H shadow and BTC15M passive shadows running;
+  - refresh official settlement daily or on manual review;
+  - do not retune a basis/distance guard from the current `11` rows;
+  - after enough new official rows, use a fresh pause/snapshot DuckDB parity
+    window before counting replay evidence toward promotion.
+- Remote status recheck at `2026-05-22T03:28:02Z`: `ALL_RUNNING`.
+  BTC1H `btc1h_high_conf80_entry70_no_chase_shadow` PID `5132` was alive, and
+  BTC15M capture plus the three BTC15M paper shadows were also alive.
+
+## 2026-05-22 - BTC1H forward snapshot signal/decision parity
+
+- Refreshed remote REST-official shadow settlement at
+  `2026-05-22T03:42:10Z` and copied the small output artifacts back to
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex`.
+  BTC1H official-settled rows remained unchanged:
+  - `11` rows;
+  - official PnL `+$0.50`;
+  - proxy PnL `+$1.50`;
+  - official-minus-proxy PnL `-$1.00`;
+  - official win `72.73%`;
+  - max DD `-$1.76`;
+  - `1` proxy/official mismatch.
+- The active remote BTC1H DuckDB was correctly locked by the running writer, so
+  no active DB copy/read was treated as promotion evidence. Used the already
+  paused May 21 snapshot instead:
+  `runtime\remote_snapshots\snapshot_20260521_145951`.
+- Copied BTC1H snapshot files locally:
+  - `btc_1hr_high_conf80_entry70_no_chase_shadow_capture.duckdb`
+    (`284,962,816` bytes);
+  - matching `.wal` (`14,025,116` bytes);
+  - paper ledger SQLite DB (`20,480` bytes);
+  - `snapshot_manifest.json`.
+- Added/updated audit tooling:
+  - `scripts\build_btc_shadow_decision_log_parity.py` now accepts explicit
+    `--target LEDGER=CAPTURE_DB` overrides so paused remote snapshots can be
+    audited without replacing local live paths;
+  - `scripts\build_btc1h_forward_snapshot_signal_audit.py` verifies the actual
+    BTC1H forward chain from captured selected `signal_scan` rows to captured
+    `order_decision` rows to official-settled paper fills;
+  - `scripts\build_btc1h_multi_holdout_research.py` now consumes the forward
+    snapshot fidelity summary and no longer labels the current 11 BTC1H rows as
+    missing snapshot parity when that parity has passed.
+- Snapshot parity artifacts:
+  - `backtest_outputs\btc1h_snapshot_decision_log_parity_latest_codex`:
+    `11 / 11` BTC1H paper-fill decisions matched official ledger rows, with
+    zero missing and zero extra fill rows; official PnL `+$0.50`, win
+    `72.73%`, max DD `-$1.76`, mismatch count `1`;
+  - `backtest_outputs\btc1h_snapshot_replay_coverage_latest_codex`:
+    `11 / 11` official BTC1H rows were replayable from readable snapshot
+    capture, with top-of-book and signal-scan rows around every paper fill;
+  - `backtest_outputs\btc1h_forward_snapshot_signal_audit_latest_codex`:
+    `13` selected signals matched `13` decisions, `11` were paper fills and
+    `2` were websocket-reprice skips, and `11 / 11` fills matched official
+    settlement rows.
+- Forward snapshot daily official holdouts:
+  - `2026-05-19`: `4` rows, official PnL `+$0.22`, mismatch rate `0%`;
+  - `2026-05-20`: `4` rows, official PnL `-$0.63`, mismatch rate `25%`;
+  - `2026-05-21`: `3` rows, official PnL `+$0.91`, mismatch rate `0%`.
+- Updated multi-holdout artifact:
+  `backtest_outputs\btc1h_multi_holdout_research_latest_codex`.
+  The primary BTC1H candidate now shows
+  `forward_snapshot_parity_status = pass_actual_shadow_snapshot_parity`, but
+  `deployable_now = False` with blockers:
+  `too_few_forward_official_rows`,
+  `official_proxy_mismatch_gate_failed`, and
+  `needs_full_counterfactual_replay_or_live_execution_gate`.
+- Attempted the broad BTC1H signal-scan-clock counterfactual replay on the
+  snapshot with `scripts\replay_btc1h_core_ws_counterfactual.py`. It remained
+  running for more than ten minutes and was stopped locally. Do not treat that
+  replay path as promotion-usable until it is optimized and can complete with a
+  row-reconciliation report.
+- Deployment conclusion unchanged:
+  - no BTC1H or BTC15M strategy is production ready;
+  - `high_conf_80_entry70_no_chase` remains the only BTC1H active
+    near-deployable research candidate;
+  - the current positive forward PnL is too small and too basis-sensitive to
+    deploy.
+- Remote worker status rechecked at `2026-05-22T04:11:06Z`: `ALL_RUNNING`.
+  BTC1H PID `5132` and all BTC15M capture/shadow workers remained alive.
+
+## 2026-05-22 - BTC1H selected-signal model parity blocker
+
+- Added `scripts\build_btc1h_selected_signal_model_parity.py`.
+  It recomputes the active BTC1H live strategy only at captured `selected`
+  `signal_scan` rows using the selected market's as-of websocket top book and
+  an as-of BTC candle cache. This is an actual-selected-row diagnostic, not a
+  full all-window counterfactual replay.
+- Pulled the remote BTC candle cache from
+  `C:\Users\ClawService\Kalshi-Trading-Bot\data\btc_1m_research_live_cache.parquet`
+  into
+  `runtime\remote_snapshots\snapshot_20260521_145951\btc_1m_research_live_cache.remote.parquet`.
+  The local cache was stale for this window, ending at
+  `2026-05-19T00:21:00Z`.
+- Artifact:
+  `backtest_outputs\btc1h_selected_signal_model_parity_latest_codex`.
+  Result:
+  - `13` selected signal rows;
+  - `0` selected model parity passes;
+  - max model probability absolute drift `0.032348`;
+  - max net-edge absolute drift `3.234823c`;
+  - `4` selected rows did not recompute as signals.
+- Follow-up diagnosis:
+  - top-book side/entry parity passed, so the selected trade prices are
+    supported by captured websocket top-of-book rows;
+  - exact model replay using scan-time TTL still fails;
+  - implied cached-TTL reconciliation passes on `13 / 13` selected rows, with
+    max probability residual `0.000239` and implied TTL offset range `-178` to
+    `+162` seconds;
+  - official impact split:
+    - `9` official fills still reproduce as scan-time-TTL signals, official PnL
+      `+$0.93`;
+    - `2` official fills are cached-TTL-only under this diagnostic, official
+      PnL `-$0.43`;
+  - the likely missing field is the exact cached `ttl_min` from the live event
+    object, not the top-of-book row or broad BTC cache.
+- Interpretation:
+  - actual signal/decision/ledger parity still supports the 11 filled rows;
+  - independent model-recomputed replay is diagnosable but not promotion-usable
+    when it must infer cached TTL after the fact;
+  - the current forward PnL cannot be treated as clean evidence for the exact
+    scan-time-TTL policy, even though the cached-TTL-only official rows were net
+    negative in this tiny sample.
+- Updated `scripts\build_btc1h_multi_holdout_research.py` to consume the new
+  selected-signal model parity summary. The active BTC1H candidate now carries
+  the additional blocker
+  `selected_signal_model_parity_failed_or_exact_btc_cache_missing`.
+- Updated `scripts\btc_1hr_research_live.py` for future evidence collection:
+  `signal_scan` rows can now include selected threshold, spread, visible
+  quantity, quote timestamp/age, BTC candle time, BTC candle age, RV60, and
+  10-minute BTC return, selected TTL, and close time. Existing remote processes
+  were not restarted, so this code change only affects future explicitly
+  authorized starts/restarts.
+- Patched the live BTC1H signal model path for future runs so
+  `model_probability` uses `close_time - scan_start_time` when a scan timestamp
+  is available, instead of the event object's cached refresh-time TTL. This is
+  a future-evidence fix, not a retroactive validation of old rows. The current
+  remote process was not restarted, so pre-restart rows remain cached-TTL-policy
+  rows and any post-restart scan-time-TTL rows must use a separate evidence
+  clock.
+- Re-ran:
+  - `scripts\build_btc1h_selected_signal_model_parity.py`;
+  - `scripts\build_btc1h_multi_holdout_research.py`;
+  - `scripts\check_btc_deployment_readiness.py`.
+  Selected-signal exact scan-time-TTL parity remains `0 / 13`, implied cached
+  TTL parity remains `13 / 13`, and readiness still reports
+  `production_ready_count = 0`.
+- Patched `scripts\replay_btc1h_core_ws_counterfactual.py` so the BTC cache
+  loader falls back to DuckDB when PyArrow fails on the remote parquet, and
+  added `--candidate-scan-only` for active-policy parity diagnostics.
+- Ran active-policy candidate-scan snapshot replay:
+  `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_candidate_scans_latest_codex`.
+  Command mode used captured `signal_scan` timestamps, live scan semantics,
+  `--candidate-scan-only`, no public settlement fallback, and the paused May 21
+  BTC1H snapshot. It completed in about `77s` and produced `10` settled replay
+  trades, captured-lifecycle PnL `+$1.11`, win `80.0%`, max DD `-$1.38`, and
+  Sharpe `0.8305`.
+- Replay-vs-actual ledger comparison:
+  - actual BTC1H REST-official shadow ledger remained `11` rows, `+$0.50`;
+  - replay matched `9` actual market/side keys;
+  - actual row missing from replay:
+    `KXBTCD-26MAY1911-T76299.99|no` (`-$0.71`);
+  - replay replaced actual `KXBTCD-26MAY2010-T77199.99|no` with
+    `KXBTCD-26MAY2010-T77299.99|no`;
+  - replay therefore overstated the actual ledger by about `$0.61`.
+  This is useful diagnostic progress, not promotion evidence: the replay is
+  still not row-for-row faithful to the old cached-TTL live process, and
+  `--candidate-scan-only` cannot discover new variants because it relies on the
+  active policy's captured candidate rows.
+- Added `scripts\build_btc1h_replay_vs_ledger_reconciliation.py` and artifact
+  `backtest_outputs\btc1h_replay_vs_ledger_reconciliation_latest_codex`.
+  The candidate-scan replay reconciliation reports:
+  - actual official rows `11`, replay rows `10`;
+  - exact market/side matches `9 / 11`;
+  - actual official PnL `+$0.50`, replay PnL `+$1.11`;
+  - replay-minus-actual PnL `+$0.61`;
+  - `promotion_usable_replay = false`;
+  - blockers:
+    `missing_actual_rows;replay_row_count_differs;extra_replay_rows;event_level_market_replacements;pnl_not_row_for_row_equal`.
+- Added stricter replay flags to `scripts\replay_btc1h_core_ws_counterfactual.py`:
+  `--selected-scan-only` and `--selected-market-only`. Artifact
+  `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_selected_scans_latest_codex`
+  replayed only captured selected-scan rows and the captured selected market.
+  It produced `6` settled replay rows, PnL `-$0.14`, win `66.67%`, max DD
+  `-$1.38`, and Sharpe `-0.1106`.
+- Selected-scan reconciliation artifact
+  `backtest_outputs\btc1h_replay_vs_ledger_reconciliation_selected_scans_latest_codex`
+  matched only `6 / 11` actual market/side rows and is also
+  `promotion_usable_replay = false`. This stricter mode avoids adjacent
+  replacement trades but misses more cached-TTL live rows under scan-time model
+  recomputation, reinforcing that old cached-TTL rows cannot validate the new
+  scan-time-TTL policy.
+- Updated `scripts\build_btc1h_multi_holdout_research.py` to consume the replay
+  reconciliation summary. The primary candidate now carries
+  `counterfactual_replay_not_row_faithful` in addition to sample-size,
+  official/proxy mismatch, cached-TTL, and full execution-gate blockers.
+- Refreshed remote official settlement at `2026-05-22T05:13:17Z` and copied the
+  small artifacts back locally. BTC1H remains unchanged at `11` official rows,
+  official PnL `+$0.50`, official win `72.73%`, proxy PnL `+$1.50`, and `1`
+  proxy/official mismatch.
+- Local process audit found and stopped one stale local
+  `replay_btc1h_core_ws_counterfactual.py` process from the earlier slow
+  all-scan attempt. It was not a collector or paper shadow.
+- Remote status at `2026-05-22T05:08:39Z` was `ALL_RUNNING` with BTC15M capture,
+  three BTC15M paper shadows, and BTC1H high-conf shadow alive on
+  `ClawService@100.92.9.80`.
+- Added explicit BTC1H policy-epoch fields for future clean evidence:
+  - `scripts\btc_1hr_research_live.py` now writes `signal_strategy`,
+    `model_ttl_policy`, and `model_policy_version` into future DuckDB
+    `signal_scan` / `order_decision` rows and future SQLite
+    `research_live_trades` rows;
+  - default `model_ttl_policy` is `scan_time_close_minus_now_v1`;
+  - default `model_policy_version` is
+    `btc1h_live_model_20260522_scan_ttl_v1`.
+- Updated `scripts\check_btc_shadow_official_settlement.py` to preserve those
+  policy fields in `shadow_official_trades.csv` and emit
+  `shadow_official_policy_summary.csv`, so future official-settled rows can be
+  grouped by evidence clock instead of pooled with old rows.
+- Deployed the corrected local BTC1H live/replay/audit/settlement scripts to
+  the always-on laptop without restarting any process. Remote backups:
+  - `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_scan_ttl_deploy_20260522_051842`;
+  - `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_policy_settlement_deploy_20260522_052004`.
+  Remote `py_compile` passed after upload.
+- Remote status after script upload at `2026-05-22T05:18:55Z` was still
+  `ALL_RUNNING`. Existing BTC1H PID `5132` is still the old in-memory process
+  started at `2026-05-22T02:42:06Z`, so it cannot produce the new
+  scan-time-TTL policy rows until an explicitly authorized controlled restart.
+- Re-ran remote official settlement after deploying the policy-aware settlement
+  script. Artifact:
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex\shadow_official_policy_summary.csv`.
+  All current BTC1H rows have blank policy fields because they predate the new
+  schema. BTC1H remains unchanged at `11` official rows, official PnL `+$0.50`,
+  win `72.73%`, proxy PnL `+$1.50`, and `1` proxy/official mismatch.
+- Validation:
+  - `python -m pytest scripts\test_research_live_safety.py -q --basetemp .pytest-codex-tmp`
+    passed (`46` tests, `8` subtests; one existing pandas warning);
+  - `scripts\build_btc1h_multi_holdout_research.py` reran with the current
+    official settlement and replay reconciliation artifacts;
+  - `scripts\check_btc_deployment_readiness.py` reran with expected no-deploy
+    exit and `production_ready_count = 0`.
+- Deployment conclusion unchanged:
+  - `production_ready_count = 0`;
+  - `high_conf_80_entry70_no_chase` is the best BTC1H research candidate, but
+    not deployable;
+  - the honest next step is more forward official rows plus a future snapshot
+    generated by code that captures exact BTC model inputs.
+
+## 2026-05-22 - BTC1H readiness now gates model-policy evidence clocks
+
+- Patched `scripts\check_btc_deployment_readiness.py` so the conservative
+  readiness report now consumes the current BTC1H evidence stack instead of
+  relying only on older promotion artifacts:
+  - prefers `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex`
+    for shadow official settlement when present;
+  - includes
+    `backtest_outputs\btc1h_multi_holdout_research_latest_codex\btc1h_candidate_gate_summary.csv`;
+  - records the primary BTC1H replay-vs-ledger reconciliation artifact in
+    readiness `run_info.json`;
+  - adds an explicit BTC1H model-policy epoch gate requiring future official
+    rows under `model_policy_version =
+    btc1h_live_model_20260522_scan_ttl_v1` and `model_ttl_policy =
+    scan_time_close_minus_now_v1`.
+- Patched `scripts\refresh_btc_evidence_stack.py` to regenerate
+  `btc1h_multi_holdout_research_latest_codex` before readiness, so full refresh
+  runs do not leave the BTC1H gate stale.
+- Added a regression test proving BTC1H rows with blank model-policy fields
+  keep readiness false:
+  `scripts\test_btc_readiness_row_reconciliation.py::test_btc1h_blank_model_policy_epoch_blocks_readiness`.
+- Re-ran:
+  - `python -m pytest scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_execution_realism_audit.py -q --basetemp .pytest-codex-tmp`
+    -> `9 passed`;
+  - `python scripts\build_btc1h_multi_holdout_research.py --out-dir backtest_outputs\btc1h_multi_holdout_research_latest_codex`;
+  - `python scripts\check_btc_deployment_readiness.py --out-dir backtest_outputs\deployment_readiness_latest_codex`
+    -> expected no-deploy exit, `production_ready_count = 0`.
+- Current BTC1H readiness row remains:
+  - active candidate `high_conf_80_entry70_no_chase`;
+  - forward official rows `11`, official PnL `+$0.50`, mismatch rate `9.09%`;
+  - snapshot parity passes for actual old shadow rows;
+  - selected-signal model parity fails;
+  - replay-vs-ledger is not row-faithful;
+  - policy epoch status is `EXPECTED_POLICY_MISSING` with `11` blank-policy
+    official rows.
+- Interpretation: old cached-TTL BTC1H rows are still useful diagnostics, but
+  readiness now has a machine-readable blocker preventing them from counting as
+  evidence for the future scan-time-TTL policy. No deployment.
+- Also patched `scripts\build_btc_restart_authorization_packet.py` after a
+  dry authorization packet exposed a stale local process snapshot from
+  `2026-05-18T22:54:40Z`. The packet now fails
+  `forward_process_hygiene_snapshot_fresh` when the status artifact is older
+  than `--max-forward-status-age-minutes` and adds
+  `forward_process_hygiene_snapshot_stale` to target blockers. Do not use stale
+  local PIDs from that packet as remote runtime evidence.
+
+## 2026-05-22 - BTC1H candidate-scan replay performance fix
+
+- Patched `scripts\replay_btc1h_core_ws_counterfactual.py` so signal-scan
+  replay pruning happens in DuckDB instead of Python:
+  - `--candidate-scan-only` now loads only `candidate_count > 0` scans;
+  - `--selected-scan-only` now loads only selected scans;
+  - non-`--full-stream` signal-scan replay joins against `replay_windows`;
+  - candidate/selected diagnostic modes prune replay event windows down to the
+    events that actually have retained signal scans.
+- Added regression coverage:
+  `scripts\test_btc1h_replay_signal_scan_pruning.py`.
+- On the May 21 paused BTC1H snapshot, the candidate-scan diagnostic now loads
+  `465` signal scans and streams `663,391` top rows across `11` event windows,
+  versus the previous equivalent run's `465` signal scans over `2,270,209` top
+  rows across `59` windows. Local runtime dropped from about `62s` in the
+  SQL-scan-pruned run to about `21s` after event-window pruning.
+- Fast replay artifact:
+  `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_candidate_scans_fast_latest_codex`.
+  It produced the same active-candidate result as the prior candidate-scan
+  replay:
+  - `10` settled replay rows;
+  - replay PnL `+$1.11`;
+  - win `80.0%`;
+  - max DD `-$1.38`;
+  - Sharpe `0.830455`.
+- Reconciled the fast replay into
+  `backtest_outputs\btc1h_replay_vs_ledger_reconciliation_latest_codex`.
+  Result remains not promotion-usable:
+  - actual official rows `11`, replay rows `10`;
+  - exact market/side matches `9 / 11`;
+  - replay-minus-actual PnL `+$0.61`;
+  - blockers:
+    `missing_actual_rows;replay_row_count_differs;extra_replay_rows;event_level_market_replacements;pnl_not_row_for_row_equal`.
+- Re-ran:
+  - `python scripts\build_btc1h_multi_holdout_research.py --out-dir backtest_outputs\btc1h_multi_holdout_research_latest_codex`;
+  - `python scripts\check_btc_deployment_readiness.py --out-dir backtest_outputs\deployment_readiness_latest_codex`
+    -> expected no-deploy exit, `production_ready_count = 0`;
+  - `python -m pytest scripts\test_btc1h_replay_signal_scan_pruning.py scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_execution_realism_audit.py -q --basetemp .pytest-codex-tmp`
+    -> `10 passed`.
+- Interpretation: active-policy parity diagnostics are now much faster and more
+  repeatable, but the result is deliberately unchanged: old cached-TTL rows
+  still fail row-faithful replay and cannot promote the strategy.
+- Uploaded the replay-pruning script/test to the remote laptop without
+  restarting collectors. Backup:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_btc1h_replay_pruning_20260522_070008`.
+  Remote `py_compile` passed. Remote status at `2026-05-22T07:00:21Z` was
+  `ALL_RUNNING`; BTC1H PID `5132` remains the old in-memory process, so this
+  code still affects offline replay tooling and future starts only.
+
+## 2026-05-22 - BTC1H full scan-clock replay diagnostic and holdout refresh
+
+- Goal: continue the BTC1H research loop with faithful live-websocket replay
+  where possible, while keeping the current active shadow as research-only
+  until official settlement, execution realism, and row-faithful replay agree.
+- Further optimized `scripts\replay_btc1h_core_ws_counterfactual.py`:
+  - maintains per-event markets that currently pass static executable-book
+    gates, so dead signal scans can be rejected before building quote
+    DataFrames or calling the model;
+  - fixes `--max-rows` smoke tests so they do not drain all remaining
+    `signal_scan` rows after the top-book stream is intentionally stopped;
+  - caches parsed event close times, parsed strikes, and BTC timestamp lookup
+    arrays.
+- Added/updated regression coverage:
+  - `scripts\test_btc1h_replay_signal_scan_pruning.py`;
+  - `scripts\test_btc_readiness_row_reconciliation.py` now proves the
+    readiness gate prefers
+    `btc1h_replay_vs_ledger_reconciliation_latest_codex` over newer full-scan
+    diagnostic directories.
+- Validation:
+  - `python -m pytest scripts\test_btc1h_replay_signal_scan_pruning.py scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_execution_realism_audit.py -q --basetemp .pytest-codex-tmp`
+    -> `13 passed`;
+  - remote `py_compile` passed after uploading the replay/readiness scripts.
+- Active-policy candidate-scan replay remains unchanged and is still not
+  promotion-usable:
+  - artifact:
+    `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_candidate_scans_fast_latest_codex`;
+  - `10` settled replay rows, PnL `+$1.11`, win `80.0%`, max DD `-$1.38`,
+    Sharpe `0.830455`;
+  - reconciliation artifact:
+    `backtest_outputs\btc1h_replay_vs_ledger_reconciliation_latest_codex`;
+  - actual official rows `11`, replay rows `10`, exact market/side matches
+    `9 / 11`, replay-minus-actual PnL `+$0.61`;
+  - blockers remain
+    `missing_actual_rows;replay_row_count_differs;extra_replay_rows;event_level_market_replacements;pnl_not_row_for_row_equal`.
+- Full scan-clock replay over the paused May 21 remote BTC1H snapshot:
+  - artifact:
+    `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_fullscan_prefilter_highconf_latest_codex`;
+  - event windows `59`, streamed top rows `2,270,209`, signal scans `436,265`;
+  - `14` signals, `13` settled, PnL `+$1.99`, win `84.62%`, max DD `-$1.40`,
+    Sharpe `1.455433`;
+  - stats show `353,167` event evaluations, `212,575` state-level static-book
+    skips, and `105,355` model calls.
+  - This is a useful research diagnostic, not promotion evidence. Reconciliation
+    against the actual paper ledger has actual rows `11`, replay rows `14`,
+    exact market/side matches `9 / 11`, replay-minus-actual PnL `+$1.49`, and
+    the same non-row-faithful blocker family.
+- Selected-scan + selected-market replay diagnostic:
+  - artifact:
+    `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_selected_market_latest_codex`;
+  - only `6` replay rows, PnL `-$0.14`, exact matches `6 / 11`;
+  - confirms the blocker is deeper than broad scan selection. Exact selected
+    model parity still fails because current rows were generated with old
+    cached-TTL/live inputs that were not fully captured; implied-TTL diagnostics
+    can reconcile probabilities, but that is not a deployable replay.
+- Refreshed remote official settlement using the remote `.venv` interpreter
+  because remote system `python` lacked `requests`. Pulled:
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex`.
+  BTC1H remains `11` official rows, official PnL `+$0.50`, official win
+  `72.73%`, proxy PnL `+$1.50`, and `1` proxy/official mismatch
+  (`9.09%`).
+- Re-ran:
+  - `python scripts\build_btc1h_multi_holdout_research.py --out-dir backtest_outputs\btc1h_multi_holdout_research_latest_codex`;
+  - `python scripts\check_btc_deployment_readiness.py --out-dir backtest_outputs\deployment_readiness_latest_codex`
+    -> expected no-deploy exit, `production_ready_count = 0`.
+- Current quantitative conclusion:
+  - `high_conf_80_entry70_no_chase` remains the best BTC1H candidate: all
+    `14 / 14` fixed holdout buckets positive, all `6 / 6` May live-WS cadences
+    positive, historical/proxy trades `159`, stressed historical/proxy PnL
+    `+$21.39`, and current forward REST-official PnL `+$0.50`.
+  - It is not deployable. Main blockers are too few forward official rows
+    (`11`, target `50`), official/proxy mismatch rate `9.09%`, selected-signal
+    exact parity failure, and non-row-faithful replay vs the paper ledger.
+- Remote status after upload at `2026-05-22T07:38:05Z`: `ALL_RUNNING`.
+  No collectors or shadows were restarted. Backup:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_btc1h_fullscan_prefilter_20260522_073800`.
+
+## 2026-05-22 - BTC1H model-input capture and holdout gate refresh
+
+- Goal: keep the BTC1H research loop focused on faithful replay and multiple
+  holdout sets, while leaving BTC15M as passive shadow/capture evidence.
+- Local process audit: no matching Kalshi/BTC Python processes were running on
+  this laptop.
+- Remote status at `2026-05-22T07:51:15Z`: `ALL_RUNNING`.
+  - BTC15M capture and all three BTC15M paper shadows were alive.
+  - BTC1H `btc1h_high_conf80_entry70_no_chase_shadow` PID `5132` remained
+    alive, started `2026-05-22T02:42:06Z`, with about `101.9 MB` working set.
+  - No collectors or shadows were restarted.
+- Refreshed remote official settlement using the remote `.venv` interpreter and
+  pulled `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex`.
+  BTC1H remains unchanged:
+  - `11` official-settled rows;
+  - official PnL `+$0.50`;
+  - official win `72.73%`;
+  - proxy PnL `+$1.50`;
+  - `1` proxy/official mismatch (`9.09%`).
+- Patched replay/materialization/parity tooling so future sidecars preserve
+  exact BTC1H model inputs needed for deployable replay evidence:
+  - `scripts\materialize_btc_replay_sidecar.py` now materializes BTC1H
+    `signal_scan` fields for selected strategy, model TTL policy/version,
+    threshold/spread/top-visible size, quote timestamp/age, selected TTL,
+    close time, BTC candle time/age, RV60, and 10-minute BTC return. It also
+    preserves policy fields on `order_decision`.
+  - `scripts\build_btc1h_selected_signal_model_parity.py` can read old and new
+    `signal_scan` schemas, carries optional captured fields through parity
+    rows, and separately reports captured-TTL parity when those fields exist.
+  - `scripts\build_btc1h_multi_holdout_research.py` now exposes captured-TTL
+    model parity counts and keeps cached-TTL-only forward rows blocked for
+    promotion.
+- Added regression coverage:
+  - `scripts\test_btc_replay_sidecar_materialization.py`;
+  - `scripts\test_btc1h_replay_signal_scan_pruning.py` now also verifies the
+    selected-signal loader preserves optional model-input fields.
+- Validation:
+  - `python -m py_compile scripts\materialize_btc_replay_sidecar.py scripts\build_btc1h_selected_signal_model_parity.py scripts\build_btc1h_multi_holdout_research.py scripts\test_btc_replay_sidecar_materialization.py scripts\test_btc1h_replay_signal_scan_pruning.py scripts\replay_btc1h_core_ws_counterfactual.py scripts\check_btc_deployment_readiness.py scripts\test_btc_readiness_row_reconciliation.py`
+    -> passed;
+  - `python -m pytest scripts\test_btc_replay_sidecar_materialization.py scripts\test_btc1h_replay_signal_scan_pruning.py scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_execution_realism_audit.py -q --basetemp .pytest-codex-tmp`
+    -> `15 passed`;
+  - remote `.venv` `py_compile` passed after upload.
+- Uploaded the replay/materializer/parity/readiness tooling to the remote laptop
+  without restarting collectors. Backup:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_btc1h_model_input_capture_20260522_075110`.
+- Refreshed:
+  - `backtest_outputs\btc1h_selected_signal_model_parity_latest_codex`;
+  - `backtest_outputs\btc1h_multi_holdout_research_latest_codex`;
+  - `backtest_outputs\deployment_readiness_latest_codex`.
+- Current BTC1H quantitative status:
+  - best candidate remains `high_conf_80_entry70_no_chase`;
+  - `14 / 14` fixed historical/proxy/live-WS holdout buckets positive;
+  - `6 / 6` May live-WS cadences positive;
+  - historical/proxy rows `159`, stressed historical/proxy PnL `+$21.39`;
+  - forward REST-official rows `11`, official PnL `+$0.50`, mismatch rate
+    `9.09%`;
+  - selected-signal exact model parity still fails `0 / 13`, while implied
+    cached-TTL parity passes `13 / 13`;
+  - replay-vs-ledger remains not promotion-usable (`9 / 11` exact matches,
+    replay-minus-actual PnL `+$0.61`).
+- Current remote sidecar schema check: the running BTC1H process is still
+  writing the older sidecar schema. It has live rows
+  (`signal_scan=133,450`, `ws_orderbook_top=456,290`, `order_decision=1` in
+  the replay sidecar at the check), but `signal_scan` lacks the newly required
+  exact model-input fields such as `ttl_min`, model policy fields, quote
+  age/timestamp, top-visible quantity, BTC RV60, and BTC 10-minute return.
+- Deployment/readiness:
+  - `production_ready_count = 0`;
+  - no BTC1H or BTC15M strategy is deployable;
+  - BTC1H is the current active research path, but future deployable evidence
+    needs a clean, explicitly authorized BTC1H evidence-clock restart so new
+    rows contain exact scan-time model inputs and can be reconciled against
+    official settlement and row-faithful replay.
+
+## 2026-05-22 - BTC1H clean evidence-clock gate added
+
+- Goal: make the next BTC1H deployability blocker machine-readable instead of
+  relying on prose scattered across parity/readiness artifacts.
+- Re-checked local process state: no matching Kalshi/BTC Python processes were
+  running on this laptop.
+- Re-checked remote process state at `2026-05-22T08:05:11Z`: `ALL_RUNNING`.
+  BTC1H PID `5132` was still alive; no collectors or shadows were restarted.
+- Refreshed remote official settlement and pulled
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex`.
+  BTC1H remains unchanged:
+  - `11` official-settled rows;
+  - official PnL `+$0.50`;
+  - official win `72.73%`;
+  - proxy PnL `+$1.50`;
+  - `1` proxy/official mismatch (`9.09%`).
+- Pulled current remote BTC1H status/schema snapshots to:
+  - `runtime\remote_status\btc1h_status_latest.json`;
+  - `runtime\remote_status\btc1h_replay_sidecar_schema_latest.json`.
+- Added `scripts\build_btc1h_clean_evidence_clock_gate.py`.
+  It checks whether active BTC1H forward rows belong to a clean promotion
+  evidence clock by requiring:
+  - fresh capture status;
+  - sidecar signal/order policy fields;
+  - expected model TTL/policy rows in official-settled ledger output;
+  - captured selected TTL/model inputs;
+  - replay-vs-ledger promotion usability;
+  - enough official rows, positive official PnL, and no proxy/official
+    mismatches.
+- Current artifact:
+  `backtest_outputs\btc1h_clean_evidence_clock_gate_latest_codex`.
+  Verdict:
+  - `gate_status = BLOCKED_CONTROLLED_RESTART_REQUIRED`;
+  - `clean_evidence_clock_ready = False`;
+  - next action:
+    `controlled_btc1h_shadow_restart_to_start_clean_evidence_clock`;
+  - official rows `11 / 50`, official PnL `+$0.50`, mismatch rate `9.09%`.
+- Main clean-clock blockers:
+  - current BTC1H replay sidecar is missing exact model-input fields:
+    `ttl_min`, `model_ttl_policy`, `model_policy_version`,
+    `signal_strategy`, quote timestamp/age, top-visible quantity, BTC RV60,
+    BTC 10-minute return, close time, and BTC candle timing fields;
+  - order-decision sidecar rows are missing policy fields;
+  - expected scan-time model policy has `0` official rows;
+  - existing `11` BTC1H official rows are blank-policy cached-TTL rows;
+  - captured TTL rows are `0 / 13`;
+  - replay-vs-ledger remains not promotion-usable;
+  - official row count and proxy/official mismatch gates both fail.
+- Wired the clean evidence-clock gate into
+  `scripts\check_btc_deployment_readiness.py`; refreshed
+  `backtest_outputs\deployment_readiness_latest_codex`.
+  `production_ready_count` remains `0`, now with explicit BTC1H clean-clock
+  blocker columns/reasons.
+- Added regression coverage:
+  `scripts\test_btc1h_clean_evidence_clock_gate.py`.
+- Also patched `scripts\analyze_btc1h_highconf_robustness.py` so `--help`
+  uses `argparse` and no longer writes a timestamped robustness artifact.
+- Validation:
+  - `python -m py_compile scripts\analyze_btc1h_highconf_robustness.py scripts\check_btc_deployment_readiness.py scripts\build_btc1h_clean_evidence_clock_gate.py`;
+  - `python scripts\analyze_btc1h_highconf_robustness.py --help` did not
+    create a new robustness directory;
+  - `python -m pytest scripts\test_btc1h_clean_evidence_clock_gate.py scripts\test_btc_replay_sidecar_materialization.py scripts\test_btc1h_replay_signal_scan_pruning.py scripts\test_btc_readiness_row_reconciliation.py scripts\test_btc_execution_realism_audit.py -q --basetemp .pytest-codex-tmp`
+    -> `18 passed`.
+- Uploaded the clean-clock/readiness/robustness tooling to the remote laptop
+  without restarting collectors. Remote backup:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_btc1h_clean_clock_gate_20260522_080506`.
+- Interpretation: `high_conf_80_entry70_no_chase` remains near-deployable
+  research only. The strategy is historically interesting, but the current
+  forward rows cannot be promoted. The next deployability step is not another
+  threshold search; it is a controlled BTC1H evidence-clock restart, if and
+  when explicitly authorized, followed by fresh official-settled rows with
+  exact model-input sidecar fields and row-faithful replay.
+
+## 2026-05-22 - BTC1H process-status and restart authorization refresh
+
+- Goal: continue the BTC1H research loop while keeping BTC15M running only as
+  shadow/control evidence, and make sure a future clean evidence-clock restart
+  is guarded by real preflight checks rather than brittle SSH/WMI process
+  inspection.
+- Re-checked local process state: no matching Kalshi/BTC Python processes were
+  running on this laptop.
+- Remote status after sidecar-PID fallback refresh:
+  - `running_targets = 5 / 5`;
+  - duplicate target processes `0`;
+  - unmanaged matching processes `0` by available status artifacts;
+  - BTC1H `btc1h_high_conf80_entry70_no_chase_shadow` PID `5132` is alive, but
+    its start time `2026-05-22T02:42:06Z` predates the latest
+    `scripts\btc_1hr_research_live.py` source mtime
+    `2026-05-22T05:18:44Z`, so current rows remain stale for promotion.
+- Current BTC1H quantitative state is unchanged:
+  - best candidate: `high_conf_80_entry70_no_chase`;
+  - multi-holdout: `14 / 14` positive buckets and `6 / 6` May WS cadences;
+  - historical/proxy rows `159`, stressed historical/proxy PnL `+$21.39`;
+  - forward REST-official rows `11`, official PnL `+$0.50`, official win
+    `72.73%`, proxy PnL `+$1.50`, mismatch rate `9.09%`;
+  - replay-vs-ledger is not promotion-usable: `9 / 11` exact rows and
+    replay-minus-actual PnL `+$0.61`.
+- Patched guardrail tooling:
+  - `scripts\check_btc_forward_shadow_status.py` now falls back to capture
+    status sidecar PIDs when WMI command-line process inspection is denied, and
+    parses Windows 7-digit fractional process start timestamps correctly;
+  - `scripts\restart_btc_paper_shadows.ps1` now uses capture-status PID
+    fallback in dry runs and records process-inspection warnings rather than
+    failing immediately under SSH;
+  - `scripts\build_btc_restart_authorization_packet.py` now treats
+    `PASS_SCHEMA_READY` active ledgers as acceptable for a guarded restart and
+    recognizes the q250 YES shadow as already running;
+  - `scripts\test_btc_paper_restart_safety.py` covers these guardrail changes.
+- Validation:
+  - local `py_compile` passed for the touched status/restart/auth/test scripts;
+  - local `powershell -NoProfile -ExecutionPolicy Bypass -File
+    scripts\restart_btc_paper_shadows.ps1 -StartupWaitSec 1` produced a dry-run
+    plan only and did not stop/start processes;
+  - local targeted pytest suite passed: `26 passed`;
+  - remote `.venv` `py_compile` passed after upload.
+- Remote backup before the final upload:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_q250_yes_running_status_fix_20260522_082520`.
+- Refreshed artifacts:
+  - `backtest_outputs\btc_forward_shadow_status_latest_codex`;
+  - `backtest_outputs\btc_restart_authorization_packet_latest_codex`;
+  - `backtest_outputs\deployment_readiness_latest_codex`.
+- Restart authorization packet now reports:
+  - `all_ready_for_user_authorization = true`;
+  - `all_ready_for_clean_restart_authorization = true`;
+  - `ready_for_user_authorization_count = 4 / 4`.
+- No restart or deployment was executed. `production_ready_count` remains `0`.
+  The honest next step, if explicitly authorized, is a controlled paper-shadow
+  restart to start a clean BTC1H scan-time-TTL evidence clock. After that,
+  BTC1H needs at least `50` official-settled post-restart rows with populated
+  execution-realism/model-input fields, low official/proxy mismatch, and
+  row-faithful replay before any deployment discussion.
+
+## 2026-05-22 - BTC1H clean-clock gate fallback and latest refresh
+
+- Goal: keep the BTC1H evidence-clock gate faithful on both the local laptop
+  and the remote collector, even when SSH/WMI access or pulled
+  `runtime\remote_status` snapshots are unavailable/stale.
+- Refreshed remote state without stopping or restarting anything:
+  - remote status: `5 / 5` expected targets running;
+  - BTC1H PID `5132` alive;
+  - duplicate target processes `0`;
+  - unmanaged matching processes `0`;
+  - BTC1H remains `RUNNING_SOURCE_STALE_RESTART_REQUIRED` because the process
+    predates the source that records exact scan-time model inputs.
+- Refreshed remote official settlement and pulled
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex`.
+  Current BTC1H official evidence is unchanged:
+  - `11` official rows;
+  - official PnL `+$0.50`;
+  - official win `72.73%`;
+  - proxy/official mismatches `1 / 11 = 9.09%`.
+- Patched `scripts\build_btc1h_clean_evidence_clock_gate.py`:
+  - added `--forward-status-summary`;
+  - uses the fresher forward-status row when pulled runtime status JSON is
+    stale or missing;
+  - can derive replay-sidecar table schema directly from the JSONL sidecar on
+    the remote collector when a separate schema snapshot is missing;
+  - parses Windows timestamps with 7 fractional digits.
+- Added regression coverage in
+  `scripts\test_btc1h_clean_evidence_clock_gate.py` for the forward-status and
+  replay-sidecar fallback path.
+- Refreshed local clean-clock artifact:
+  `backtest_outputs\btc1h_clean_evidence_clock_gate_latest_codex`.
+  Current summary:
+  - `gate_status = BLOCKED_CONTROLLED_RESTART_REQUIRED`;
+  - `status_source = forward_status_summary`;
+  - `sidecar_schema_source = sidecar_schema_json`;
+  - official rows `11 / 50`;
+  - official PnL `+$0.50`;
+  - multi-holdout promising `True`;
+  - captured TTL rows `0 / 13`;
+  - old sidecar still missing exact model-input fields.
+- Refreshed `backtest_outputs\deployment_readiness_latest_codex`:
+  `production_ready_count = 0`.
+- Uploaded the clean-clock fallback script/test to the remote laptop after
+  backup:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_clean_clock_forward_status_fallback_20260522_083820`.
+  Remote `.venv` compile passed. Remote smoke run now blocks for real
+  evidence-clock reasons rather than missing status JSON.
+- Validation:
+  - local `py_compile` passed for the clean-clock script and test;
+  - local targeted pytest suite passed: `27 passed`;
+  - no restart, deployment, or process kill was executed.
+- Interpretation: the active BTC1H candidate remains the strongest research
+  candidate and near-deployable only in the research sense. The deployability
+  bottleneck is now very specific and machine-readable: a clean scan-time-TTL
+  forward evidence clock must be started before future rows can count.
+
+## 2026-05-22 - BTC1H official basis/mismatch audit
+
+- Goal: make the current BTC1H official/proxy settlement risk row-level and
+  machine-readable without fitting a hindsight guard on the tiny sample.
+- Added `scripts\build_btc1h_official_basis_mismatch_audit.py`.
+  It reads
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex\shadow_official_trades.csv`
+  and writes:
+  - `backtest_outputs\btc1h_official_basis_mismatch_audit_latest_codex\btc1h_basis_mismatch_summary.csv`;
+  - `btc1h_basis_mismatch_watchlist.csv`;
+  - `btc1h_basis_mismatch_by_day.csv`;
+  - `btc1h_basis_mismatch_rows.csv`;
+  - `report.md`.
+- Current audit verdict:
+  `TOO_FEW_OFFICIAL_ROWS;OBSERVED_PROXY_OFFICIAL_MISMATCH;PROXY_WIN_OFFICIAL_LOSS_FLIP`.
+- Current BTC1H basis/mismatch numbers:
+  - official rows `11 / 50`;
+  - official PnL `+$0.50`;
+  - proxy PnL `+$1.50`;
+  - official-minus-proxy PnL `-$1.00`;
+  - official/proxy mismatches `1 / 11 = 9.09%`;
+  - proxy-win/official-loss flips `1`;
+  - max absolute official/proxy basis `$87.42`;
+  - p95 absolute official/proxy basis `$78.915`;
+  - near-proxy-boundary rows within `$50`: `4`;
+  - near-official-boundary rows within `$50`: `4`.
+- The mismatch row is
+  `KXBTCD-26MAY2008-T77299.99`, side `no`:
+  - proxy result `no`, official result `yes`;
+  - proxy margin was only about `$8.37` in favor of NO;
+  - official margin ended about `$33.78` against NO;
+  - official-minus-proxy basis was `$42.15`;
+  - proxy PnL `+$0.30`, official PnL `-$0.70`.
+- Daily path:
+  - `2026-05-19`: `4` rows, official PnL `+$0.22`, no mismatches;
+  - `2026-05-20`: `4` rows, official PnL `-$0.63`, `1` mismatch;
+  - `2026-05-21`: `3` rows, official PnL `+$0.91`, no mismatches.
+- Wired the audit into `scripts\check_btc_deployment_readiness.py`; refreshed
+  `backtest_outputs\deployment_readiness_latest_codex`.
+  Readiness now carries BTC1H basis fields and still has
+  `production_ready_count = 0`.
+- Added the audit to `scripts\refresh_btc_evidence_stack.py` immediately before
+  deployment readiness. Bounded smoke refresh passed for:
+  - `btc1h_official_basis_mismatch_audit`;
+  - `deployment_readiness` with expected no-deploy exit `1`.
+- Added regression coverage:
+  - `scripts\test_btc1h_official_basis_mismatch_audit.py`;
+  - readiness coverage in `scripts\test_btc_readiness_row_reconciliation.py`.
+- Validation:
+  - local `py_compile` passed for the new audit, readiness, refresh controller,
+    and tests;
+  - local targeted pytest suite passed: `29 passed`;
+  - remote `.venv` compile passed after upload;
+  - remote audit run passed and produced the same BTC1H basis verdict.
+- Remote backup before upload:
+  `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_btc1h_basis_mismatch_audit_20260522_084500`.
+- Interpretation: this does not make a guard deployable. It tells us exactly
+  what to monitor after a clean restart: near-strike NO trades can be erased by
+  Kalshi official basis versus proxy close. Any distance/basis guard must be
+  preregistered for future clean-clock rows, not fitted to these `11` rows.
+
+## 2026-05-22 - BTC1H next forward candidate packet
+
+- Goal: freeze the next BTC1H forward-evidence spec so future clean-clock rows
+  have an explicit candidate definition, promotion gate, and basis-watch
+  checklist. This is not deployment approval.
+- Added `scripts\build_btc1h_next_forward_candidate_packet.py`.
+  It writes:
+  - `backtest_outputs\btc1h_next_forward_candidate_packet_latest_codex\btc1h_candidate_freeze_specs.csv`;
+  - `btc1h_promotion_gate_specs.csv`;
+  - `btc1h_basis_watch_specs.csv`;
+  - `btc1h_current_evidence_snapshot.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_next_forward_candidate_packet.py`.
+- Frozen candidate:
+  - `variant = high_conf_80_entry70_no_chase`;
+  - `ledger = btc1h_high_conf80_entry70_no_chase_shadow`;
+  - wrapper `scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py`;
+  - policy `btc1h_live_model_20260522_scan_ttl_v1` /
+    `scan_time_close_minus_now_v1`;
+  - paper-only, flat-max sizing, `1` contract;
+  - TTL `5` to `20` minutes;
+  - entry `25c` to `70c`;
+  - YES probability `>= 0.80`, NO-side `p_yes <= 0.20`;
+  - min edge `12c`, max spread `2c`;
+  - no-chase 10-minute move threshold `$150`.
+- Current evidence snapshot in the packet:
+  - `14 / 14` holdouts positive;
+  - `6 / 6` May websocket cadences positive;
+  - historical/proxy rows `159`, PnL `+$21.39`;
+  - forward official rows `11`, official PnL `+$0.50`;
+  - forward official mismatch rate `9.09%`;
+  - clean clock `BLOCKED_CONTROLLED_RESTART_REQUIRED`;
+  - basis audit
+    `TOO_FEW_OFFICIAL_ROWS;OBSERVED_PROXY_OFFICIAL_MISMATCH;PROXY_WIN_OFFICIAL_LOSS_FLIP`.
+- Promotion gate frozen for future clean-clock rows:
+  - at least `50` clean post-restart official rows;
+  - official PnL positive after fees;
+  - proxy/official mismatch rate `<= 2%`;
+  - proxy-win/official-loss flips `0`;
+  - row-for-row replay/ledger match required;
+  - execution realism fields required;
+  - expected model policy rows required;
+  - blank policy rows allowed `0`;
+  - source freshness must be current after controlled restart.
+- Basis watch is prospective only:
+  - watch boundary `$50`;
+  - watch fields include side, market/strike, entry spot, proxy close,
+    official expiration value, official-minus-proxy spot, side margins,
+    quote age, top visible quantity, and entry price;
+  - do not fit or apply a guard from current stale rows.
+- Wired the packet into `scripts\refresh_btc_evidence_stack.py` immediately
+  before deployment readiness. Bounded smoke refresh passed for:
+  - `btc1h_next_forward_candidate_packet`;
+  - `deployment_readiness` with expected no-deploy exit `1`.
+- Validation:
+  - local `py_compile` passed for the packet builder/test and refresh
+    controller;
+  - local packet test passed;
+  - local packet generated from full local artifact set;
+  - remote `.venv` compile and packet run passed after upload;
+  - remote backup:
+    `C:\Users\ClawService\Kalshi-Trading-Bot\runtime\script_backups\pre_btc1h_next_forward_packet_20260522_085030`.
+- Interpretation: the next forward path is now explicit. We still need an
+  explicitly authorized controlled paper-shadow restart before any new rows can
+  count toward the frozen promotion gate.
+
+## 2026-05-22 - BTC1H decision-time distance guard audit
+
+- Goal: test whether the current BTC1H official/proxy flip is likely solved by
+  a simple decision-time side-distance guard, without fitting a deployable guard
+  from the tiny current official sample.
+- Added `scripts\build_btc1h_decision_distance_guard_audit.py`.
+  It writes:
+  - `backtest_outputs\btc1h_decision_distance_guard_audit_latest_codex\btc1h_decision_distance_guard_summary.csv`;
+  - `btc1h_decision_distance_guard_holdouts.csv`;
+  - `btc1h_decision_distance_guard_forward_rows.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_decision_distance_guard_audit.py`.
+- Feature tested: decision-time side margin in USD:
+  - YES margin = `spot - strike`;
+  - NO margin = `strike - spot`.
+- Active candidate audited:
+  `high_conf_80_entry70_no_chase`, with historical/proxy rows stressed by
+  `+2c` adverse entry.
+- Key result:
+  - no guard / `$25` guard: `127` historical rows, `15 / 15` positive
+    historical holdouts, `6 / 6` positive WS cadences, current official sample
+    `11` rows for `+$0.50` with `1` proxy-win/official-loss flip;
+  - `$50` guard: removes the current official mismatch and raises current
+    diagnostic official PnL to `+$1.88` on `9` rows, but historical evidence
+    weakens to `13 / 15` positive holdouts and only `4 / 6` positive WS
+    cadences;
+  - `$75+` guards reduce sample size and damage WS stability further.
+- Interpretation: a simple `$50+` decision-distance guard is not ready to
+  freeze as the next BTC1H strategy. It addresses the current observed flip,
+  but it breaks the fixed live-websocket cadence robustness that made the
+  candidate interesting. The current stale-clock official rows remain
+  diagnostic only; do not promote or tune a guard from them.
+- Wired the audit into `scripts\refresh_btc_evidence_stack.py` before the
+  BTC1H next-forward packet and readiness check.
+- Bounded refresh smoke passed for:
+  - `btc1h_decision_distance_guard_audit`;
+  - `btc1h_next_forward_candidate_packet`;
+  - `deployment_readiness` with expected no-deploy exit `1`.
+- Validation:
+  - local `py_compile` passed for the new audit, test, and refresh controller;
+  - local targeted pytest passed: `8 passed`.
+
+## 2026-05-22 - BTC1H side/entry profile audit
+
+- Goal: check whether the active BTC1H candidate's fragility is better
+  explained by side exposure or entry-price band than by distance alone, without
+  treating slices as deployable policies.
+- Added `scripts\build_btc1h_side_entry_profile_audit.py`.
+  It writes:
+  - `backtest_outputs\btc1h_side_entry_profile_audit_latest_codex\btc1h_side_entry_profile_summary.csv`;
+  - `btc1h_side_entry_profile_holdouts.csv`;
+  - `btc1h_side_entry_profile_forward_rows.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_side_entry_profile_audit.py`.
+- Profiles tested are fixed diagnostics:
+  `all_active`, `yes_only`, `no_only`, `entry_le_50`,
+  `entry_50_60`, `entry_60_70`, `yes_entry_le_60`,
+  `yes_entry_60_70`, `no_entry_le_60`, `no_entry_60_70`.
+- Key result:
+  - `all_active`: `159` historical/proxy rows, `+$21.39`, `15 / 15`
+    positive holdouts, `6 / 6` WS cadences, current diagnostic official sample
+    `11` rows, `+$0.50`, `1` mismatch/flip;
+  - `entry_60_70`: still `15 / 15` holdouts and `6 / 6` WS cadences, but
+    current official sample has only `+$0.09` on `10` rows and still has the
+    mismatch/flip;
+  - `yes_only`: `59` historical/proxy rows, `+$8.74`, but only `14 / 15`
+    holdouts and `5 / 6` WS cadences positive; current official evidence is
+    just `1` row for `+$0.32`;
+  - `no_only`: `100` historical/proxy rows, `+$12.65`, `6 / 6` WS cadences,
+    but current official sample is `10` rows for only `+$0.18` and still has
+    the mismatch/flip;
+  - `no_entry_60_70`: current official sample is negative, `-$0.23`, with the
+    mismatch/flip still present.
+- Interpretation: no side-only or entry-band slice improves the deployability
+  case. YES-only is too sparse and less stable; NO-side/entry-60-70 retains the
+  exact official-settlement blocker. Keep the frozen active BTC1H candidate as
+  the sole next forward candidate for now, and do not preregister a side/entry
+  retune from these stale rows.
+- Wired the audit into `scripts\refresh_btc_evidence_stack.py` between the
+  BTC1H distance-guard audit and the next-forward packet.
+- Bounded refresh smoke passed for:
+  - `btc1h_decision_distance_guard_audit`;
+  - `btc1h_side_entry_profile_audit`;
+  - `btc1h_next_forward_candidate_packet`;
+  - `deployment_readiness` with expected no-deploy exit `1`.
+- Validation:
+  - local `py_compile` passed for the new audit/test and refresh controller;
+  - local targeted pytest passed: `8 passed`.
+
+## 2026-05-22 - BTC1H promotion gap matrix
+
+- Goal: collapse the large readiness CSV into a compact BTC1H-only promotion
+  matrix that separates research support, operational passes, stale diagnostic
+  evidence, hard blockers, and rejected retune diagnostics.
+- Added `scripts\build_btc1h_promotion_gap_matrix.py`.
+  It writes:
+  - `backtest_outputs\btc1h_promotion_gap_matrix_latest_codex\btc1h_promotion_gap_matrix.csv`;
+  - `btc1h_promotion_gap_summary.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_promotion_gap_matrix.py`.
+- Current summary for `high_conf_80_entry70_no_chase`:
+  - `deployable_now = False`;
+  - `near_deployable_research_candidate = True`;
+  - recommended policy for the next clean clock:
+    `high_conf_80_entry70_no_chase`;
+  - recommended policy change: `none`;
+  - recommended next action:
+    `explicitly_authorized_controlled_restart_then_collect_50_clean_official_rows`;
+  - blocked gates: `8`;
+  - rejected diagnostic retunes: `2`;
+  - diagnostic-only gates: `5`;
+  - research-only pass: `1`;
+  - operational pass: `1`.
+- Gate interpretation:
+  - PASS research-only:
+    historical multi-holdout support (`14 / 14` holdouts, `6 / 6` WS
+    cadences, historical PnL `+$21.39`);
+  - PASS operational:
+    frozen policy parity;
+  - DIAGNOSTIC only:
+    official PnL is positive (`+$0.50`) only on stale pre-clean-clock rows,
+    basis-stressed proxy labels are fragile at observed p95/max basis,
+    runner-up variants look more basis-robust but lack forward validation,
+    holdout independence is duplicate-heavy, and statistical confidence is
+    fragile after de-duplicating market/side rows;
+  - BLOCKED:
+    clean evidence clock, clean forward sample size, execution-realism fields,
+    proxy/official agreement, overall readiness, policy identity fields,
+    process/source freshness, and row-for-row replay;
+  - REJECTED diagnostic retunes:
+    distance guard and side/entry retunes.
+- Wired the matrix into `scripts\refresh_btc_evidence_stack.py` immediately
+  after deployment readiness, so it summarizes the current BTC1H gate state
+  after readiness has been rebuilt.
+- Bounded refresh smoke passed for:
+  - `deployment_readiness` with expected no-deploy exit `1`;
+  - `btc1h_promotion_gap_matrix`.
+- Validation:
+  - local `py_compile` passed for the new matrix script/test and refresh
+    controller;
+  - local targeted pytest passed: `8 passed`.
+
+## 2026-05-22 - BTC1H statistical confidence audit
+
+- Goal: stress the active BTC1H candidate's statistical story without changing
+  policy thresholds, and without allowing statistics to bypass official
+  settlement, clean-clock, execution, or replay gates.
+- Added `scripts\build_btc1h_statistical_confidence_audit.py`.
+  It writes:
+  - `backtest_outputs\btc1h_statistical_confidence_audit_latest_codex\btc1h_statistical_confidence_summary.csv`;
+  - `btc1h_statistical_input_rows.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_statistical_confidence_audit.py`.
+- Key result:
+  - naive pooled historical rows: `159` rows, `+$21.39`, win `81.76%`,
+    max DD `-$1.82`, Sharpe `4.45`, event-cluster bootstrap p2.5
+    `+$5.7395`, breakeven-null p `0.00025`;
+  - unique market/side historical rows: `69` rows, `+$5.82`, win `76.81%`,
+    max DD `-$1.95`, Sharpe `1.67`, event-cluster bootstrap p2.5
+    `-$1.28`, breakeven-null p `0.043898`;
+  - robustness rows alone: `127` rows, `+$16.61`, event-cluster bootstrap p2.5
+    `+$2.77`, breakeven-null p `0.00065`;
+  - direct rows alone: `32` rows, `+$4.78`, event-cluster bootstrap p2.5
+    `+$0.24975`, breakeven-null p `0.049448`;
+  - stale forward official rows: `11` rows, `+$0.50`, win `72.73%`, max DD
+    `-$1.76`, Sharpe `0.315`, event-cluster bootstrap p2.5 `-$2.61`,
+    breakeven-null p `0.514474`.
+- Interpretation: pooled historical evidence remains worth researching, but it
+  is partly inflated by duplicate/cadence-overlapping market-side rows. The
+  de-duplicated panel has a negative lower bootstrap bound, and the stale
+  official panel is statistically useless for promotion. The active BTC1H
+  candidate remains a near-deployable research candidate only.
+- Wired the audit into `scripts\refresh_btc_evidence_stack.py` before the
+  BTC1H next-forward packet, deployment readiness, and promotion gap matrix.
+- Wired the statistical summary into
+  `scripts\build_btc1h_promotion_gap_matrix.py` as a `DIAGNOSTIC_ONLY`
+  `statistical_confidence` gate.
+
+## 2026-05-22 - BTC1H holdout independence audit
+
+- Goal: audit whether the active BTC1H candidate's `14 / 14` positive
+  multi-holdout result is inflated by duplicate market/side rows or by one
+  event/holdout cluster, without changing the frozen policy.
+- Added `scripts\build_btc1h_holdout_independence_audit.py`.
+  It writes:
+  - `backtest_outputs\btc1h_holdout_independence_audit_latest_codex\btc1h_holdout_independence_summary.csv`;
+  - `btc1h_holdout_independence_by_holdout.csv`;
+  - `btc1h_holdout_independence_leave_one_holdout.csv`;
+  - `btc1h_holdout_independence_top_clusters.csv`;
+  - `btc1h_holdout_independence_input_rows.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_holdout_independence_audit.py`.
+- Key result:
+  - pooled historical rows: `159` rows, `+$21.39`, `90` duplicate
+    market/side rows, `63` event clusters, `15` holdout keys,
+    leave-one-event minimum PnL `+$19.41`;
+  - de-duplicated market/side rows: `69` rows, `+$5.82`, `63` event clusters,
+    `10` holdout keys, leave-one-event minimum PnL `+$5.26`;
+  - stale forward official rows: `11` rows, `+$0.50`, leave-one-event minimum
+    PnL `+$0.09`, diagnostic only;
+  - weak holdout buckets:
+    `direct_predexon_trade_logs|H2b_direct_apr23_may01_holdout` has only
+    `+$0.06` and flips negative under one-event removal; and
+    `robustness_trade_logs|D1_predexon_mar24_apr01_dev` has only `+$0.22` and
+    also flips negative under one-event removal.
+- Interpretation: the active BTC1H candidate is not purely a one-event mirage;
+  the de-duplicated panel remains positive and leave-one-holdout remains
+  positive. But the pooled edge is much less impressive after removing
+  duplicate market/side rows, and several small buckets are fragile. This is
+  research support, not deployment evidence.
+- Wired the audit into `scripts\refresh_btc_evidence_stack.py` before the
+  statistical confidence audit and BTC1H promotion gap matrix.
+- Wired the summary into `scripts\build_btc1h_promotion_gap_matrix.py` as a
+  `DIAGNOSTIC_ONLY` `holdout_independence` gate.
+- Validation:
+  - local `py_compile` passed for the new audit/test, promotion matrix, and
+    refresh controller;
+  - local targeted pytest passed: `10 passed`;
+  - bounded refresh smoke passed from `btc1h_holdout_independence_audit`
+    through `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as
+    the expected no-deploy verdict.
+
+## 2026-05-22 - BTC1H official-basis stress audit
+
+- Goal: stress active BTC1H historical/proxy labels against plausible Kalshi
+  official settlement basis without fitting a guard or changing the frozen
+  policy. The stress moves proxy settlement against each trade side: YES rows
+  lower, NO rows higher.
+- Added `scripts\build_btc1h_basis_stress_audit.py`.
+  It writes:
+  - `backtest_outputs\btc1h_basis_stress_audit_latest_codex\btc1h_basis_stress_summary.csv`;
+  - `btc1h_basis_stress_by_holdout.csv`;
+  - `btc1h_basis_stress_trade_rows.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_basis_stress_audit.py`.
+- Stressable coverage:
+  - `62` active-candidate historical/proxy rows with usable settlement spot;
+  - `32` unique market/side rows;
+  - `9` historical holdout buckets;
+  - this excludes live-WS rows without a usable proxy settlement spot for this
+    particular stress calculation.
+- Key result under `+2c` adverse entry stress:
+  - `$0`, `$25`, `$50` side-adverse basis: `0` flips, PnL `+$9.04`, unique
+    market/side PnL `+$4.78`, `9 / 9` positive stressable holdouts;
+  - `$75` side-adverse basis: `7` flips, PnL `+$2.04`, unique PnL `+$0.78`,
+    `6 / 9` positive holdouts;
+  - observed p95 absolute official/proxy basis `$78.915`: `9` flips, PnL
+    `+$0.04`, unique PnL `-$0.22`, only `4 / 9` positive holdouts;
+  - observed max basis `$87.42`: `11` flips, PnL `-$1.96`, unique PnL
+    `-$1.22`, only `2 / 9` positive holdouts.
+- Interpretation: the active BTC1H candidate is robust to moderate `$50`
+  side-adverse basis in the stressable historical panel, but it is not robust
+  to p95/max basis shocks observed in the tiny stale official sample. This
+  reinforces that proxy/captured labels remain research-only and that future
+  clean official rows are mandatory before any promotion or basis guard.
+- Wired the audit into `scripts\refresh_btc_evidence_stack.py` after the
+  official basis mismatch audit and before distance/side/statistical audits.
+- Wired the summary into `scripts\build_btc1h_promotion_gap_matrix.py` as a
+  `DIAGNOSTIC_ONLY` `basis_stress` gate.
+- Validation:
+  - local `py_compile` passed for the new audit/test, promotion matrix, and
+    refresh controller;
+  - local targeted pytest passed: `11 passed`;
+  - bounded refresh smoke passed from `btc1h_basis_stress_audit` through
+    `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as the
+    expected no-deploy verdict.
+
+## 2026-05-22 - BTC1H variant basis-stress ranking
+
+- Goal: compare already-frozen BTC1H variants under the same side-adverse
+  official-basis shocks, so research priority is not based only on the active
+  forward candidate. This is not a threshold search and does not switch the
+  active policy.
+- Added `scripts\build_btc1h_variant_basis_stress_ranking.py`.
+  It writes:
+  - `backtest_outputs\btc1h_variant_basis_stress_ranking_latest_codex\btc1h_variant_basis_stress_ranking.csv`;
+  - `btc1h_variant_basis_stress_summary.csv`;
+  - `btc1h_variant_basis_stress_by_holdout.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_variant_basis_stress_ranking.py`.
+- Ranking by maximum side-adverse basis shock with positive unique
+  market/side PnL:
+  - `high_conf_80_no_chase`: survives through `$87.42`; at p95 basis
+    `$78.915`, PnL `+$2.70`, unique PnL `+$1.60`, `8 / 12` holdouts positive;
+  - `high_conf_80_entry59_70_no_chase`: survives through `$87.42`; at p95
+    basis, PnL `+$3.00`, unique PnL `+$1.41`, `8 / 9` holdouts positive;
+  - `high_conf_80_entry70_no_chase`: survives only through `$75`; at p95
+    basis, PnL `+$0.04`, unique PnL `-$0.22`, `4 / 9` holdouts positive;
+  - `high_conf_80`: survives only through `$50`; at p95 basis, PnL `-$2.11`,
+    unique PnL `-$2.11`, `2 / 5` holdouts positive.
+- Interpretation:
+  - The active forward candidate is still the only BTC1H near-forward
+    candidate because it has current official rows and frozen packet coverage.
+  - But it is not the strongest basis-stress historical variant.
+  - `high_conf_80_no_chase` is basis-robust historically, yet prior evidence
+    still rejected it for websocket cadence instability and expensive-entry
+    fragility.
+  - `entry59_70_no_chase` is basis-robust historically, yet it remains
+    historical-only and derived from filtered rows; it needs causal replay and
+    fresh forward shadow evidence before promotion discussion.
+- Wired the ranking into `scripts\refresh_btc_evidence_stack.py` after the
+  active-candidate basis stress audit.
+- Wired the ranking into `scripts\build_btc1h_promotion_gap_matrix.py` as a
+  `DIAGNOSTIC_ONLY` `variant_basis_stress_ranking` gate.
+- Validation:
+  - local `py_compile` passed for the new ranking/test, promotion matrix, and
+    refresh controller;
+  - local targeted pytest passed: `10 passed`;
+  - bounded refresh smoke passed from `btc1h_variant_basis_stress_ranking`
+    through `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as
+    the expected no-deploy verdict.
+
+## 2026-05-22 - BTC1H research priority matrix
+
+- Goal: separate the current forward-control policy from the best historical
+  runner-up, so BTC1H research does not silently switch policies based on a
+  diagnostic basis-stress table.
+- Added `scripts\build_btc1h_research_priority_matrix.py`.
+  It writes:
+  - `backtest_outputs\btc1h_research_priority_matrix_latest_codex\btc1h_research_priority_matrix.csv`;
+  - `btc1h_research_priority_summary.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Added regression coverage:
+  `scripts\test_btc1h_research_priority_matrix.py`.
+- Current matrix:
+  - active forward-control policy remains `high_conf_80_entry70_no_chase`;
+  - top causal-replay runner-up is
+    `high_conf_80_entry59_70_no_chase`, but current live-WS replay overlap is
+    exact with the active policy on the paused snapshot;
+  - top basis-stress-only variant is `high_conf_80_no_chase`;
+  - recommended forward policy change is `none`;
+  - `deployable_now = False` and `production_ready_count = 0`.
+- Interpretation:
+  - `entry70_no_chase` is still the right frozen clean-clock control because it
+    is the only BTC1H policy with current official forward rows and packet
+    coverage, even though those rows are stale/diagnostic.
+  - `entry59_70_no_chase` deserves broader causal replay/model-input parity
+    before any paper-shadow discussion because the first paused-snapshot replay
+    added no independent rows versus `entry70_no_chase`.
+  - `high_conf_80_no_chase` is a basis-robust watchlist policy, but the failed
+    `1s` live-WS cadence and extra-row damage must be explained first.
+  - `high_conf_80` is low priority under current evidence.
+- Wired the priority matrix into `scripts\refresh_btc_evidence_stack.py` after
+  statistical confidence and before the BTC1H next-forward packet/readiness.
+- Validation:
+  - local `py_compile` passed for the new matrix/test and refresh controller;
+  - local targeted pytest passed: `8 passed`;
+  - bounded refresh smoke passed from `btc1h_research_priority_matrix` through
+    `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as the
+    expected no-deploy verdict.
+
+## 2026-05-22 - BTC1H entry59 replay overlap audit
+
+- Goal: test whether the `high_conf_80_entry59_70_no_chase` runner-up is
+  independent on the available paused live-websocket replay, rather than only a
+  historical filtered-row variant.
+- Ran faithful scan-clock replay on the paused May 21 remote BTC1H snapshot:
+  `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_fullscan_entry59_latest_codex`.
+  Command used captured `signal_scan` timestamps, live scan semantics, the
+  remote BTC research cache, and `--no-public-fallback`.
+- Result for `high_conf_80_entry59_70_no_chase`:
+  - `14` signals;
+  - `13` settled rows;
+  - PnL `+$1.99`;
+  - win rate `84.6154%`;
+  - max DD `-$1.40`;
+  - Sharpe `1.455433`.
+- Added `scripts\build_btc1h_replay_variant_overlap_audit.py`.
+  It compares the active `entry70_no_chase` full-scan replay against the new
+  `entry59_70_no_chase` replay.
+- Added regression coverage:
+  `scripts\test_btc1h_replay_variant_overlap_audit.py`.
+- Key overlap result:
+  - `entry70_no_chase` replay rows: `14`, PnL `+$1.99`;
+  - `entry59_70_no_chase` replay rows: `14`, PnL `+$1.99`;
+  - shared rows: `14`;
+  - base-only rows: `0`;
+  - challenger-only rows: `0`;
+  - independent challenger rows: `0`;
+  - status: `EXACT_ROW_SET_MATCH`.
+- Interpretation: on the paused May 21 live-WS snapshot, `entry59_70_no_chase`
+  adds no independent causal replay evidence versus `entry70_no_chase`. It is
+  still an interesting historical/basis-stress runner-up, but it should not get
+  a separate paper shadow or be double-counted until a broader causal replay or
+  future clean forward rows produce a genuinely different row set.
+- Wired the overlap audit into `scripts\refresh_btc_evidence_stack.py` before
+  the BTC1H research priority matrix. The matrix now records
+  `entry59_replay_overlap_status = EXACT_ROW_SET_MATCH` and
+  `entry59_independent_replay_rows_vs_active = 0`.
+- Validation:
+  - local `py_compile` passed for the overlap audit/test, priority matrix/test,
+    and refresh controller;
+  - local targeted pytest passed: `27 passed`;
+  - bounded refresh smoke passed from `btc1h_replay_variant_overlap_audit`
+    through `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as
+    the expected no-deploy verdict.
+
+## 2026-05-22 - BTC1H entry59 floor-filter audit
+
+- Goal: broaden the entry59-vs-entry70 independence check beyond the paused
+  live-WS snapshot without treating a filtered historical variant as a new
+  deployable policy.
+- Added `scripts\build_btc1h_entry59_floor_filter_audit.py`.
+  It compares `high_conf_80_entry59_70_no_chase` against active
+  `high_conf_80_entry70_no_chase` across paired direct Predexon aggregate rows
+  and the paused live-WS full-scan replay. It skips artifacts where either
+  variant is absent; the latest robustness log currently lacks the entry59
+  variant, so it is not counted as entry59-deleted evidence.
+- Added regression coverage:
+  `scripts\test_btc1h_entry59_floor_filter_audit.py`.
+- Output:
+  `backtest_outputs\btc1h_entry59_floor_filter_audit_latest_codex`.
+- Key result:
+  - comparable evidence labels: `6`;
+  - direct/live comparable rows: active `46`, entry59 `41`;
+  - shared exact rows: `40`;
+  - active-only exact rows: `6`, PnL `+$1.79`;
+  - entry59-only exact rows: `1`, PnL `+$0.32`;
+  - entry59-only independent market/side rows: `1`;
+  - paused live-WS snapshot entry59-only market/side rows: `0`;
+  - paused live-WS snapshot status: `EXACT_ROW_SET_MATCH`;
+  - status: `ENTRY59_HAS_INDEPENDENT_MARKET_SIDE_ROWS`, but only from one
+    historical direct Predexon row.
+- Updated `scripts\build_btc1h_research_priority_matrix.py` to ingest the new
+  floor-filter summary. Current priority summary records:
+  - `entry59_floor_filter_status = ENTRY59_HAS_INDEPENDENT_MARKET_SIDE_ROWS`;
+  - `entry59_independent_market_side_rows_vs_active = 1`;
+  - `entry59_independent_replay_rows_vs_active = 0`;
+  - `entry59_deleted_low_entry_base_rows = 6`;
+  - `entry59_deleted_low_entry_base_pnl = 1.79`;
+  - recommended forward policy change remains `none`.
+- Interpretation:
+  the one historical direct independent row is useful for broader replay
+  targeting, but it is not clean forward evidence. Do not start a separate
+  entry59 shadow yet; broaden causal replay or wait for future clean official
+  rows that actually differ from active entry70.
+- Wired the floor-filter audit into `scripts\refresh_btc_evidence_stack.py`
+  after replay-overlap and before the BTC1H priority matrix.
+- Validation:
+  - local `py_compile` passed for the new audit/test, priority matrix/test, and
+    refresh controller;
+  - local targeted pytest passed: `17 passed`;
+  - bounded refresh smoke passed from `btc1h_entry59_floor_filter_audit`
+    through `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as
+    the expected no-deploy verdict.
+
+## 2026-05-22 - BTC1H broad no-chase extra-row audit
+
+- Goal: make the `high_conf_80_no_chase` watchlist blocker current and
+  row-level, instead of relying on an older summary that said the 1s cadence was
+  bad.
+- Added `scripts\build_btc1h_no_chase_extra_row_audit.py`.
+  It compares broad `high_conf_80_no_chase` against active
+  `high_conf_80_entry70_no_chase` only on artifacts where both variants are
+  present. It recomputes every compared row with fixed `+2c` adverse entry
+  stress and taker fee.
+- Added regression coverage:
+  `scripts\test_btc1h_no_chase_extra_row_audit.py`.
+- Output:
+  `backtest_outputs\btc1h_no_chase_extra_row_audit_latest_codex`.
+- Also ran paused May 21 scan-clock replay for broad no-chase:
+  `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_fullscan_no_chase_latest_codex`.
+  It used captured `signal_scan` timestamps, live scan semantics, the remote
+  BTC cache, and `--no-public-fallback`.
+- Key result:
+  - broad no-chase full-scan replay: `17` signals, `16` settled rows, PnL
+    `+$1.68`, win `81.25%`, max DD `-$1.41`;
+  - full-scan overlap versus active entry70:
+    `14` active rows, `17` no-chase rows, `12` shared rows, `2` active-only
+    rows, `5` no-chase-only rows, no-chase PnL diff `-$0.31`;
+  - full-scan `+2c` extra-row stress:
+    `5` extra no-chase rows, `3` independent market/side rows, extra-row PnL
+    `-$0.84`;
+  - comparable evidence labels: `19`;
+  - no-chase rows: `208`;
+  - entry70 rows: `173`;
+  - exact extra broad no-chase rows: `55`;
+  - all exact extra broad no-chase rows were `>70c`;
+  - total extra no-chase PnL: `-$2.24`;
+  - total extra `>70c` PnL: `-$2.24`;
+  - live-WS extra no-chase PnL: `-$3.32`;
+  - live-WS labels with negative extra-row PnL: `4 / 6`;
+  - 1s live-WS extra `>70c` rows: `11`, PnL `-$1.41`.
+- Updated `scripts\build_btc1h_research_priority_matrix.py` to ingest the new
+  no-chase summary. Current priority summary records:
+  - `no_chase_extra_row_status = NO_CHASE_EXTRA_ROWS_LIVE_WS_DAMAGING`;
+  - `no_chase_total_extra_rows = 55`;
+  - `no_chase_total_extra_pnl = -2.24`;
+  - `no_chase_live_ws_negative_extra_label_count = 4`;
+  - `no_chase_stride1_extra_gt70_pnl = -1.41`;
+  - `no_chase_fullscan_status = EXTRA_GT70_ROWS_NEGATIVE`;
+  - `no_chase_fullscan_extra_rows = 5`;
+  - `no_chase_fullscan_extra_pnl = -0.84`;
+  - `no_chase_fullscan_pnl_diff = -0.37`.
+- Interpretation:
+  broad no-chase remains basis-robust historically, but the extra rows admitted
+  by removing the 70c cap are damaging in live-WS cadence checks. Do not
+  restart or promote broad no-chase from current evidence; any revival needs
+  fresh causal replay and official forward rows.
+- Wired the audit into `scripts\refresh_btc_evidence_stack.py` before the BTC1H
+  research priority matrix.
+- Validation:
+  - local `py_compile` passed for the new audit/test, priority matrix/test, and
+    refresh controller;
+  - local targeted pytest passed: `10 passed`;
+  - bounded refresh smoke passed from `btc1h_no_chase_extra_row_audit` through
+    `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as the
+    expected no-deploy verdict.
+
+## 2026-05-22 - BTC1H candidate decision packet update
+
+- Goal: freeze the current candidate decisions inside the BTC1H next-forward
+  packet, so basis-stress runner-ups cannot be mistaken for restart or
+  deployment candidates.
+- Updated `scripts\build_btc1h_next_forward_candidate_packet.py` to ingest:
+  - `backtest_outputs\btc1h_research_priority_matrix_latest_codex\btc1h_research_priority_matrix.csv`;
+  - `backtest_outputs\btc1h_research_priority_matrix_latest_codex\btc1h_research_priority_summary.csv`.
+- New packet output:
+  `backtest_outputs\btc1h_next_forward_candidate_packet_latest_codex\btc1h_candidate_decision_packet.csv`.
+- Current decisions:
+  - `high_conf_80_entry70_no_chase`:
+    `keep_as_only_frozen_clean_clock_control`, eligible only for an explicitly
+    authorized controlled paper-shadow restart and still not deployable;
+  - `high_conf_80_entry59_70_no_chase`:
+    `defer_shadow_until_independent_causal_rows`, because the paused live-WS
+    snapshot was an exact row-set match with active entry70 and the broader
+    floor audit has only one diagnostic historical independent market-side row;
+  - `high_conf_80_no_chase`: `basis_watchlist_only_no_restart`, because the
+    extra-row audit shows `55` exact extra rows for `-$2.24` and full-scan
+    extra rows for `-$0.84`;
+  - `high_conf_80`: `deprioritize`.
+- `run_info.json` now records:
+  - `candidate_decision_count = 4`;
+  - `recommended_forward_policy_change = none`;
+  - `top_causal_replay_runner_up = high_conf_80_entry59_70_no_chase`;
+  - `top_basis_stress_variant = high_conf_80_no_chase`.
+- Validation:
+  - local `py_compile` passed for the packet builder/test;
+  - local targeted pytest passed for the packet, priority matrix, promotion
+    gap, and refresh-controller tests: `10 passed`;
+  - bounded refresh passed from `btc1h_research_priority_matrix` through
+    `btc1h_promotion_gap_matrix`, with readiness exit `1` accepted as the
+    expected no-deploy verdict;
+  - local packet regenerated from the current artifact stack.
+
+## 2026-05-22 - BTC1H clean-clock gate wired into refresh
+
+- Goal: prevent fresh BTC1H readiness/packet artifacts from depending on a
+  stale `btc1h_clean_evidence_clock_gate_latest_codex` output.
+- Full read-only refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex --skip-packet`.
+  It completed all `50` then-wired steps at `2026-05-22T12:43:32Z`, with
+  deployment readiness exit `1` accepted as the expected no-deploy verdict.
+- The refresh exposed a source-boundary problem:
+  - local `btc_forward_shadow_status_latest_codex` reports the local BTC1H
+    paper shadow as `NOT_RUNNING`;
+  - BTC1H strategy/readiness artifacts still correctly use the pulled remote
+    official-settlement artifact with `11` BTC1H rows;
+  - SSH to `ClawService@100.92.9.80` failed from this session with
+    `Permission denied`, so remote liveness could not be refreshed live.
+- Patched `scripts\refresh_btc_evidence_stack.py` to add
+  `btc1h_clean_evidence_clock_gate` after BTC1H multi-holdout research and
+  before the next-forward packet, deployment readiness, and promotion-gap
+  matrix.
+- The clean-clock step accepts return code `1` as an expected blocked-gate
+  result, like deployment readiness, instead of failing the whole read-only
+  refresh when the correct conclusion is no deploy.
+- Updated `scripts\test_btc_evidence_stack_refresh.py` so the refresh-order test
+  enforces the new dependency and allows only the clean-clock gate and
+  readiness to return `(0, 1)`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_clean_clock_current_latest_codex --start-at btc1h_multi_holdout_research --stop-after btc1h_promotion_gap_matrix --skip-packet`.
+  It completed all `16` selected steps, with planned total now `51`.
+- Current clean-clock summary:
+  - `gate_status = BLOCKED_CONTROLLED_RESTART_REQUIRED`;
+  - `clean_evidence_clock_ready = False`;
+  - `blocker_count = 9`;
+  - `status_source = status_json`;
+  - remote BTC1H status snapshot updated at
+    `2026-05-22T08:01:20.103367Z`, about `284.9` minutes old at audit time;
+  - `official_rows = 11`, `official_pnl = +$0.50`,
+    `official_proxy_mismatches = 1`;
+  - `blank_policy_official_rows = 11`;
+  - sidecar schema is missing the scan-time model-input and policy fields.
+- Validation:
+  - local `py_compile` passed for the refresh controller, clean-clock gate, and
+    tests;
+  - local targeted pytest passed:
+    `scripts\test_btc_evidence_stack_refresh.py`
+    `scripts\test_btc1h_clean_evidence_clock_gate.py` -> `11 passed`.
+- Interpretation:
+  active BTC1H remains near-deployable research only. The refreshed gate now
+  makes the stale remote-status boundary explicit; no new official rows count
+  toward promotion without an explicitly authorized clean-clock restart and
+  current source/status verification.
+
+## 2026-05-22 - BTC1H remote provenance in forward report
+
+- Goal: make the normal forward evidence report distinguish local BTC process
+  status from pulled remote BTC1H official-settlement evidence.
+- Updated `scripts\build_btc_forward_evidence_report.py` to accept and report:
+  - `--remote-official-dir`, default
+    `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex`;
+  - `--btc1h-remote-status-json`, default
+    `runtime\remote_status\btc1h_status_latest.json`;
+  - `--btc1h-clean-clock-summary`, default
+    `backtest_outputs\btc1h_clean_evidence_clock_gate_latest_codex\btc1h_clean_evidence_clock_summary.csv`.
+- New output:
+  `backtest_outputs\btc_forward_evidence_report_latest_codex\btc1h_remote_provenance.csv`.
+- Added report section `BTC1H Remote Provenance`, with fields for:
+  - local shadow running/source freshness;
+  - pulled remote status timestamp and age;
+  - remote official rows/PnL/proxy mismatch count;
+  - clean-clock gate status and blank-policy rows.
+- Added regression coverage:
+  `scripts\test_btc_forward_evidence_report.py`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_forward_provenance_latest_codex --start-at forward_evidence_report --stop-after gpt_pro_action_status --skip-packet`.
+  It completed all `5` selected downstream steps.
+- Current BTC1H provenance result:
+  - `provenance_verdict = REMOTE_STATUS_STALE_OR_UNAVAILABLE`;
+  - local BTC1H shadow status: `local_shadow_running = False`;
+  - remote BTC1H official rows: `11`;
+  - remote official PnL: `+$0.50`;
+  - remote proxy/official mismatches: `1`;
+  - remote status last pulled at `2026-05-22T08:01:20.103367Z`, about
+    `289.4` minutes old at the report run;
+  - clean-clock status remains `BLOCKED_CONTROLLED_RESTART_REQUIRED`.
+- Validation:
+  - local `py_compile` passed for the forward report and new test;
+  - local targeted pytest passed:
+    `scripts\test_btc_forward_evidence_report.py` -> `1 passed`.
+- Interpretation:
+  this does not add deployment evidence; it prevents a false read that local
+  `NOT_RUNNING` rows erased the remote official sample, or that the stale
+  remote official sample proves current remote liveness. BTC1H remains
+  near-deployable research only until a fresh remote status plus clean evidence
+  clock exists.
+
+## 2026-05-22 - BTC1H remote provenance in consistency audit
+
+- Goal: make the downstream consistency/control layer carry the same BTC1H
+  remote provenance instead of reducing BTC1H to a generic local
+  `not_running_or_status_missing` row.
+- Updated `scripts\build_btc_forward_consistency_audit.py` to read
+  `backtest_outputs\btc_forward_evidence_report_latest_codex\btc1h_remote_provenance.csv`.
+- New BTC1H consistency fields include:
+  - `btc1h_remote_provenance_verdict`;
+  - `btc1h_remote_status_age_minutes`;
+  - `btc1h_remote_official_rows`;
+  - `btc1h_remote_official_pnl`;
+  - `btc1h_remote_proxy_official_mismatches`;
+  - `btc1h_clean_clock_status`;
+  - `btc1h_clean_clock_ready`.
+- Current consistency result:
+  - `consistent_enough_for_promotion_count = 0 / 4`;
+  - BTC1H `agreement_status =
+    btc1h_remote_status_stale_or_unavailable`;
+  - BTC1H remote official rows remain visible as `11`, with official PnL
+    `+$0.50` and `1` remote proxy/official mismatch;
+  - BTC1H blockers now explicitly include
+    `btc1h_remote_status_stale_or_unavailable`,
+    `btc1h_clean_evidence_clock_not_ready`,
+    `btc1h_remote_proxy_official_mismatch`, and
+    `btc1h_too_few_remote_official_rows`, alongside the local
+    `not_running_or_status_missing` blocker.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_consistency_provenance_latest_codex --start-at forward_consistency_audit --stop-after gpt_pro_action_status --skip-packet`.
+  It completed both selected downstream steps.
+- Validation:
+  - local `py_compile` passed for the consistency audit, forward report,
+    refresh controller, and focused tests;
+  - local targeted pytest passed:
+    `scripts\test_btc_forward_consistency_audit.py`
+    `scripts\test_btc_forward_evidence_report.py`
+    `scripts\test_btc_evidence_stack_refresh.py` -> `11 passed`.
+- Interpretation:
+  BTC1H remains near-deployable research only. The control artifacts now show
+  the useful remote official sample and the reason it still cannot count as
+  fresh promotion evidence in the same row.
+
+## 2026-05-22 - BTC1H remote provenance in GPT action status
+
+- Goal: make the final GPT Pro/local-action control artifact preserve BTC1H
+  remote-provenance blockers, not just generic replay coverage or local
+  source-freshness blockers.
+- Updated `scripts\build_btc_gpt_pro_action_status.py` to consume the BTC1H row
+  from
+  `backtest_outputs\btc_forward_consistency_audit_latest_codex\forward_consistency_summary.csv`.
+- Added checklist row `btc1h_remote_provenance`.
+  Current result:
+  - `status = BLOCKS_BTC1H_PROMOTION`;
+  - `passes_for_deployment = False`;
+  - `verdict = REMOTE_STATUS_STALE_OR_UNAVAILABLE`;
+  - `remote_status_age_minutes = 289.4126`;
+  - `remote_official_rows = 11`;
+  - `remote_official_pnl = +$0.50`;
+  - `remote_proxy_official_mismatches = 1`;
+  - `clean_clock_status = BLOCKED_CONTROLLED_RESTART_REQUIRED`;
+  - `clean_clock_ready = False`.
+- The BTC1H row in
+  `backtest_outputs\btc_gpt_pro_action_status_latest_codex\gpt_pro_candidate_status.csv`
+  now carries:
+  - `current_status = BTC1H_REMOTE_STATUS_STALE_OR_UNAVAILABLE`;
+  - `forward_consistency_status =
+    btc1h_remote_status_stale_or_unavailable`;
+  - the same remote official row/PnL/mismatch and clean-clock fields.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_gpt_action_provenance_latest_codex --start-at gpt_pro_action_status --stop-after gpt_pro_action_status --skip-packet`.
+  It completed the selected step successfully.
+- Validation:
+  - local `py_compile` passed for the GPT action status, forward consistency,
+    forward report, refresh controller, and focused tests;
+  - local targeted pytest passed:
+    `scripts\test_btc_gpt_pro_action_status.py`
+    `scripts\test_btc_forward_consistency_audit.py`
+    `scripts\test_btc_forward_evidence_report.py`
+    `scripts\test_btc_evidence_stack_refresh.py` -> `22 passed`.
+- Interpretation:
+  BTC1H remains observe-only / near-deployable research. The final action
+  artifact now makes it hard to confuse `11` pulled remote official rows with
+  fresh, clean-clock, promotion-usable evidence.
+
+## 2026-05-22 - BTC1H near-deployable label tightened
+
+- Goal: prevent the fixed multi-holdout research artifact from labeling a BTC1H
+  candidate as `near_deployable_candidate = True` when positive forward PnL is
+  still accompanied by official/proxy mismatch, row-unfaithful replay, missing
+  exact live model inputs, or cached-TTL-only fills.
+- Updated `scripts\build_btc1h_multi_holdout_research.py`:
+  - added `promotion_readiness_status`;
+  - added `near_deployable_disqualifying_blockers`;
+  - changed `near_deployable_candidate` so only sample-size plus a final
+    counterfactual/live-execution validation blocker can still be called near
+    deployable.
+- Current active BTC1H result in
+  `backtest_outputs\btc1h_multi_holdout_research_latest_codex\btc1h_candidate_gate_summary.csv`:
+  - `research_promising = True`;
+  - `near_deployable_candidate = False`;
+  - `promotion_readiness_status =
+    promising_but_blocked_by_official_or_fidelity_gates`;
+  - forward official rows/PnL: `11` / `+$0.50`;
+  - forward official mismatch rate: `9.09%`;
+  - disqualifying blockers:
+    `official_proxy_mismatch_gate_failed`,
+    `counterfactual_replay_not_row_faithful`,
+    `selected_signal_exact_cached_ttl_missing_for_promotion`,
+    `forward_rows_include_cached_ttl_only_fills`.
+- Updated `scripts\build_btc1h_next_forward_candidate_packet.py` so
+  `btc1h_current_evidence_snapshot.csv` no longer hardcodes
+  `deployability_state = near_deployable_research_only`. It now carries the
+  multi-holdout `promotion_readiness_status`.
+- Current next-forward packet evidence now says:
+  - `near_deployable_candidate = False`;
+  - `deployability_state =
+    promising_but_blocked_by_official_or_fidelity_gates`;
+  - clean clock remains `BLOCKED_CONTROLLED_RESTART_REQUIRED`;
+  - restart authorization remains not ready in the current generated packet.
+- Bounded refreshes:
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_multi_holdout_gate_latest_codex --start-at btc1h_multi_holdout_research --stop-after gpt_pro_action_status --skip-packet`
+    completed all `21` selected downstream steps;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_candidate_packet_readiness_state_latest_codex --start-at btc1h_next_forward_candidate_packet --stop-after gpt_pro_action_status --skip-packet`
+    completed all `8` selected downstream steps.
+- Validation:
+  - local `py_compile` passed for the multi-holdout, next-forward packet,
+    research priority matrix, promotion-gap matrix, refresh controller, and
+    their focused tests;
+  - local targeted pytest passed:
+    `scripts\test_btc1h_multi_holdout_research.py`
+    `scripts\test_btc1h_next_forward_candidate_packet.py`
+    `scripts\test_btc1h_research_priority_matrix.py`
+    `scripts\test_btc1h_promotion_gap_matrix.py`
+    `scripts\test_btc_evidence_stack_refresh.py` -> `13 passed`.
+- Interpretation:
+  the active BTC1H `high_conf_80_entry70_no_chase` path is still the best
+  forward research control, but it is no longer described as near-deployable.
+  It is promising but blocked by official-settlement disagreement and
+  replay/model-input fidelity gaps, before even reaching the clean-clock sample
+  size gate.
+
+## 2026-05-22 - BTC1H replay mismatch diagnosis made row-level
+
+- Tightened `scripts\build_btc1h_replay_vs_ledger_reconciliation.py` so
+  `promotion_usable_replay` now requires row-for-row market/side, entry-price,
+  and PnL parity. Exact market/side agreement alone is no longer enough if the
+  replay drifts by even one cent on entry or PnL.
+- Added
+  `backtest_outputs\btc1h_replay_vs_ledger_reconciliation_latest_codex\btc1h_replay_vs_ledger_mismatch_diagnosis.csv`.
+  It joins reconciliation failures to the captured
+  `btc1h_selected_signal_decision_chain.csv` and
+  `btc1h_fill_decision_official_chain.csv` artifacts.
+- Current candidate-scan replay remains not promotion usable:
+  - actual official rows: `11`;
+  - replay rows: `10`;
+  - exact market/side matches: `9 / 11`;
+  - entry-price drift rows: `2`;
+  - PnL drift rows: `2`;
+  - actual official PnL: `+$0.50`;
+  - replay PnL: `+$1.11`;
+  - replay-minus-actual PnL: `+$0.61`;
+  - blockers:
+    `missing_actual_rows;replay_row_count_differs;extra_replay_rows;event_level_market_replacements;entry_price_not_row_for_row_equal;pnl_not_row_for_row_equal`.
+- The five row-level diagnosis rows are:
+  - `KXBTCD-26MAY1911-T76299.99|no`:
+    `captured_live_fill_missing_after_skip_then_fill`. The captured chain had
+    two selected scans for this market: one `skip` from
+    `failed_ws_reprice_filter`, then one `paper_fill`. Replay missed the later
+    actual fill, which was the `-$0.71` official row.
+  - `KXBTCD-26MAY2010-T77199.99|no`:
+    `captured_live_fill_replaced_by_replay_market`. Actual paper filled the
+    `T77199.99` NO market at `0.57`, but replay chose the same event's
+    `T77299.99` NO market instead.
+  - `KXBTCD-26MAY2010-T77299.99|no`:
+    `replay_extra_market_replacing_captured_live_fill`.
+  - `KXBTCD-26MAY2107-T77299.99|no`:
+    `matched_market_with_entry_or_pnl_drift`. Market/side matched, but replay
+    entry was `0.70` versus ledger `0.69`.
+  - `KXBTCD-26MAY2110-T76699.99|yes`:
+    `matched_market_with_entry_or_pnl_drift`. Market/side matched, but replay
+    entry was `0.65` versus ledger `0.66`.
+- Refreshed downstream artifacts from `btc1h_multi_holdout_research` through
+  `gpt_pro_action_status`; all `21` selected read-only steps completed. The
+  clean-clock blocker now carries the stricter entry/PnL parity blocker string.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_vs_ledger_reconciliation.py scripts\build_btc1h_multi_holdout_research.py scripts\build_btc1h_clean_evidence_clock_gate.py scripts\build_btc1h_promotion_gap_matrix.py`;
+  - `python -m pytest scripts\test_btc1h_replay_vs_ledger_reconciliation.py scripts\test_btc1h_multi_holdout_research.py scripts\test_btc1h_clean_evidence_clock_gate.py scripts\test_btc1h_promotion_gap_matrix.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-replay-diagnosis-final`
+    -> `18 passed`.
+- Interpretation:
+  the active BTC1H candidate is still a useful research control, but the
+  remaining replay blocker is now sharper: the offline replay is not merely
+  short by count, it fails specific live-chain behaviors around skip-then-fill,
+  event-market replacement, and one-cent entry/PnL drift. No process changes or
+  deployment actions followed from this diagnostic.
+
+## 2026-05-22 - BTC1H cached-TTL replay diagnostic was negative
+
+- Added diagnostic-only `--model-ttl-override-min` support to
+  `scripts\replay_btc1h_core_ws_counterfactual.py`. It lets replay use a fixed
+  model probability horizon while still enforcing the real event TTL entry
+  window. This is intentionally not the default and is not forward
+  scan-time-TTL evidence.
+- Ran a bounded candidate-scan replay with `--model-ttl-override-min 15` on the
+  May 21 paused BTC1H snapshot:
+  `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_candidate_scans_ttl15_latest_codex`.
+- Reconciliation artifact:
+  `backtest_outputs\btc1h_replay_vs_ledger_reconciliation_ttl15_latest_codex`.
+  Result:
+  - actual official rows: `11`;
+  - replay rows: `7`;
+  - exact market/side matches: `7 / 11`;
+  - entry-price drift rows: `3`;
+  - PnL drift rows: `3`;
+  - actual official PnL: `+$0.50`;
+  - replay PnL: `+$1.21`;
+  - replay-minus-actual PnL: `+$0.71`;
+  - `promotion_usable_replay = false`;
+  - blockers:
+    `missing_actual_rows;replay_row_count_differs;entry_price_not_row_for_row_equal;pnl_not_row_for_row_equal`.
+- Interpretation:
+  a simple fixed `15` minute cached-horizon replay does not explain the old
+  live rows. It removes the same-event replacement problem but misses more
+  actual fills and increases entry/PnL drift. The remaining faithful-replay
+  problem therefore likely requires exact captured model-input state and
+  reprice/fill sequencing, not a single global TTL override.
+- Validation:
+  - `python -m py_compile scripts\replay_btc1h_core_ws_counterfactual.py scripts\test_btc1h_replay_signal_scan_pruning.py`;
+  - `python -m pytest scripts\test_btc1h_replay_signal_scan_pruning.py scripts\test_btc1h_replay_vs_ledger_reconciliation.py -q --basetemp .pytest-codex-tmp-btc1h-ttl-replay-final`
+    -> `8 passed`.
+
+## 2026-05-22 - BTC1H replay root-cause audit added to refresh stack
+
+- Added `scripts\build_btc1h_replay_root_cause_audit.py` and artifact
+  `backtest_outputs\btc1h_replay_root_cause_audit_latest_codex`.
+  It joins replay-vs-ledger mismatch rows with:
+  - selected-signal model parity;
+  - selected-signal to order-decision chain timing;
+  - replay-mode reconciliation summaries.
+- Current root-cause summary:
+  - root-cause rows: `5`;
+  - unique root causes: `4`;
+  - dominant cause:
+    `same_event_market_selection_not_row_faithful`;
+  - counts:
+    `same_event_market_selection_not_row_faithful=2`,
+    `reprice_skip_then_fill_sequence_missing=1`,
+    `order_decision_reprice_fill_price_missing=1`,
+    `blocked_dedupe_or_post_selected_scan_used_as_replay_clock=1`;
+  - requires order-decision reprice/fill modeling: `true`;
+  - requires blocked-dedupe filtering: `true`;
+  - promotion usable from this audit: `false`.
+- Replay mode comparison now shows no attempted replay mode is promotion usable:
+  - candidate-scan: `9 / 11` exact market/side matches, replay PnL `+$1.11`
+    vs actual `+$0.50`, blockers include event replacement and entry/PnL
+    drift;
+  - candidate-selected-market: same `9 / 11` and same blockers;
+  - selected-scan / selected-market: only `6 / 11` exact matches;
+  - fixed `15` minute cached-TTL candidate scan: `7 / 11` exact matches;
+  - fullscan prefilter: `14` replay rows but still only `9 / 11` exact
+    matches, with extra rows and event replacement.
+- Patched `scripts\refresh_btc_evidence_stack.py` so the root-cause audit runs
+  after `btc1h_clean_evidence_clock_gate` and before downstream BTC1H summary,
+  readiness, and action-status artifacts.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_root_cause_latest_codex --start-at btc1h_replay_root_cause_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `20` selected read-only steps. Readiness returned `1` as the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_root_cause_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc1h_replay_root_cause_audit.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_replay_root_cause_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-root-cause-final`
+    -> `10 passed`.
+- Current candidate verdict remains unchanged:
+  `high_conf_80_entry70_no_chase` is `research_promising = true` but
+  `near_deployable_candidate = false`, `deployable_now = false`, and
+  `promotion_readiness_status =
+  promising_but_blocked_by_official_or_fidelity_gates`.
+
+## 2026-05-22 - BTC1H root causes surfaced in decision artifacts
+
+- Patched `scripts\build_btc1h_promotion_gap_matrix.py` so the
+  `row_for_row_replay` gate now consumes
+  `backtest_outputs\btc1h_replay_root_cause_audit_latest_codex` in addition to
+  the generic replay reconciliation blockers.
+- Patched `scripts\build_btc1h_next_forward_candidate_packet.py` so
+  `btc1h_current_evidence_snapshot.csv`, `btc1h_promotion_gate_specs.csv`, and
+  `run_info.json` carry:
+  - replay root-cause counts;
+  - dominant root cause;
+  - whether replay requires order-decision reprice/fill modeling;
+  - whether replay requires blocked-dedupe filtering;
+  - promotion-usable replay modes versus modes compared.
+- Current promotion gap summary now records:
+  - `near_deployable_research_candidate = false`;
+  - replay root causes:
+    `same_event_market_selection_not_row_faithful=2;reprice_skip_then_fill_sequence_missing=1;order_decision_reprice_fill_price_missing=1;blocked_dedupe_or_post_selected_scan_used_as_replay_clock=1`;
+  - dominant replay root cause:
+    `same_event_market_selection_not_row_faithful`;
+  - promotion-usable replay modes: `0 / 6`.
+- Current next-forward evidence snapshot now carries:
+  - `replay_requires_order_decision_reprice_model = True`;
+  - `replay_requires_blocked_dedupe_filter = True`;
+  - `replay_requires_exact_model_inputs = False` for the current diagnosed
+    mismatch rows, while clean future rows still require exact model-input
+    capture through the separate clean-clock gate;
+  - `replay_promotion_usable_modes = 0`;
+  - `replay_modes_compared = 6`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_root_cause_surfaces_latest_codex --start-at btc1h_next_forward_candidate_packet --stop-after gpt_pro_action_status --skip-packet`
+  completed all `8` selected read-only steps. Readiness returned `1`, the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_promotion_gap_matrix.py scripts\build_btc1h_next_forward_candidate_packet.py scripts\test_btc1h_promotion_gap_matrix.py scripts\test_btc1h_next_forward_candidate_packet.py`;
+  - `python -m pytest scripts\test_btc1h_promotion_gap_matrix.py scripts\test_btc1h_next_forward_candidate_packet.py -q --basetemp .pytest-codex-tmp-btc1h-root-cause-surfaces`
+    -> `2 passed`.
+- Interpretation:
+  the decision surface is now harder to misread. The BTC1H active candidate
+  remains the frozen research control, but the action artifacts explicitly say
+  no replay mode is promotion usable and list the exact replay semantics that
+  must be fixed before any replay evidence can count.
+
+## 2026-05-22 - BTC1H replay repair feasibility split added
+
+- Added `scripts\build_btc1h_replay_repair_feasibility.py` and artifact
+  `backtest_outputs\btc1h_replay_repair_feasibility_latest_codex`.
+- The checklist separates replay repairs testable on the existing paused
+  snapshot from promotion gates that require future clean-clock official rows.
+- Current summary:
+  - `deployable_now = false`;
+  - `near_deployable_after_current_replay_repairs = false`;
+  - `replay_repair_can_make_deployable_now = false`;
+  - replay promotion-usable modes: `0 / 6`;
+  - current official rows: `11` versus the `50` row promotion floor;
+  - official/proxy mismatch rate: `9.09%` versus the `2%` max;
+  - clean clock remains `BLOCKED_CONTROLLED_RESTART_REQUIRED`.
+- Existing paused-snapshot replay repairs:
+  - `order_decision_reprice_fill_model`: required and testable now; current
+    blockers include two root-cause rows across skip-then-fill sequencing and
+    order-decision entry-price/PnL drift.
+  - `blocked_dedupe_filter`: required and testable now; one root-cause row
+    shows replay trading from a blocked/dedupe or post-selected scan clock.
+  - `same_event_selected_market_dedupe`: required and partially testable now;
+    two root-cause rows replace the captured live market with another market in
+    the same event.
+  - `row_for_row_reconciliation_after_repairs`: required and testable now, but
+    currently all six compared replay modes fail promotion usability.
+- Future clean-clock requirements:
+  - `exact_model_input_capture`: old selected rows have
+    `captured_ttl_available_rows = 0` and selected-signal model parity fails;
+  - `official_proxy_basis_gate`: the current stale official sample has one
+    proxy-win/official-loss flip and too high a mismatch rate;
+  - `sample_size_gate`: current rows are old/not-clean-clock and short by `39`
+    rows against the `50` row floor;
+  - `clean_policy_identity`: old rows have blank policy identity and missing
+    sidecar fields, so they cannot count toward the next evidence clock.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_replay_repair_feasibility` runs immediately after
+  `btc1h_replay_root_cause_audit` and before downstream BTC1H summaries.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_replay_repair_feasibility_latest_codex --start-at btc1h_replay_root_cause_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `21` selected read-only steps. Readiness returned `1`, the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_repair_feasibility.py scripts\test_btc1h_replay_repair_feasibility.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_replay_repair_feasibility.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-replay-repair-feasibility`
+    -> `8 passed`;
+  - after wording cleanup:
+    `python -m pytest scripts\test_btc1h_replay_repair_feasibility.py -q --basetemp .pytest-codex-tmp-btc1h-repair-feasibility-single`
+    -> `1 passed`.
+- Interpretation:
+  the next best replay engineering target is order-decision/reprice modeling
+  plus blocked-dedupe/same-event replay semantics on the paused snapshot. Even
+  if that succeeds, the candidate remains blocked until future clean-clock rows
+  satisfy exact model-input capture, official/proxy basis, sample size, and
+  policy-identity gates.
+
+## 2026-05-22 - BTC1H captured order-decision replay baseline
+
+- Added `scripts\build_btc1h_order_decision_replay_baseline.py` and artifact
+  `backtest_outputs\btc1h_order_decision_replay_baseline_latest_codex`.
+  The builder materializes captured `order_decision` paper fills from the
+  paused BTC1H snapshot into replay-shaped trade rows.
+- This is deliberately diagnostic only:
+  - it is an exact captured decision-log baseline;
+  - it is not an independent counterfactual replay;
+  - it cannot make replay evidence promotion usable by itself.
+- Patched `scripts\build_btc1h_replay_vs_ledger_reconciliation.py` with
+  `--replay-evidence-kind`. Default independent counterfactual behavior is
+  unchanged, but diagnostic baselines now report row fidelity separately from
+  promotion usability.
+- Captured order-decision baseline result:
+  - baseline rows: `11`;
+  - settled rows: `11`;
+  - official PnL: `+$0.50`;
+  - official premium: `$7.50`;
+  - official ROP: `6.6667%`;
+  - official win rate: `72.7273%`;
+  - max drawdown: `-$1.76`;
+  - `promotion_usable_as_counterfactual = false`.
+- Baseline reconciliation artifact:
+  `backtest_outputs\btc1h_order_decision_replay_baseline_reconciliation_latest_codex`.
+  It proves the captured decision/settlement/reconciliation path can be exact:
+  - `replay_evidence_kind = captured_order_decision_log`;
+  - actual rows: `11`;
+  - replay rows: `11`;
+  - exact market/side matches: `11 / 11`;
+  - entry-price drift rows: `0`;
+  - PnL drift rows: `0`;
+  - row-fidelity exact: `true`;
+  - `promotion_usable_replay = false`;
+  - blocker:
+    `diagnostic_replay_not_independent_counterfactual`.
+- Updated `scripts\build_btc1h_replay_repair_feasibility.py` so its summary
+  carries the captured order-decision baseline fields:
+  `order_decision_baseline_rows = 11`,
+  `order_decision_baseline_row_fidelity_exact = True`,
+  `order_decision_baseline_promotion_usable_replay = False`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so the order-decision
+  baseline and baseline reconciliation run after
+  `btc1h_replay_root_cause_audit` and before
+  `btc1h_replay_repair_feasibility`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_order_decision_baseline_latest_codex --start-at btc1h_replay_root_cause_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `23` selected read-only steps. Readiness returned `1`, the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_order_decision_replay_baseline.py scripts\test_btc1h_order_decision_replay_baseline.py scripts\build_btc1h_replay_vs_ledger_reconciliation.py scripts\test_btc1h_replay_vs_ledger_reconciliation.py scripts\build_btc1h_replay_repair_feasibility.py scripts\test_btc1h_replay_repair_feasibility.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_order_decision_replay_baseline.py scripts\test_btc1h_replay_vs_ledger_reconciliation.py scripts\test_btc1h_replay_repair_feasibility.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-order-decision-baseline-final`
+    -> `13 passed`.
+- Interpretation:
+  the data and official-settlement path are not the reason independent replay is
+  failing. When anchored to captured order decisions, row fidelity is exact.
+  The remaining BTC1H blocker is specifically the independent replay engine's
+  scan/model/market-selection semantics, plus future clean-clock official
+  evidence gates.
+
+## 2026-05-22 - BTC1H independent replay repair target matrix
+
+- Added `scripts\build_btc1h_replay_repair_target_matrix.py` and artifact
+  `backtest_outputs\btc1h_replay_repair_target_matrix_latest_codex`.
+- The matrix compares:
+  - current independent counterfactual replay reconciliation;
+  - captured order-decision baseline reconciliation;
+  - replay root-cause rows;
+  - replay repair feasibility summary.
+- Current summary:
+  - current independent row fidelity exact: `false`;
+  - current independent promotion usable: `false`;
+  - captured order-decision baseline row fidelity exact: `true`;
+  - captured order-decision baseline promotion usable: `false`;
+  - `independent_replay_gap_is_not_data_pipeline = true`;
+  - current independent replay exact market/side matches: `9 / 11`;
+  - current independent replay rows: `10` vs actual `11`;
+  - current independent replay-minus-actual PnL: `+$0.61`;
+  - deployable now: `false`.
+- The next independent replay repair targets are now machine-readable:
+  - `skip_then_fill_sequence`: `1` root-cause row in `KXBTCD-26MAY1911`;
+    addresses a missing actual fill after captured skip-then-fill sequencing.
+  - `same_event_market_selection`: `2` root-cause rows in
+    `KXBTCD-26MAY2010`; addresses one ledger-only actual fill, one replay-only
+    extra row, and event-level market replacement.
+  - `order_decision_reprice_fill_price`: `1` root-cause row in
+    `KXBTCD-26MAY2107`; addresses one-cent entry/PnL drift.
+  - `blocked_dedupe_scan_clock`: `1` root-cause row in
+    `KXBTCD-26MAY2110`; addresses a one-cent drift caused by trading from the
+    wrong scan clock.
+- Future-row blockers remain unchanged and are carried through the summary:
+  `exact_model_input_capture;official_proxy_basis_gate;sample_size_gate;clean_policy_identity`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_replay_repair_target_matrix` runs after repair feasibility and before
+  downstream BTC1H decision/status artifacts.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_replay_repair_target_matrix_latest_codex --start-at btc1h_replay_root_cause_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `24` selected read-only steps. Readiness returned `1`, the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_repair_target_matrix.py scripts\test_btc1h_replay_repair_target_matrix.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_replay_repair_target_matrix.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-repair-target-refresh`
+    -> `8 passed`.
+- Interpretation:
+  this does not make BTC1H deployable, but it makes the next independent replay
+  repair measurable. The captured decision baseline proves the raw
+  decision/settlement path can be exact; independent replay must now eliminate
+  the four named row-fidelity target classes without using captured decisions
+  as the trade source.
+
+## 2026-05-22 - BTC1H replay repair prerequisite audit
+
+- Added `scripts\build_btc1h_replay_repair_prerequisite_audit.py` and artifact
+  `backtest_outputs\btc1h_replay_repair_prerequisite_audit_latest_codex`.
+  This audit tightens the repair target matrix by asking which targets are
+  actually independently repairable from the current paused snapshot versus
+  blocked by missing exact model-input or TTL capture.
+- Current summary:
+  - repair target count: `4`;
+  - existing-snapshot repairable targets: `2`;
+  - partial targets: `1`;
+  - false targets: `1`;
+  - repairable from current snapshot:
+    `order_decision_reprice_fill_price;blocked_dedupe_scan_clock`;
+  - partial from current snapshot: `same_event_market_selection`;
+  - not independently repairable from current snapshot:
+    `skip_then_fill_sequence`;
+  - future exact-input blocked targets:
+    `same_event_market_selection;skip_then_fill_sequence`;
+  - `all_targets_repairable_from_existing_snapshot = false`;
+  - `near_deployable_after_current_replay_repairs = false`;
+  - deployable now: `false`.
+- Row-level split:
+  - `order_decision_reprice_fill_price` can be tested from the current
+    snapshot on `KXBTCD-26MAY2107`: market/side already match, selected-chain
+    fill exists, and the captured decision fill price explains the one-cent
+    entry/PnL drift.
+  - `blocked_dedupe_scan_clock` can be tested from the current snapshot on
+    `KXBTCD-26MAY2110`: selected-chain fill exists and replay is `0.727796`
+    seconds away from the selected timing.
+  - `same_event_market_selection` is only partial on `KXBTCD-26MAY2010`:
+    selected-chain fill exists for the actual market, but the replay-only
+    replacement market has no captured selected-chain row and model/edge parity
+    still drifts by `0.00343705697461` probability / `0.343705697461` cents.
+  - `skip_then_fill_sequence` is false as an independent repair from this
+    snapshot on `KXBTCD-26MAY1911`: the chain has skip/fill rows, but scan-TTL
+    parity has `0` recomputed signal rows and `2` no-signal rows for the target
+    fill market.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_replay_repair_prerequisite_audit` runs after
+  `btc1h_replay_repair_target_matrix` and before downstream BTC1H
+  official-basis, promotion-gap, and GPT-status artifacts.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_repair_prereq_latest_codex --start-at btc1h_replay_root_cause_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `25` selected read-only steps. Readiness returned `1`, the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_repair_prerequisite_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc1h_replay_repair_prerequisite_audit.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_replay_repair_prerequisite_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-repair-prereq`
+    -> `8 passed`.
+- Interpretation:
+  the previous repair target matrix should not be read as "all four targets are
+  pure replay-code fixes." The current snapshot is enough to test the two
+  matched-drift repairs, but same-event market choice and skip-then-fill
+  sequencing still require exact model-input/TTL capture or future clean-clock
+  evidence. BTC1H remains observe-only and not near-deployable.
+
+## 2026-05-22 - BTC1H replay repair attempt audit
+
+- Refreshed the strict selected-scan / selected-market replay into
+  `backtest_outputs\btc1h_core_ws_counterfactual_snapshot_selected_scans_latest_codex`
+  using the paused May 21 BTC1H snapshot, captured `signal_scan` clock,
+  `--selected-scan-only`, `--selected-market-only`, and `--no-public-fallback`.
+  Result: `6` replay rows, PnL `-$0.14`, win rate `66.6667%`, with all rows
+  settled from captured lifecycle data.
+- Refreshed reconciliation artifact
+  `backtest_outputs\btc1h_replay_vs_ledger_reconciliation_selected_scans_latest_codex`.
+  Strict selected-scan replay is not a repair:
+  - actual official rows: `11`;
+  - replay rows: `6`;
+  - exact market/side matches: `6`;
+  - ledger-only rows: `5`;
+  - replay-only rows: `0`;
+  - event replacement rows: `0`;
+  - entry/PnL drift rows: `1 / 1`;
+  - replay-minus-actual PnL: `-$0.64`;
+  - blockers:
+    `missing_actual_rows;replay_row_count_differs;entry_price_not_row_for_row_equal;pnl_not_row_for_row_equal`.
+- Added `scripts\build_btc1h_replay_repair_attempt_audit.py` and artifact
+  `backtest_outputs\btc1h_replay_repair_attempt_audit_latest_codex`.
+  The audit compares:
+  - a diagnostic matched-drift patch simulation for the two targets that the
+    prerequisite audit marked `True`;
+  - the real strict selected-scan / selected-market replay attempt.
+- Current attempt summary:
+  - repairable targets from prerequisite audit:
+    `order_decision_reprice_fill_price;blocked_dedupe_scan_clock`;
+  - matched-drift diagnostic patch rows: `2`;
+  - matched-drift patch removes entry drift: `true`;
+  - strict selected-scan attempt verdict: `REGRESSES_ROW_FIDELITY`;
+  - best current-snapshot attempt:
+    `matched_drift_decision_fill_price_patch_simulation`;
+  - remaining blockers after best attempt:
+    `missing_actual_rows;replay_row_count_differs;extra_replay_rows;event_level_market_replacements;pnl_not_row_for_row_equal`;
+  - current snapshot repairs make replay promotion usable: `false`;
+  - near-deployable after current replay repairs: `false`;
+  - deployable now: `false`.
+- Attempt rows:
+  - `matched_drift_decision_fill_price_patch_simulation` removes the two
+    entry/PnL drift rows on `KXBTCD-26MAY2107` and `KXBTCD-26MAY2110`, but
+    replay still has `10` rows vs `11` actual, only `9` market/side matches,
+    `2` ledger-only rows, `1` replay-only row, `2` event-replacement rows, and
+    replay-minus-actual PnL `+$0.61`.
+  - `strict_selected_scan_selected_market_replay` is worse for row fidelity:
+    `6` replay rows vs `11` actual, `5` ledger-only rows, and replay-minus-
+    actual PnL `-$0.64`. It removes event replacements by dropping too many
+    actual fills, not by faithfully repairing blocked/dedupe semantics.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_replay_repair_attempt_audit` runs after the prerequisite audit and
+  before downstream BTC1H official-basis, promotion-gap, and GPT-status
+  artifacts.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_repair_attempt_latest_codex --start-at btc1h_replay_root_cause_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `26` selected read-only steps. Readiness returned `1`, the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_repair_attempt_audit.py scripts\test_btc1h_replay_repair_attempt_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_replay_repair_attempt_audit.py scripts\test_btc1h_replay_repair_prerequisite_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-repair-attempt-final`
+    -> `9 passed`.
+- Interpretation:
+  the next replay-engineering step is not simply "turn on selected-scan-only."
+  Current snapshot repairs can remove the two matched drift rows, but faithful
+  independent replay still needs exact model-input/TTL capture plus row-for-row
+  market selection, skip/fill sequence, entry price, and PnL parity. BTC1H
+  remains observe-only and not near-deployable.
+
+## 2026-05-22 - BTC1H replay repair attempts surfaced in top-level gates
+
+- Patched `scripts\build_btc1h_promotion_gap_matrix.py` so the promotion
+  matrix has an explicit `replay_repair_attempts` gate instead of leaving the
+  repair-attempt verdict buried in the lower-level audit. Current status:
+  `BLOCKED`.
+- Current top-level replay-repair gate evidence:
+  - attempts: `2`;
+  - best current-snapshot attempt:
+    `matched_drift_decision_fill_price_patch_simulation`;
+  - matched-drift patch rows: `2`;
+  - strict selected-scan verdict: `REGRESSES_ROW_FIDELITY`;
+  - current snapshot repairs promotion usable: `false`;
+  - blockers:
+    `current_snapshot_repairs_not_promotion_usable;selected_scan_attempt_regresses_row_fidelity`;
+  - remaining blockers after best attempt:
+    `missing_actual_rows;replay_row_count_differs;extra_replay_rows;event_level_market_replacements;pnl_not_row_for_row_equal`.
+- Patched `scripts\build_btc1h_research_priority_matrix.py` to read
+  `backtest_outputs\btc1h_replay_repair_attempt_audit_latest_codex\btc1h_replay_repair_attempt_summary.csv`
+  directly. The priority summary now carries:
+  - `promotion_gap_blocked_gate_count = 9`;
+  - `replay_repair_active_blockers =
+    current_snapshot_repairs_not_promotion_usable;selected_scan_attempt_regresses_row_fidelity`;
+  - `replay_repair_strict_selected_scan_attempt_verdict =
+    REGRESSES_ROW_FIDELITY`;
+  - `replay_repair_current_snapshot_repairs_promotion_usable = false`.
+- Patched `scripts\build_btc1h_next_forward_candidate_packet.py` so the next
+  forward packet's current-evidence snapshot and promotion spec also surface
+  the repair-attempt audit. It now states that replay repair attempts must be
+  promotion usable and that the current attempts are not.
+- Regenerated:
+  - `backtest_outputs\btc1h_promotion_gap_matrix_latest_codex`;
+  - `backtest_outputs\btc1h_research_priority_matrix_latest_codex`;
+  - `backtest_outputs\btc1h_next_forward_candidate_packet_latest_codex`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_repair_attempt_topline_latest_codex --start-at btc1h_replay_root_cause_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `26` selected read-only steps. Readiness returned `1`, the
+  expected no-deploy result.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_promotion_gap_matrix.py scripts\test_btc1h_promotion_gap_matrix.py scripts\build_btc1h_research_priority_matrix.py scripts\test_btc1h_research_priority_matrix.py scripts\build_btc1h_next_forward_candidate_packet.py scripts\test_btc1h_next_forward_candidate_packet.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_promotion_gap_matrix.py scripts\test_btc1h_research_priority_matrix.py scripts\test_btc1h_next_forward_candidate_packet.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-repair-attempt-topline`
+    -> `10 passed`.
+- Interpretation:
+  BTC1H remains observe-only, not deployable, and not near-deployable. The
+  current snapshot is useful for replay unit tests, but the top-level
+  promotion path now explicitly requires independent replay repairs that are
+  row-for-row promotion usable before old rows can count.
+
+## 2026-05-22 - BTC1H objective completion audit
+
+- Added `scripts\build_btc1h_objective_completion_audit.py` and artifact
+  `backtest_outputs\btc1h_objective_completion_audit_latest_codex`.
+  This is a requirement-level audit for the active objective: BTC1H strategy
+  research via faithful backtesting on available data, multiple holdout sets,
+  and deployable/near-deployable identification without relaxing official,
+  execution, or live-replay gates.
+- The audit emits:
+  - `btc1h_candidate_objective_status.csv`;
+  - `btc1h_objective_requirements.csv`;
+  - `btc1h_objective_summary.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- Current objective summary:
+  - `objective_complete = false`;
+  - current verdict:
+    `objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - deployable candidates: `0`;
+  - near-deployable candidates: `0`;
+  - promising research candidates: `3`;
+  - promotion gap blocked gate count: `9`;
+  - replay promotion-usable modes: `0 / 6`;
+  - replay repair current-snapshot promotion usable: `false`.
+- Candidate statuses:
+  - `high_conf_80_entry70_no_chase`:
+    `promising_research_control_blocked`, with `14 / 14` historical holdouts,
+    `6 / 6` WS cadences, `11` forward official rows, official PnL `+$0.50`,
+    and replay promotion usable `false`;
+  - `high_conf_80_entry59_70_no_chase`:
+    `promising_research_runner_up_not_independent`, with `12 / 13`
+    historical holdouts, `6 / 6` WS cadences, and no forward official rows;
+  - `high_conf_80_no_chase`: `basis_watchlist_not_forward_validated`, with
+    `13 / 14` historical holdouts, `5 / 6` WS cadences, and no forward
+    official rows;
+  - `high_conf_80`: `historical_promising_blocked`, with `8 / 9` historical
+    holdouts, `6 / 6` WS cadences, and no forward official rows.
+- Requirement statuses:
+  - `candidate_universe_and_holdouts = PASS_RESEARCH_EVIDENCE`;
+  - `candidate_ranking_and_identification = PASS_IDENTIFIED`;
+  - `deployment_or_near_deployment_verdict =
+    PASS_NO_DEPLOYABLE_OR_NEAR_DEPLOYABLE_FOUND`;
+  - `official_settlement_gate = BLOCKED`;
+  - `execution_realism_gate = BLOCKED`;
+  - `faithful_live_replay_gate = BLOCKED`;
+  - `clean_evidence_clock_gate = BLOCKED`;
+  - `statistical_independence_and_basis_caveats = DIAGNOSTIC_ONLY`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_objective_completion_audit` runs after
+  `btc1h_promotion_gap_matrix` and before `forward_evidence_report` /
+  `gpt_pro_action_status`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_objective_audit_latest_codex --start-at btc1h_promotion_gap_matrix --stop-after gpt_pro_action_status --skip-packet`
+  completed all `7` selected read-only steps. The refresh controller now has
+  `59` total planned steps, and the new objective audit is step `54`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-objective-audit-rerun`
+    -> `8 passed`.
+- Interpretation:
+  the objective is not complete because faithful deployment-grade BTC1H
+  backtesting is still blocked by official settlement, execution-realism,
+  live-replay, and clean-clock requirements. The current honest result is
+  stronger than "maybe promising": the candidate universe is ranked, but there
+  are zero deployable or near-deployable BTC1H candidates under the preserved
+  gates.
+
+## 2026-05-22 - BTC1H paused-snapshot execution realism diagnostic
+
+- Added `scripts\build_btc1h_snapshot_execution_realism_audit.py` and artifact
+  `backtest_outputs\btc1h_snapshot_execution_realism_latest_codex`.
+  This reads the paused remote BTC1H SQLite shadow ledger at
+  `runtime\remote_snapshots\snapshot_20260521_145951\btc_1hr_high_conf80_entry70_no_chase_shadow.db`
+  and joins the already pulled REST-official settlement rows from
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex\shadow_official_trades.csv`.
+- Current diagnostic summary:
+  - rows: `11`;
+  - official rows: `11`;
+  - official PnL: `+$0.50`;
+  - official/proxy mismatches: `1`;
+  - blank policy rows: `11`;
+  - required execution field complete rate: `1.0`;
+  - entry matches side ask rate: `1.0`;
+  - actual entry matches entry rate: `1.0`;
+  - fee present/nonnegative rate: `1.0`;
+  - top visible quantity >= contracts rate: `1.0`;
+  - quote age <= `250ms` rate: `0.9090909090909091`;
+  - stale quote rows: `1`;
+  - promotion usable: `false`.
+- The stale quote row is:
+  - event `KXBTCD-26MAY2106`;
+  - market `KXBTCD-26MAY2106-T77699.99`;
+  - side `no`;
+  - entry `0.68`;
+  - top visible quantity `75`;
+  - quote age `260.9622ms`.
+- Current blockers:
+  `quote_age_above_limit;official_proxy_mismatch_present;pre_clean_clock_blank_policy_rows;old_snapshot_not_clean_clock_promotion_evidence`.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the
+  execution-realism requirement now includes this paused-snapshot diagnostic.
+  The requirement remains `BLOCKED`; this only narrows the reason from "maybe
+  missing fields" to "old rows have fields, but one stale quote plus blank
+  policy/proxy mismatch/old-clock status prevent promotion."
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_snapshot_execution_realism_audit` runs after
+  `btc1h_promotion_gap_matrix` and before
+  `btc1h_objective_completion_audit`. The refresh controller now has `60`
+  total planned steps.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_snapshot_execution_latest_codex --start-at btc1h_promotion_gap_matrix --stop-after gpt_pro_action_status --skip-packet`
+  completed all `8` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_snapshot_execution_realism_audit.py scripts\test_btc1h_snapshot_execution_realism_audit.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_snapshot_execution_realism_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-snapshot-execution`
+    -> `9 passed`.
+- Interpretation:
+  this improves the faithful-backtesting evidence package by proving the paused
+  BTC1H ledger did capture executable side asks, fees, visible size, and quote
+  timestamps. It does not make the current rows near-deployable because the
+  rows are pre-clean-clock, have blank policy identity, include one stale quote
+  by the `250ms` gate, retain one proxy/official mismatch, and still lack
+  independent row-for-row replay parity.
+
+## 2026-05-22 - BTC1H execution-filter impact audit
+
+- Added `scripts\build_btc1h_execution_filter_impact_audit.py` and artifact
+  `backtest_outputs\btc1h_execution_filter_impact_latest_codex`.
+  This applies the strict execution-realism row flags from
+  `backtest_outputs\btc1h_snapshot_execution_realism_latest_codex` to the
+  current pulled REST-official BTC1H rows. It is a sensitivity audit only, not
+  a new candidate or a gate relaxation.
+- Current profile comparison:
+  - all paused snapshot rows: `11` rows, official PnL `+$0.50`, proxy PnL
+    `+$1.50`, official/proxy mismatches `1`, mismatch rate `9.09%`;
+  - strict execution-filtered rows: `10` rows, official PnL `+$0.20`, proxy
+    PnL `+$1.20`, official/proxy mismatches `1`, mismatch rate `10.00%`.
+- Removed row:
+  - `KXBTCD-26MAY2106` / `KXBTCD-26MAY2106-T77699.99`;
+  - side `no`;
+  - entry `0.68`;
+  - quote age `260.9622ms`;
+  - official result `no`;
+  - proxy result `no`;
+  - official PnL `+$0.30`;
+  - removal reason `quote_age_above_limit`.
+- The strict filtered slice remains blocked by:
+  `too_few_execution_filtered_official_rows;official_proxy_mismatch_remaining;old_snapshot_not_clean_clock_promotion_evidence;replay_parity_still_required`.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the
+  execution-realism requirement now carries both the old-snapshot execution
+  field diagnostic and the strict execution-filter official-result impact.
+  Current objective summary includes:
+  - `execution_filter_strict_official_rows = 10`;
+  - `execution_filter_strict_official_pnl = 0.2`;
+  - `execution_filter_strict_official_proxy_mismatches = 1`;
+  - `execution_filter_strict_removed_markets =
+    KXBTCD-26MAY2106-T77699.99`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_execution_filter_impact_audit` runs after
+  `btc1h_snapshot_execution_realism_audit` and before
+  `btc1h_objective_completion_audit`. At this point the refresh controller had
+  `61` total planned steps; the basis-mismatch audit below extends it to `62`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_execution_filter_latest_codex --start-at btc1h_promotion_gap_matrix --stop-after gpt_pro_action_status --skip-packet`
+  completed all `9` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_execution_filter_impact_audit.py scripts\test_btc1h_execution_filter_impact_audit.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_execution_filter_impact_audit.py scripts\test_btc1h_snapshot_execution_realism_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-execution-filter`
+    -> `10 passed`.
+- Interpretation:
+  strict execution filtering makes the already-small positive BTC1H official
+  sample weaker (`+$0.50` -> `+$0.20`) and does not remove the proxy/official
+  mismatch. This strengthens the no-near-deployable conclusion under preserved
+  execution, official-settlement, clean-clock, and replay-fidelity gates.
+
+## 2026-05-22 - BTC1H execution-filtered basis mismatch audit
+
+- Added `scripts\build_btc1h_execution_filtered_basis_mismatch_audit.py` and
+  artifact
+  `backtest_outputs\btc1h_execution_filtered_basis_mismatch_latest_codex`.
+  This narrows the strict execution-filtered BTC1H slice to any surviving
+  official/proxy settlement mismatches and computes the strike-distance /
+  basis math. It is diagnostic only and does not fit a guard.
+- Current summary:
+  - strict execution-filtered official rows: `10`;
+  - strict official PnL: `+$0.20`;
+  - strict proxy PnL: `+$1.20`;
+  - strict official/proxy mismatches: `1`;
+  - mismatch removed by execution filter: `false`;
+  - basis guard deployable now: `false`;
+  - near-deployable candidate: `false`.
+- Surviving mismatch row:
+  - event `KXBTCD-26MAY2008`;
+  - market `KXBTCD-26MAY2008-T77299.99`;
+  - side `no`;
+  - entry `0.68`;
+  - official/proxy result `yes/no`;
+  - official PnL `-$0.70`;
+  - proxy PnL `+$0.30`;
+  - official-minus-proxy spot `+$42.15`;
+  - proxy close minus strike `-$8.37`;
+  - official expiration minus strike `+$33.78`;
+  - proxy side margin `+$8.37`;
+  - official side margin `-$33.78`;
+  - quote age `72.4969ms`;
+  - top visible quantity `881`.
+- Current blockers:
+  `single_mismatch_after_execution_filter;too_few_strict_official_rows;old_snapshot_not_clean_clock_promotion_evidence;guard_not_fit_from_current_rows;replay_parity_still_required`.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the
+  official-settlement requirement and objective summary now surface the
+  strict-filtered basis mismatch. Current objective fields include:
+  - `execution_filtered_basis_mismatch_rows = 1`;
+  - `execution_filtered_basis_mismatch_market =
+    KXBTCD-26MAY2008-T77299.99`;
+  - `execution_filtered_basis_mismatch_removed_by_execution_filter = False`;
+  - `execution_filtered_basis_mismatch_official_minus_proxy_spot = 42.15`;
+  - `execution_filtered_basis_mismatch_proxy_close_minus_strike = -8.37`;
+  - `execution_filtered_basis_mismatch_official_expiration_minus_strike =
+    33.78`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_execution_filtered_basis_mismatch_audit` runs after
+  `btc1h_execution_filter_impact_audit` and before
+  `btc1h_objective_completion_audit`. The refresh controller now has `62`
+  total planned steps.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_exec_filter_basis_latest_codex --start-at btc1h_promotion_gap_matrix --stop-after gpt_pro_action_status --skip-packet`
+  completed all `10` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_execution_filtered_basis_mismatch_audit.py scripts\test_btc1h_execution_filtered_basis_mismatch_audit.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_execution_filtered_basis_mismatch_audit.py scripts\test_btc1h_execution_filter_impact_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-exec-filter-basis`
+    -> `11 passed`.
+- Interpretation:
+  the strict execution filter did not remove the only BTC1H official/proxy
+  mismatch; it isolated it as a near-strike basis flip. That makes the blocker
+  more concrete, not weaker: any distance/basis guard must be preregistered and
+  tested on future clean-clock official rows, not fitted to this old `10`-row
+  filtered slice.
+
+## 2026-05-22 - BTC1H remaining evidence manifest
+
+- Added `scripts\build_btc1h_remaining_evidence_manifest.py` and artifact
+  `backtest_outputs\btc1h_remaining_evidence_manifest_latest_codex`.
+  This consumes the objective-completion audit, promotion gap matrix,
+  clean-clock gate, execution realism, strict execution-filter impact,
+  strict-filtered basis mismatch, and replay repair/root-cause summaries. It
+  turns the remaining BTC1H blockers into explicit missing-evidence rows
+  without starting, stopping, restarting, migrating, deploying, or tuning.
+- Current summary:
+  - manifest status: `BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - objective complete: `false`;
+  - deployable now: `false`;
+  - near-deployable now: `false`;
+  - requirements total: `7`;
+  - requirements current artifacts can satisfy: `0`;
+  - requirements current artifacts cannot satisfy: `7`;
+  - requires explicit authorization count: `6`;
+  - requires process control count: `6`;
+  - preregistration required count: `6`;
+  - critical missing evidence count: `5`;
+  - current artifacts can make near-deployable: `false`;
+  - process control authorized: `false`;
+  - no process action taken: `true`.
+- Critical missing evidence IDs:
+  - `clean_evidence_clock_start`;
+  - `official_settled_clean_sample`;
+  - `execution_realism_clean_rows`;
+  - `faithful_row_for_row_replay_parity`;
+  - `basis_mismatch_prospective_watch`.
+- The manifest rows make the current blocker contract machine-readable:
+  - old blank-policy rows cannot become clean-clock promotion evidence;
+  - stale official rows and the `10`-row strict execution-filtered slice cannot
+    satisfy the official-settlement sample gate;
+  - old-snapshot execution realism can define future row requirements but
+    cannot promote the candidate;
+  - current replay repairs remain diagnostics because `0 / 6` replay modes are
+    promotion usable;
+  - the strict-filtered basis mismatch is only a prospective watch condition,
+    not a fitted trading guard.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_remaining_evidence_manifest` runs after
+  `btc1h_objective_completion_audit` and before `forward_evidence_report`. The
+  refresh controller now has `63` total planned steps.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_remaining_evidence_latest_codex --start-at btc1h_promotion_gap_matrix --stop-after gpt_pro_action_status --skip-packet`
+  completed all `11` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-remaining-evidence`
+    -> `9 passed`.
+- Interpretation:
+  this does not make BTC1H closer to deployment by weakening gates. It makes
+  the opposite explicit: every promotion-relevant remaining requirement still
+  needs clean future evidence, and six of the seven manifest rows require
+  explicit authorization/process control before that evidence can even start
+  being collected.
+
+## 2026-05-22 - BTC1H faithful replay data contract
+
+- Added `scripts\build_btc1h_faithful_replay_data_contract.py` and artifact
+  `backtest_outputs\btc1h_faithful_replay_data_contract_latest_codex`.
+  This consolidates the exact sidecar fields needed for future row-for-row
+  BTC1H replay parity. Inputs are the current BTC1H remote status/schema JSON,
+  clean-clock gate, replay-vs-ledger reconciliation, repair target matrix,
+  repair prerequisite audit, and repair attempt audit. It is a read-only
+  contract, not a process action or a deployment gate relaxation.
+- Current data-contract summary:
+  - contract status: `BLOCKED_MISSING_FAITHFUL_REPLAY_CAPTURE_FIELDS`;
+  - required field count: `56`;
+  - present required field count: `39`;
+  - missing required field count: `17`;
+  - required clean-clock missing field count: `17`;
+  - required tables: `order_decision;signal_scan;ws_lifecycle;ws_orderbook_top`;
+  - missing required tables: `order_decision;signal_scan`;
+  - sidecar signal-scan rows: `134648`;
+  - sidecar order-decision rows: `1`;
+  - sidecar top-of-book rows: `458458`;
+  - sidecar lifecycle rows: `68782`;
+  - clean evidence clock ready: `false`;
+  - expected-policy official rows: `0`;
+  - blank-policy official rows: `11`;
+  - current field contract ready: `false`;
+  - clean policy identity ready: `false`;
+  - current artifacts can support faithful replay: `false`;
+  - current replay promotion usable: `false`;
+  - deployable now: `false`;
+  - near-deployable now: `false`;
+  - requires explicit authorization: `true`;
+  - requires process control: `true`;
+  - no process action taken: `true`.
+- Missing required sidecar fields:
+  - `signal_scan.signal_strategy`;
+  - `signal_scan.model_ttl_policy`;
+  - `signal_scan.model_policy_version`;
+  - `signal_scan.edge_threshold_cents`;
+  - `signal_scan.spread_cents`;
+  - `signal_scan.top_visible_qty`;
+  - `signal_scan.quote_received_at_ns`;
+  - `signal_scan.quote_age_ms`;
+  - `signal_scan.ttl_min`;
+  - `signal_scan.close_time`;
+  - `signal_scan.btc_candle_time`;
+  - `signal_scan.btc_candle_age_sec`;
+  - `signal_scan.btc_rv60`;
+  - `signal_scan.btc_ret_10m_usd`;
+  - `order_decision.signal_strategy`;
+  - `order_decision.model_ttl_policy`;
+  - `order_decision.model_policy_version`.
+- The contract also carries the current replay blockers:
+  `missing_required_sidecar_fields;clean_policy_identity_not_ready;future_exact_model_input_capture_required;current_replay_not_promotion_usable;current_snapshot_repairs_not_promotion_usable`.
+  The prerequisite audit still says future exact-input capture is required for
+  `same_event_market_selection;skip_then_fill_sequence`.
+- Updated `scripts\build_btc1h_remaining_evidence_manifest.py` so the
+  faithful-replay missing-evidence row now includes this data-contract status,
+  missing field count, and blockers. The refreshed manifest now records:
+  - `faithful_replay_data_contract_status =
+    BLOCKED_MISSING_FAITHFUL_REPLAY_CAPTURE_FIELDS`;
+  - `faithful_replay_missing_required_field_count = 17`;
+  - `faithful_replay_current_artifacts_can_support = False`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_faithful_replay_data_contract` runs after
+  `btc1h_replay_repair_attempt_audit` and before
+  `btc1h_official_basis_mismatch_audit`. The refresh controller now has `64`
+  total planned steps.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_replay_data_contract_latest_codex --start-at btc1h_replay_repair_attempt_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `26` selected read-only steps. `deployment_readiness` returned
+  code `1`, accepted by the controller because it correctly means no
+  production-ready candidates.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_faithful_replay_data_contract.py scripts\test_btc1h_faithful_replay_data_contract.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_faithful_replay_data_contract.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-replay-data-contract`
+    -> `11 passed`.
+- Interpretation:
+  the blocker is now field-level rather than vague. Current BTC1H sidecar data
+  has plenty of rows, but it is missing the scan-time policy identity, TTL,
+  quote-age, top-visible-quantity, BTC feature, and order-decision policy
+  fields needed to make an independent replay promotion-usable. Existing rows
+  remain research/control diagnostics only.
+
+## 2026-05-22 - BTC1H replay source-contract readiness
+
+- Patched `scripts\materialize_btc_replay_sidecar.py` so materialized replay
+  DuckDBs preserve:
+  - `ws_lifecycle.open_ts`;
+  - `ws_lifecycle.close_ts`;
+  - `order_decision.side`.
+  The source writer already had these fields in `CAPTURE_SCHEMAS` /
+  replay-sidecar rows, but the materializer had not been preserving all of
+  them.
+- Added `scripts\build_btc1h_replay_source_contract_readiness.py` and artifact
+  `backtest_outputs\btc1h_replay_source_contract_readiness_latest_codex`.
+  This statically checks the current BTC1H source against the `56`-field
+  faithful-replay contract:
+  - `CAPTURE_SCHEMAS` contains every contract field;
+  - `_record_scan` / `_record_decision` emit every required
+    `signal_scan` / `order_decision` payload field;
+  - `materialize_btc_replay_sidecar.py` can parse every raw sidecar field;
+  - the materialized table definitions preserve every contract field.
+- Current source-contract summary:
+  - source contract status:
+    `SOURCE_READY_RESTART_REQUIRED_CURRENT_ROWS_BLOCKED`;
+  - required field count: `56`;
+  - source-ready field count: `56`;
+  - source missing field count: `0`;
+  - capture schema missing count: `0`;
+  - recorder payload missing count: `0`;
+  - materializer sidecar column missing count: `0`;
+  - materializer table column missing count: `0`;
+  - current source contract ready: `true`;
+  - current data contract status:
+    `BLOCKED_MISSING_FAITHFUL_REPLAY_CAPTURE_FIELDS`;
+  - current artifacts can support faithful replay: `false`;
+  - current rows remain blocked until clean clock: `true`;
+  - deployable now: `false`;
+  - near-deployable now: `false`;
+  - requires explicit authorization to collect: `true`;
+  - requires process control to collect: `true`;
+  - no process action taken: `true`.
+- Updated `scripts\build_btc1h_remaining_evidence_manifest.py` so the
+  faithful-replay missing-evidence row now distinguishes source readiness from
+  current-row evidence. The refreshed manifest records:
+  - `replay_source_contract_status =
+    SOURCE_READY_RESTART_REQUIRED_CURRENT_ROWS_BLOCKED`;
+  - `replay_source_contract_ready = True`;
+  - `replay_source_missing_field_count = 0`;
+  - `faithful_replay_current_artifacts_can_support = False`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_replay_source_contract_readiness` runs after
+  `btc1h_faithful_replay_data_contract` and before
+  `btc1h_official_basis_mismatch_audit`. The refresh controller now has `65`
+  total planned steps.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_source_contract_latest_codex --start-at btc1h_faithful_replay_data_contract --stop-after gpt_pro_action_status --skip-packet`
+  completed all `26` selected read-only steps. `deployment_readiness` returned
+  code `1`, accepted by the controller because it still means no
+  production-ready candidates.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_source_contract_readiness.py scripts\test_btc1h_replay_source_contract_readiness.py scripts\materialize_btc_replay_sidecar.py scripts\test_btc_replay_sidecar_materialization.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_replay_source_contract_readiness.py scripts\test_btc_replay_sidecar_materialization.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-source-contract`
+    -> `13 passed`.
+- Interpretation:
+  the current checked-out BTC1H code path is now source-ready to emit and
+  materialize every field in the faithful-replay contract, but that is not
+  evidence for the old running rows. The official BTC1H status remains blocked:
+  current artifacts cannot support faithful replay, and future rows only become
+  eligible after explicit authorization starts a clean evidence clock and the
+  refreshed sidecar schema proves these fields are populated.
+
+## 2026-05-22 - BTC1H clean-clock collection preflight
+
+- Added `scripts\build_btc1h_clean_clock_collection_preflight.py` and artifact
+  `backtest_outputs\btc1h_clean_clock_collection_preflight_latest_codex`.
+  This is a read-only handoff/preflight that separates:
+  - source/materializer preparation readiness;
+  - current-row replay/clean-clock blockers;
+  - explicit user authorization requirements;
+  - the missing post-restart official sample.
+- Current preflight summary:
+  - `preflight_status = READY_FOR_AUTHORIZATION_NOT_COLLECTION_EVIDENCE`;
+  - `ready_for_authorization = True`;
+  - `collection_evidence_ready = False`;
+  - `source_contract_ready = True`;
+  - `current_artifacts_can_support_faithful_replay = False`;
+  - `clean_evidence_clock_ready = False`;
+  - `restart_authorization_status = NEEDS_REVIEW_BEFORE_START_RESTART`;
+  - `user_permission_required = True`;
+  - `restart_path_status = PASS_RESTART_PATH_READY`;
+  - `fresh_capture_replay_schema_status = PASS_REPLAY_SIDECAR_SCHEMA`;
+  - `post_restart_gate_status = PENDING_CONTROLLED_RESTART`;
+  - `post_restart_official_rows = 0`;
+  - `min_post_restart_official_rows = 50`;
+  - `promotion_collection_ready = False`;
+  - `deployable_now = False`;
+  - `near_deployable_now = False`;
+  - `process_control_authorized = False`;
+  - `no_process_action_taken = True`.
+- Checklist verdicts:
+  - `source_contract_ready`: `PASS_SOURCE_READY`;
+  - `current_rows_faithful_replay_contract`:
+    `BLOCKED_CURRENT_ROWS_NOT_FAITHFUL`;
+  - `clean_evidence_clock_state`: `BLOCKED_CLEAN_CLOCK_NOT_READY`;
+  - `restart_path_preflight`: `PASS_PREP_READY`;
+  - `explicit_authorization`: `BLOCKED_AUTHORIZATION_REQUIRED`;
+  - `post_restart_official_sample`: `BLOCKED_NO_POST_RESTART_ROWS`;
+  - `deployability_verdict`: `BLOCKED_NO_DEPLOY`.
+- Updated `scripts\build_btc1h_remaining_evidence_manifest.py` so the manifest
+  consumes the preflight and now records:
+  - `clean_clock_collection_preflight_status =
+    READY_FOR_AUTHORIZATION_NOT_COLLECTION_EVIDENCE`;
+  - `clean_clock_collection_preflight_ready_for_authorization = True`;
+  - `clean_clock_collection_preflight_collection_evidence_ready = False`;
+  - `clean_clock_collection_preflight_process_control_authorized = False`.
+- Patched `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_clean_clock_collection_preflight` runs after
+  `btc1h_replay_source_contract_readiness` and before
+  `btc1h_official_basis_mismatch_audit`. The refresh controller now has `66`
+  total planned steps.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_clean_preflight_latest_codex --start-at btc1h_faithful_replay_data_contract --stop-after gpt_pro_action_status --skip-packet`
+  completed all `27` selected read-only steps. `deployment_readiness` returned
+  code `1`, accepted by the controller because it still means no
+  production-ready candidates.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_clean_clock_collection_preflight.py scripts\test_btc1h_clean_clock_collection_preflight.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_clean_clock_collection_preflight.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-clean-preflight`
+    -> `11 passed`.
+- Interpretation:
+  BTC1H is prepared enough to ask for explicit guarded paper-shadow
+  authorization, but it has zero clean collection evidence today. No process
+  control was taken, and the candidate remains neither deployable nor
+  near-deployable.
+
+## 2026-05-22 - BTC1H forward packet aligned with clean-clock preflight
+
+- Patched `scripts\build_btc1h_next_forward_candidate_packet.py` so the
+  next-forward packet consumes
+  `backtest_outputs\btc1h_clean_clock_collection_preflight_latest_codex\btc1h_clean_clock_collection_preflight_summary.csv`.
+  The packet now separates:
+  - restart authorization packet global readiness;
+  - BTC1H-specific readiness for authorization review;
+  - promotion/collection evidence readiness;
+  - whether process control has actually been authorized.
+- Refreshed artifact:
+  `backtest_outputs\btc1h_next_forward_candidate_packet_latest_codex`.
+  Current `run_info.json` now records:
+  - `packet_status =
+    READY_FOR_AUTHORIZATION_REVIEW_NOT_COLLECTION_EVIDENCE`;
+  - `clean_clock_collection_preflight_status =
+    READY_FOR_AUTHORIZATION_NOT_COLLECTION_EVIDENCE`;
+  - `clean_clock_collection_ready_for_authorization = true`;
+  - `clean_clock_collection_evidence_ready = false`;
+  - `clean_clock_collection_process_control_authorized = false`;
+  - `restart_authorization_ready = false`;
+  - `deployable_now = false`;
+  - `replay_promotion_usable_modes = 0 / 6`.
+- The refreshed `btc1h_current_evidence_snapshot.csv` carries the same
+  preflight fields next to the existing objective facts:
+  - all fixed holdouts positive: `14 / 14`;
+  - live-WS cadences positive: `6 / 6`;
+  - stale forward official rows: `11`;
+  - stale official PnL: `+$0.50`;
+  - forward proxy/official mismatch rate: `0.0909`;
+  - replay repair attempt: `REGRESSES_ROW_FIDELITY`;
+  - clean-clock status: `BLOCKED_CONTROLLED_RESTART_REQUIRED`.
+- Downstream objective audit now reports:
+  - `packet_status =
+    READY_FOR_AUTHORIZATION_REVIEW_NOT_COLLECTION_EVIDENCE`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `critical_blocked_requirements =
+    official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_packet_preflight_latest_codex --start-at btc1h_next_forward_candidate_packet --stop-after gpt_pro_action_status --skip-packet`
+  completed all `13` selected read-only steps. `deployment_readiness` returned
+  code `1`, accepted by the controller because no strategy is production-ready.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_next_forward_candidate_packet.py scripts\test_btc1h_next_forward_candidate_packet.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_next_forward_candidate_packet.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-packet-preflight`
+    -> `8 passed`.
+- Interpretation:
+  the active BTC1H control remains the only frozen next-clean-clock candidate,
+  but the correct current state is authorization-review readiness, not
+  collection evidence or near-deployability. No process control was taken.
+
+## 2026-05-22 - BTC1H holdout provenance audit
+
+- Patched `scripts\build_btc1h_multi_holdout_research.py` so the multi-holdout
+  report now writes:
+  - `btc1h_holdout_provenance.csv`;
+  - `btc1h_holdout_provenance_summary.csv`.
+  These files classify every fixed holdout row as one of:
+  - `historical_predexon_research`;
+  - `live_ws_replay_research`;
+  - `official_forward_shadow`.
+- Current provenance summary:
+  - `high_conf_80_entry70_no_chase`:
+    - holdout rows: `16`;
+    - research-countable rows: `16`;
+    - live-WS stability rows: `6`;
+    - official-forward diagnostic rows: `1`;
+    - official-forward trades: `11`;
+    - official/proxy mismatch rows: `1`;
+    - near-deployable countable rows: `0`;
+    - deployable countable rows: `0`;
+    - status: `RESEARCH_PLUS_OFFICIAL_DIAGNOSTIC_ONLY`.
+  - `high_conf_80_entry59_70_no_chase`:
+    - holdout rows: `15`;
+    - live-WS stability rows: `6`;
+    - official-forward diagnostic rows: `0`;
+    - near/deployable countable rows: `0 / 0`;
+    - status: `RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE`.
+  - `high_conf_80`:
+    - holdout rows: `11`;
+    - live-WS stability rows: `6`;
+    - official-forward diagnostic rows: `0`;
+    - negative research holdouts:
+      `D0_predexon_mar17_24_old_context;H3_predexon_may03_06_external`;
+    - status: `RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE`.
+  - `high_conf_80_no_chase`:
+    - holdout rows: `18`;
+    - live-WS stability rows: `6`;
+    - official-forward diagnostic rows: `0`;
+    - negative research holdout: `H4_live_ws_may06_12_stride1s`;
+    - status: `RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE`.
+- The active-control official row is explicitly labeled
+  `official_forward_diagnostic_only`, not promotion evidence, with blockers:
+  `too_few_official_rows_for_promotion;official_proxy_mismatch_rate_above_limit;official_proxy_mismatches_present;too_few_forward_official_rows;official_proxy_mismatch_gate_failed;needs_full_counterfactual_replay_or_live_execution_gate;counterfactual_replay_not_row_faithful;selected_signal_exact_cached_ttl_missing_for_promotion;forward_rows_include_cached_ttl_only_fills;candidate_not_deployable_or_near_deployable`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_holdout_provenance_latest_codex --start-at btc1h_multi_holdout_research --stop-after gpt_pro_action_status --skip-packet`
+  completed all `36` selected read-only steps. `btc1h_clean_evidence_clock_gate`
+  returned code `1` and `deployment_readiness` returned code `1`, both accepted
+  because they represent expected blocked gates/no production-ready candidates.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_multi_holdout_research.py scripts\test_btc1h_multi_holdout_research.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_multi_holdout_research.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-holdout-provenance`
+    -> `12 passed`.
+- Interpretation:
+  the research-positive BTC1H story is now explicitly separated from
+  promotion-countable evidence. The active control remains promising research
+  with official diagnostics, while every current holdout bucket still has `0`
+  deployable and `0` near-deployable countable rows.
+
+## 2026-05-22 - BTC1H official PnL path audit
+
+- Added `scripts\build_btc1h_official_pnl_path_audit.py` and test
+  `scripts\test_btc1h_official_pnl_path_audit.py`.
+- New artifact:
+  `backtest_outputs\btc1h_official_pnl_path_latest_codex`.
+  It writes:
+  - `btc1h_official_pnl_path_sequence.csv`;
+  - `btc1h_official_pnl_path_details.csv`;
+  - `btc1h_official_pnl_path_summary.csv`;
+  - `report.md`;
+  - `run_info.json`.
+- The audit sequences the current REST-official BTC1H paper rows from
+  `backtest_outputs\remote_btc_shadow_official_settlement_latest_codex\shadow_official_trades.csv`.
+  Current official path facts:
+  - official rows: `11`;
+  - official PnL after fees: `+$0.50`;
+  - proxy PnL over the same rows: `+$1.50`;
+  - official-minus-proxy PnL: `-$1.00`;
+  - official win rate: `0.727273`;
+  - proxy/official mismatches: `1`;
+  - proxy/official mismatch rate: `0.090909`;
+  - max drawdown: `-$1.76`;
+  - drawdown/PnL ratio: `3.52`;
+  - max drawdown market: `KXBTCD-26MAY2009-T77499.99`;
+  - max single loss: `-$0.71`;
+  - rows with quote age `>90ms`: `3`;
+  - max quote age: `260.9622ms`.
+- Path status:
+  `DIAGNOSTIC_PRE_CLEAN_CLOCK_OFFICIAL_PATH_NOT_PROMOTION_USABLE`.
+  `current_rows_count_for_promotion = false` because the sample is below `50`
+  clean official rows, has a `9.09%` proxy/official mismatch rate, predates a
+  clean evidence clock, and still lacks replay-parity/execution-realism gates.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the objective
+  audit consumes the path summary. Current objective summary now includes:
+  - `official_pnl_path_audit_status =
+    DIAGNOSTIC_PRE_CLEAN_CLOCK_OFFICIAL_PATH_NOT_PROMOTION_USABLE`;
+  - `official_pnl_path_rows = 11`;
+  - `official_pnl_path_official_pnl = 0.5`;
+  - `official_pnl_path_max_drawdown = -1.76`;
+  - `official_pnl_path_drawdown_to_pnl_ratio = 3.52`;
+  - `official_pnl_path_proxy_official_mismatches = 1`;
+  - `official_pnl_path_current_rows_count_for_promotion = false`.
+- Updated `scripts\refresh_btc_evidence_stack.py` so
+  `btc1h_official_pnl_path_audit` runs after
+  `btc1h_execution_filtered_basis_mismatch_audit` and before
+  `btc1h_objective_completion_audit`. The refresh controller now has `67`
+  planned steps.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_pnl_path_latest_codex --start-at btc1h_execution_filtered_basis_mismatch_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `9 / 9` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_official_pnl_path_audit.py scripts\test_btc1h_official_pnl_path_audit.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_official_pnl_path_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-pnl-path`
+    -> `9 passed`.
+- Interpretation:
+  the current BTC1H official path is now visible row-by-row instead of being
+  hidden behind a positive summary PnL. The path is still diagnostic only and
+  strengthens the no-deploy verdict: `0` deployable and `0` near-deployable
+  BTC1H candidates, with official settlement, execution realism, faithful
+  replay, and clean evidence clock gates still blocked. No process control was
+  taken.
+
+## 2026-05-22 - BTC1H strict execution-filtered official path
+
+- Updated `scripts\build_btc1h_official_pnl_path_audit.py` so the official PnL
+  path audit also consumes
+  `backtest_outputs\btc1h_execution_filtered_basis_mismatch_latest_codex\btc1h_execution_filtered_basis_strict_rows.csv`.
+- New strict-path artifact:
+  `backtest_outputs\btc1h_official_pnl_path_latest_codex\btc1h_official_pnl_path_strict_execution_sequence.csv`.
+- Current strict execution-filtered path facts:
+  - strict rows: `10`;
+  - strict official PnL after fees: `+$0.20`;
+  - strict proxy PnL on the same rows: `+$1.20`;
+  - strict official-minus-proxy PnL: `-$1.00`;
+  - strict max drawdown: `-$1.76`;
+  - strict drawdown/PnL ratio: `8.8`;
+  - strict proxy/official mismatches: `1`;
+  - strict rows with quote age `>90ms`: `2`;
+  - row removed by the strict execution filter:
+    `KXBTCD-26MAY2106-T77699.99`.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the objective
+  summary now carries the strict-path fields:
+  - `official_pnl_path_strict_execution_rows = 10`;
+  - `official_pnl_path_strict_execution_official_pnl = 0.2`;
+  - `official_pnl_path_strict_execution_max_drawdown = -1.76`;
+  - `official_pnl_path_strict_execution_proxy_official_mismatches = 1`;
+  - `official_pnl_path_strict_execution_current_rows_count_for_promotion =
+    false`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_strict_pnl_path_latest_codex --start-at btc1h_execution_filtered_basis_mismatch_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `9 / 9` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_official_pnl_path_audit.py scripts\test_btc1h_official_pnl_path_audit.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py`;
+  - `python -m pytest scripts\test_btc1h_official_pnl_path_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-strict-pnl-path`
+    -> `9 passed`.
+- Interpretation:
+  enforcing the strict old-snapshot execution filter weakens, rather than
+  rescues, the current BTC1H official path. It removes one positive row and
+  leaves the same max drawdown and the same official/proxy mismatch. The active
+  BTC1H control remains diagnostic-only, with `0` deployable and `0`
+  near-deployable candidates. No process control was taken.
+
+## 2026-05-22 - BTC1H holdout independence now feeds priority blockers
+
+- Updated `scripts\build_btc1h_research_priority_matrix.py` so the priority
+  matrix consumes
+  `backtest_outputs\btc1h_holdout_independence_audit_latest_codex\btc1h_holdout_independence_summary.csv`.
+- Current active-control independence facts:
+  - pooled historical/proxy rows: `159`;
+  - unique market-side rows: `69`;
+  - duplicate market-side rows: `90`;
+  - pooled historical/proxy stressed PnL: `+$21.39`;
+  - unique market-side stressed PnL: `+$5.82`;
+  - historical leave-one-event minimum PnL: `+$19.41`;
+  - forward official stale leave-one-event minimum PnL: `+$0.09`;
+  - independence status: `WEAK_OR_CONCENTRATED_RESEARCH`;
+  - independence blocker: `duplicate_market_side_rows`.
+- The active BTC1H priority row now carries:
+  - `holdout_independence_status = WEAK_OR_CONCENTRATED_RESEARCH`;
+  - `historical_unique_market_side_rows = 69`;
+  - `historical_duplicate_market_side_rows = 90`;
+  - `historical_unique_market_side_pnl = 5.82`;
+  - deployment blockers
+    `active_historical_holdouts_have_duplicate_market_side_rows` and
+    `active_historical_independence_weak_or_concentrated`.
+- The objective candidate status now propagates those blockers into
+  `backtest_outputs\btc1h_objective_completion_audit_latest_codex\btc1h_candidate_objective_status.csv`
+  for `high_conf_80_entry70_no_chase`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_independence_priority_latest_codex --start-at btc1h_holdout_independence_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `20 / 20` selected read-only steps. `deployment_readiness`
+  returned code `1`, accepted because no strategy is production-ready.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_research_priority_matrix.py scripts\test_btc1h_research_priority_matrix.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_research_priority_matrix.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-independence-priority`
+    -> `8 passed`.
+- Interpretation:
+  the active BTC1H control remains the best frozen forward control, but its
+  historical support is now explicitly discounted for duplicate market-side
+  concentration. This does not make the strategy deployable or
+  near-deployable; it strengthens the blocked-research conclusion. No process
+  control was taken.
+
+## 2026-05-22 - BTC1H promising-candidate sets split in objective audit
+
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the objective
+  summary distinguishes raw multi-holdout promising variants from stricter
+  priority-ranked research candidates.
+- Current objective summary now reports:
+  - `promising_research_candidates = 3`;
+  - `priority_research_candidates = 3`;
+  - `multi_holdout_promising_candidates = 3`;
+  - `priority_research_candidate_variants =
+    high_conf_80_entry70_no_chase;high_conf_80_entry59_70_no_chase;high_conf_80_no_chase`;
+  - `multi_holdout_promising_variants =
+    high_conf_80_entry70_no_chase;high_conf_80_entry59_70_no_chase;high_conf_80`;
+  - `multi_holdout_promising_but_low_priority_variants = high_conf_80`;
+  - `priority_watchlist_not_multi_holdout_promising_variants =
+    high_conf_80_no_chase`.
+- Candidate status now marks:
+  - `high_conf_80_entry70_no_chase` as
+    `promising_research_control_blocked`;
+  - `high_conf_80_entry59_70_no_chase` as
+    `promising_research_runner_up_not_independent`;
+  - `high_conf_80_no_chase` as
+    `basis_watchlist_not_forward_validated`;
+  - `high_conf_80` as `low_priority_or_rejected`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_promising_sets_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `7 / 7` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py -q --basetemp .pytest-codex-tmp-btc1h-objective-promising-sets`
+    -> `1 passed`.
+- Interpretation:
+  the headline count remains `3`, but it no longer hides that the two
+  three-candidate sets are different. Broad `high_conf_80` is still raw
+  multi-holdout-promising but low priority/rejected after stricter ranking,
+  while `high_conf_80_no_chase` is a basis watchlist path rather than a
+  multi-holdout pass. No BTC1H candidate is deployable or near-deployable.
+
+## 2026-05-22 - BTC1H available-data coverage surfaced in remaining manifest
+
+- Updated `scripts\build_btc1h_remaining_evidence_manifest.py` so the
+  remaining-evidence manifest now writes a companion machine-readable coverage
+  table:
+  `backtest_outputs\btc1h_remaining_evidence_manifest_latest_codex\btc1h_available_data_coverage.csv`.
+- The coverage table pulls in:
+  - the BTC1H holdout provenance summary;
+  - replay coverage audit status;
+  - faithful-replay data-contract status;
+  - replay source-contract readiness.
+- Current coverage summary:
+  - known available data classes:
+    `historical_proxy_research_only;live_ws_stability_research_only;official_forward_diagnostic_only;current_btc1h_replay_coverage_audit;current_sidecar_and_snapshot_replay_artifacts;checked_out_source_and_materializer_for_future_rows`;
+  - known data statuses:
+    `RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE;RESEARCH_PLUS_OFFICIAL_DIAGNOSTIC_ONLY;BLOCKED_REPLAY_COVERAGE;BLOCKED_MISSING_FAITHFUL_REPLAY_CAPTURE_FIELDS;SOURCE_READY_RESTART_REQUIRED_CURRENT_ROWS_BLOCKED`;
+  - promotion-countable available data classes: none;
+  - known available near-deployable-countable rows: `0`;
+  - known available deployable-countable rows: `0`;
+  - `known_available_data_can_make_near_deployable = false`;
+  - `no_known_available_data_class_can_make_near_deployable = true`.
+- The coverage rows make the data-class distinction explicit:
+  - historical/proxy rows and live-WS replay rows are research-only;
+  - old official-forward BTC1H rows are diagnostic-only;
+  - current replay coverage is blocked and cannot replace faithful row-for-row
+    replay;
+  - current sidecar/snapshot artifacts still miss faithful-replay contract
+    fields;
+  - checked-out source/materializer readiness is future-collection readiness,
+    not current promotion evidence.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_available_data_manifest_latest_codex --start-at btc1h_remaining_evidence_manifest --stop-after gpt_pro_action_status --skip-packet`
+  completed all `6 / 6` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py`;
+  - `python -m pytest scripts\test_btc1h_remaining_evidence_manifest.py -q --basetemp .pytest-codex-tmp-btc1h-available-data-manifest`
+    -> `2 passed`.
+- Interpretation:
+  this closes a handoff ambiguity around "available data." The current local
+  evidence package has useful BTC1H research data, but no known available data
+  class can make the active control deployable or near-deployable without new
+  clean-clock official rows, execution-realism fields, and independent
+  row-for-row replay parity. No process control was taken.
+
+## 2026-05-22 - BTC1H available-data scope added to objective audit
+
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the objective
+  audit now consumes the same upstream available-data evidence directly:
+  - `btc1h_holdout_provenance_summary.csv`;
+  - `btc1h_replay_coverage_summary.csv`;
+  - `btc1h_faithful_replay_data_contract_summary.csv`;
+  - `btc1h_replay_source_contract_summary.csv`.
+- Added an explicit requirement row:
+  `available_data_scope_and_countability`.
+  Current status:
+  `PASS_SCOPED_NO_PROMOTION_USABLE_AVAILABLE_DATA`.
+- Current objective summary now carries:
+  - known available data classes:
+    `historical_proxy_research_only;live_ws_stability_research_only;official_forward_diagnostic_only;current_btc1h_replay_coverage_audit;current_sidecar_and_snapshot_replay_artifacts;checked_out_source_and_materializer_for_future_rows`;
+  - known data statuses:
+    `RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE;RESEARCH_PLUS_OFFICIAL_DIAGNOSTIC_ONLY;BLOCKED_REPLAY_COVERAGE;BLOCKED_MISSING_FAITHFUL_REPLAY_CAPTURE_FIELDS;SOURCE_READY_RESTART_REQUIRED_CURRENT_ROWS_BLOCKED`;
+  - promotion-countable available data classes: none;
+  - known available near-deployable-countable rows: `0`;
+  - known available deployable-countable rows: `0`;
+  - `known_available_data_can_make_near_deployable = false`;
+  - `known_available_data_can_make_deployable = false`;
+  - `faithful_replay_data_contract_status =
+    BLOCKED_MISSING_FAITHFUL_REPLAY_CAPTURE_FIELDS`;
+  - `replay_source_contract_status =
+    SOURCE_READY_RESTART_REQUIRED_CURRENT_ROWS_BLOCKED`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_objective_available_data_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `7 / 7` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-objective-available-data-final`
+    -> `10 passed`.
+- Interpretation:
+  the top-level objective audit now carries the same available-data conclusion
+  as the remaining-evidence manifest. A reader no longer has to inspect a
+  separate manifest to see that current BTC1H available data supports research
+  diagnostics only and cannot make any candidate deployable or near-deployable
+  under the official-settlement, execution-realism, faithful-replay, and
+  clean-clock gates. No process control was taken.
+
+## 2026-05-22 - BTC1H candidate-level promotion gate columns
+
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so
+  `btc1h_candidate_objective_status.csv` now carries candidate-level
+  promotion evidence columns instead of only a long blocker string:
+  - `available_data_status`;
+  - `available_data_uses`;
+  - `promotion_countable_available_data`;
+  - `candidate_promotion_evidence_status`;
+  - `official_settlement_gate_blocked`;
+  - `execution_realism_gate_blocked`;
+  - `faithful_replay_gate_blocked`;
+  - `clean_evidence_clock_gate_blocked`;
+  - `statistical_or_basis_caveat_active`.
+- Current candidate-level result:
+  - `high_conf_80_entry70_no_chase`:
+    `candidate_promotion_evidence_status =
+    NO_PROMOTION_COUNTABLE_AVAILABLE_DATA`,
+    `available_data_status = RESEARCH_PLUS_OFFICIAL_DIAGNOSTIC_ONLY`;
+  - `high_conf_80_entry59_70_no_chase`:
+    `candidate_promotion_evidence_status =
+    NO_PROMOTION_COUNTABLE_AVAILABLE_DATA`,
+    `available_data_status = RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE`;
+  - `high_conf_80_no_chase`:
+    `candidate_promotion_evidence_status =
+    NO_PROMOTION_COUNTABLE_AVAILABLE_DATA`,
+    `available_data_status = RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE`;
+  - `high_conf_80`:
+    `candidate_promotion_evidence_status =
+    NO_PROMOTION_COUNTABLE_AVAILABLE_DATA`,
+    `available_data_status = RESEARCH_ONLY_NO_OFFICIAL_FORWARD_EVIDENCE`.
+- For the active control, the candidate row now also exposes the hard gate
+  blockers directly:
+  - `official_settlement_gate_blocked = true`;
+  - `execution_realism_gate_blocked = true`;
+  - `faithful_replay_gate_blocked = true`;
+  - `clean_evidence_clock_gate_blocked = true`;
+  - `statistical_or_basis_caveat_active = true`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_candidate_gate_columns_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `7 / 7` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-candidate-gate-columns-final`
+    -> `10 passed`.
+- Interpretation:
+  the candidate table now makes the no-near-deployable conclusion auditable at
+  the row level. Each promising or watchlist BTC1H variant is still useful as
+  research evidence, but none has promotion-countable available data, and the
+  active control remains blocked by every hard promotion gate. No process
+  control was taken.
+
+## 2026-05-22 - BTC1H candidate rows now name failing holdout buckets
+
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so
+  `btc1h_candidate_objective_status.csv` now carries the multi-holdout details
+  that were previously only visible in `btc1h_candidate_gate_summary.csv`:
+  - `promotion_readiness_status`;
+  - `negative_holdouts`;
+  - `near_deployable_disqualifying_blockers`.
+- Current candidate-level holdout facts:
+  - `high_conf_80_entry70_no_chase`: `14 / 14` historical holdouts positive,
+    `6 / 6` WS cadences positive, no negative holdout name, but still
+    `promising_but_blocked_by_official_or_fidelity_gates`;
+  - `high_conf_80_entry59_70_no_chase`: `12 / 13` historical holdouts
+    positive, negative holdout `H2b_direct_apr23_may01_holdout`, `6 / 6` WS
+    cadences positive, and `historical_promising_needs_forward_official_evidence`;
+  - `high_conf_80_no_chase`: `13 / 14` historical holdouts positive, negative
+    live-WS cadence `H4_live_ws_may06_12_stride1s`, `5 / 6` WS cadences
+    positive, and `research_watch_or_reject`;
+  - `high_conf_80`: `8 / 9` historical holdouts positive, negative holdout
+    `H3_predexon_may03_06_external`, `6 / 6` WS cadences positive, and
+    `historical_promising_needs_forward_official_evidence`.
+- Bounded refresh:
+  `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_holdout_detail_columns_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status --skip-packet`
+  completed all `7 / 7` selected read-only steps.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-holdout-detail-final`
+    -> `10 passed`.
+- Interpretation:
+  the objective candidate table now preserves both sides of the multi-holdout
+  picture. The active control is the only current candidate with clean
+  historical/WS bucket positivity, but it is still blocked by official,
+  execution, replay, and clean-clock gates. The runner-up and watchlist
+  variants now show exactly which holdout or cadence prevents treating them as
+  broad robust passes. No process control was taken.
+
+## 2026-05-22 - BTC1H replay repair feasibility surfaced in objective audit
+
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the top-level
+  objective audit consumes:
+  - `btc1h_replay_repair_prerequisite_summary.csv`;
+  - `btc1h_replay_repair_target_summary.csv`;
+  - `btc1h_replay_repair_attempt_summary.csv`.
+- The objective summary now exposes the replay-repair blocker directly:
+  - `replay_repair_blocker_status =
+    BLOCKED_FUTURE_EXACT_INPUT_REQUIRED`;
+  - `replay_repair_target_count = 4`;
+  - `replay_repair_existing_snapshot_true_target_count = 2`;
+  - `replay_repair_existing_snapshot_partial_target_count = 1`;
+  - `replay_repair_existing_snapshot_false_target_count = 1`;
+  - `replay_repair_future_exact_input_blocked_targets =
+    same_event_market_selection;skip_then_fill_sequence`.
+- The `faithful_live_replay_gate` requirement now includes the row-for-row
+  replay repair detail:
+  - current independent replay exact market-side matches are `9 / 11`;
+  - replay row count is `10` versus `11` actual rows;
+  - replay-minus-actual PnL drift is `+0.61`;
+  - two targets are repairable from the current snapshot:
+    `order_decision_reprice_fill_price` and `blocked_dedupe_scan_clock`;
+  - `same_event_market_selection` is only partially repairable and
+    `skip_then_fill_sequence` is not repairable from the current snapshot;
+  - the best current snapshot attempt is
+    `matched_drift_decision_fill_price_patch_simulation`, but remaining
+    blockers are still
+    `missing_actual_rows;replay_row_count_differs;extra_replay_rows;event_level_market_replacements;pnl_not_row_for_row_equal`.
+- Current objective verdict remains unchanged:
+  - `objective_complete = false`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - critical blockers:
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-replay-repair-objective`
+    -> `8 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_replay_repair_objective_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `7 / 7` steps.
+- Interpretation:
+  the objective audit now makes the faithful-backtesting blocker explicit at
+  the same level as deployability. Existing paused-snapshot data can test two
+  replay-engine fixes diagnostically, but it cannot make the active BTC1H
+  candidate promotion-usable because same-event selection and skip/fill
+  sequencing still need exact model-input/TTL capture or future clean-clock
+  evidence. No process control was taken.
+
+## 2026-05-22 - BTC1H faithful replay root-cause field gaps
+
+- Extended `scripts\build_btc1h_faithful_replay_data_contract.py` so the
+  contract now writes
+  `btc1h_faithful_replay_root_cause_field_gaps.csv`, mapping each replay
+  failure target to the exact required capture fields that are present or
+  missing.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so
+  `btc1h_objective_summary.csv` carries the field-gap result:
+  - `faithful_replay_root_cause_field_gap_rows = 4`;
+  - `faithful_replay_root_cause_future_exact_input_target_count = 2`;
+  - `faithful_replay_root_cause_target_missing_required_field_count = 16`;
+  - `faithful_replay_root_cause_target_missing_required_fields =
+    signal_scan.model_ttl_policy;signal_scan.model_policy_version;signal_scan.ttl_min;signal_scan.close_time;signal_scan.btc_candle_time;signal_scan.btc_candle_age_sec;signal_scan.btc_rv60;signal_scan.btc_ret_10m_usd`;
+  - `faithful_replay_root_cause_target_repairs_can_make_promotion_usable_now =
+    False`.
+- Current target-level field gap result:
+  - `skip_then_fill_sequence`: snapshot repair status `False`, `8` missing
+    target fields, future exact-input required, promotion-usable now `False`;
+  - `same_event_market_selection`: snapshot repair status `Partial`, `8`
+    missing target fields, future exact-input required, promotion-usable now
+    `False`;
+  - `order_decision_reprice_fill_price`: snapshot repair status `True`, `0`
+    missing target fields, but promotion-usable now still `False`;
+  - `blocked_dedupe_scan_clock`: snapshot repair status `True`, `0` missing
+    target fields, but promotion-usable now still `False`.
+- Objective/manifest verdict after refresh:
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `known_available_data_can_make_near_deployable = False`;
+  - `manifest_status = BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_faithful_replay_data_contract.py scripts\test_btc1h_faithful_replay_data_contract.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_faithful_replay_data_contract.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-field-gap-contract`
+    -> `10 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_field_gap_contract_latest_codex --start-at btc1h_faithful_replay_data_contract --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `28 / 28` steps. The
+    `deployment_readiness` step returned `1` and was correctly treated as PASS
+    by the controller because it means no production-ready candidates.
+- Interpretation:
+  current paused-snapshot data can still support two diagnostic replay-engine
+  repairs, but it cannot rescue the target-selection or skip/fill sequence
+  failures because the exact scan-time model-input and TTL fields were not
+  captured. This is stricter faithful-backtesting evidence, not a deployment
+  shortcut. No process control was taken.
+
+## 2026-05-22 - BTC1H residual repair target ledger
+
+- Extended `scripts\build_btc1h_replay_repair_attempt_audit.py` so it now
+  writes `btc1h_replay_repair_residual_targets.csv`, a target-level ledger that
+  separates diagnostic current-snapshot patches from unresolved future-input
+  replay blockers.
+- Current residual target statuses:
+  - `skip_then_fill_sequence`:
+    `UNRESOLVED_FUTURE_EXACT_INPUT_REQUIRED`, current snapshot repair attempted
+    `False`, future exact input required `True`, promotion usable `False`;
+  - `same_event_market_selection`:
+    `UNRESOLVED_FUTURE_EXACT_INPUT_REQUIRED`, current snapshot repair attempted
+    `False`, future exact input required `True`, promotion usable `False`;
+  - `order_decision_reprice_fill_price`:
+    `DIAGNOSTIC_PATCH_APPLIED_NOT_PROMOTION_USABLE`, current snapshot repair
+    attempted `True`, future exact input required `False`, promotion usable
+    `False`;
+  - `blocked_dedupe_scan_clock`:
+    `DIAGNOSTIC_PATCH_APPLIED_NOT_PROMOTION_USABLE`, current snapshot repair
+    attempted `True`, future exact input required `False`, promotion usable
+    `False`.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the objective
+  summary now carries:
+  - `replay_repair_residual_target_count = 4`;
+  - `replay_repair_diagnostic_patch_applied_target_count = 2`;
+  - `replay_repair_unresolved_future_exact_input_target_count = 2`;
+  - `replay_repair_diagnostic_patch_applied_targets =
+    order_decision_reprice_fill_price;blocked_dedupe_scan_clock`;
+  - `replay_repair_unresolved_future_exact_input_targets =
+    skip_then_fill_sequence;same_event_market_selection`;
+  - `replay_repair_targets_repaired_to_promotion_usable_count = 0`;
+  - `replay_repair_all_field_ready_repairs_remain_diagnostic_only = True`.
+- Current objective and manifest verdict remain unchanged:
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `manifest_status = BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - `known_available_data_can_make_near_deployable = False`;
+  - hard blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_replay_repair_attempt_audit.py scripts\test_btc1h_replay_repair_attempt_audit.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\build_btc1h_faithful_replay_data_contract.py scripts\test_btc1h_faithful_replay_data_contract.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_replay_repair_attempt_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc1h_faithful_replay_data_contract.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-residual-repair`
+    -> `11 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_residual_repair_latest_codex --start-at btc1h_replay_repair_attempt_audit --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `29 / 29` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  the two field-ready replay repairs can remove matched entry/PnL drift only as
+  diagnostic replay-engineering evidence. They still leave missing actual
+  rows, row-count drift, extra replay rows, event-level replacements, and PnL
+  drift, and they repair `0` targets to promotion usability. No process control
+  was taken.
+
+## 2026-05-22 - BTC1H priority matrix carries residual replay blockers
+
+- Updated `scripts\build_btc1h_research_priority_matrix.py` so
+  `btc1h_research_priority_matrix.csv` and
+  `btc1h_research_priority_summary.csv` include the active-control residual
+  replay repair fields from `btc1h_replay_repair_attempt_summary.csv`.
+- Current ranking-layer replay blocker string:
+  `current_snapshot_repairs_not_promotion_usable;selected_scan_attempt_regresses_row_fidelity;unresolved_future_exact_input_replay_targets;field_ready_replay_repairs_diagnostic_only;zero_replay_targets_repaired_to_promotion_usable`.
+- Current active-control priority row now carries:
+  - `replay_repair_residual_target_count = 4`;
+  - `replay_repair_diagnostic_patch_applied_target_count = 2`;
+  - `replay_repair_unresolved_future_exact_input_target_count = 2`;
+  - `replay_repair_diagnostic_patch_applied_targets =
+    order_decision_reprice_fill_price;blocked_dedupe_scan_clock`;
+  - `replay_repair_unresolved_future_exact_input_targets =
+    skip_then_fill_sequence;same_event_market_selection`;
+  - `replay_repair_targets_repaired_to_promotion_usable_count = 0`;
+  - `replay_repair_all_field_ready_repairs_remain_diagnostic_only = True`.
+- Current research ranking remains:
+  - active forward control: `high_conf_80_entry70_no_chase`;
+  - top causal replay runner-up:
+    `high_conf_80_entry59_70_no_chase`;
+  - top basis-stress variant: `high_conf_80_no_chase`.
+- Current objective/manifest verdict remains unchanged:
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `manifest_status = BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - `known_available_data_can_make_near_deployable = False`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_research_priority_matrix.py scripts\test_btc1h_research_priority_matrix.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_research_priority_matrix.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-priority-residual`
+    -> `9 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_priority_residual_latest_codex --start-at btc1h_research_priority_matrix --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `15 / 15` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  the strategy ranking now reflects the stricter residual replay evidence at
+  the same layer that names the active control and runner-up candidates. The
+  active control remains the best BTC1H forward-control research candidate, but
+  the ranking artifact now makes clear that `0` replay targets were repaired to
+  promotion usability. No process control was taken.
+
+## 2026-05-22 - BTC1H candidate packet carries residual replay evidence
+
+- Updated `scripts\build_btc1h_next_forward_candidate_packet.py` so the
+  next-forward candidate packet carries residual replay repair fields in:
+  - `btc1h_current_evidence_snapshot.csv`;
+  - `btc1h_candidate_decision_packet.csv`;
+  - `run_info.json`;
+  - `report.md`.
+- Current packet replay fields:
+  - `replay_repair_residual_target_count = 4`;
+  - `replay_repair_diagnostic_patch_applied_target_count = 2`;
+  - `replay_repair_unresolved_future_exact_input_target_count = 2`;
+  - `replay_repair_diagnostic_patch_applied_targets =
+    order_decision_reprice_fill_price;blocked_dedupe_scan_clock`;
+  - `replay_repair_unresolved_future_exact_input_targets =
+    skip_then_fill_sequence;same_event_market_selection`;
+  - `replay_repair_targets_repaired_to_promotion_usable_count = 0`;
+  - `replay_repair_all_field_ready_repairs_remain_diagnostic_only = True`.
+- Current packet status remains conservative:
+  - `packet_status = READY_FOR_AUTHORIZATION_REVIEW_NOT_COLLECTION_EVIDENCE`;
+  - `deployable_now = False`;
+  - `current_rows_count_for_promotion = False`;
+  - `collection_evidence_ready = False`;
+  - `restart_authorization_ready = False`.
+- Current objective/manifest verdict remains unchanged:
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `manifest_status = BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_next_forward_candidate_packet.py scripts\test_btc1h_next_forward_candidate_packet.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_next_forward_candidate_packet.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-packet-residual`
+    -> `8 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_packet_residual_latest_codex --start-at btc1h_next_forward_candidate_packet --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `14 / 14` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  the forward candidate packet can still freeze the active BTC1H policy for a
+  future clean evidence clock, but it now names the strict replay-residual
+  blocker directly: current data repaired `0` replay targets to promotion
+  usability. No process control was taken.
+
+## 2026-05-22 - BTC1H clean-clock preflight defers to restart authorization
+
+- Updated `scripts\build_btc1h_clean_clock_collection_preflight.py` so the
+  BTC1H clean-clock collection preflight no longer claims authorization
+  readiness when the guarded restart authorization packet itself is not ready.
+- Current refreshed preflight:
+  - `preflight_status = BLOCKED_PREPARATION_NOT_READY`;
+  - `ready_for_authorization = False`;
+  - `collection_evidence_ready = False`;
+  - `restart_authorization_status = NEEDS_REVIEW_BEFORE_START_RESTART`;
+  - `restart_authorization_packet_ready = False`;
+  - `pre_authorization_blockers = target_process_state_expected`;
+  - `target_process_count = 0`;
+  - `target_process_running = False`;
+  - `target_process_hygiene_status = NOT_RUNNING`.
+- Downstream status now reflects the stricter current process-state blocker:
+  - remaining-evidence manifest:
+    `clean_clock_collection_preflight_status =
+    BLOCKED_PREPARATION_NOT_READY`;
+  - next-forward candidate packet:
+    `clean_clock_collection_ready_for_authorization = False`,
+    `shadow_running = False`,
+    `restart_authorization_ready = False`;
+  - objective audit:
+    `packet_status = BLOCKED_RESTART_AUTHORIZATION_NOT_READY`.
+- Current objective verdict remains unchanged:
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_clean_clock_collection_preflight.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\build_btc1h_objective_completion_audit.py scripts\build_btc1h_next_forward_candidate_packet.py scripts\check_btc_deployment_readiness.py scripts\test_btc1h_clean_clock_collection_preflight.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc1h_next_forward_candidate_packet.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_clean_clock_collection_preflight.py scripts\test_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc1h_next_forward_candidate_packet.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-clean-preflight-auth-slice`
+    -> `14 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_clean_preflight_auth_latest_codex --start-at btc1h_clean_clock_collection_preflight --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `26 / 26` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  the source/schema path can still be reviewed, but the current BTC1H target is
+  not running and the restart authorization packet reports
+  `target_process_state_expected`, so the preflight is now blocked before
+  authorization. No process control was taken.
+
+## 2026-05-22 - BTC restart packet separates expected state from observed action
+
+- Updated `scripts\build_btc_restart_authorization_packet.py` so the guarded
+  restart/start authorization packet reports current observed process action
+  from `process_count`, separate from the configured expected process state.
+- Current BTC1H authorization row:
+  - `authorization_packet_status = NEEDS_REVIEW_BEFORE_START_RESTART`;
+  - `pre_authorization_blockers = target_process_state_expected`;
+  - `process_count = 0`;
+  - `process_hygiene_status = NOT_RUNNING`;
+  - `expected_process_state = existing_process_required`;
+  - `observed_process_action = start_absent_target`;
+  - `will_stop_existing_processes = False`;
+  - `will_start_process = True`;
+  - `will_restart_process = False`;
+  - `will_start_new_process = True`.
+- The BTC1H clean-clock preflight now carries:
+  - `preflight_status = BLOCKED_PREPARATION_NOT_READY`;
+  - `restart_authorization_packet_ready = False`;
+  - `expected_process_state = existing_process_required`;
+  - `observed_process_action = start_absent_target`;
+  - `will_restart_process = False`;
+  - `will_start_new_process = True`.
+- Current objective verdict remains unchanged:
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `packet_status = BLOCKED_RESTART_AUTHORIZATION_NOT_READY`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc_restart_authorization_packet.py scripts\test_btc_paper_restart_safety.py scripts\build_btc1h_clean_clock_collection_preflight.py scripts\test_btc1h_clean_clock_collection_preflight.py`;
+  - `python -m pytest scripts\test_btc_paper_restart_safety.py scripts\test_btc1h_clean_clock_collection_preflight.py -q --basetemp .pytest-codex-tmp-btc1h-start-action-semantics`
+    -> `12 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_start_action_semantics_latest_codex --start-at restart_authorization_packet --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `56 / 56` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  the evidence clock is still blocked and no process action was taken, but the
+  packet now states the operational reality precisely: the absent BTC1H target
+  would be a guarded start, not a restart of an existing process, and this is
+  not authorization-ready under the current expected-process-state check.
+
+## 2026-05-22 - BTC start/restart authorization lane is ready but not evidence
+
+- Updated `scripts\build_btc_restart_authorization_packet.py` so the guarded
+  workflow treats absent paper shadows as startable only after explicit user
+  authorization, instead of blocking on the absence of an existing process.
+- The packet now checks that BTC15M capture is not targeted by the workflow
+  rather than requiring a BTC15M capture PID to be running.
+- Current target rows:
+  - all four paper-shadow targets have
+    `authorization_packet_status = READY_FOR_USER_AUTHORIZATION_TO_START`;
+  - all four have `process_count = 0`;
+  - all four have `expected_process_state = start_or_restart_allowed`;
+  - all four have `observed_process_action = start_absent_target`;
+  - all four have `will_start_new_process = True`;
+  - all four have `will_restart_process = False`.
+- Current authorization packet `run_info.json`:
+  - `all_ready_for_user_authorization = True`;
+  - `all_ready_for_clean_restart_authorization = True`;
+  - `ready_for_user_authorization_count = 4`;
+  - `latest_restart_plan_execute = False`;
+  - `unmanaged_matching_process_count = 0`.
+- Current BTC1H clean-clock preflight:
+  - `preflight_status = READY_FOR_AUTHORIZATION_NOT_COLLECTION_EVIDENCE`;
+  - `ready_for_authorization = True`;
+  - `collection_evidence_ready = False`;
+  - `restart_authorization_status = READY_FOR_USER_AUTHORIZATION_TO_START`;
+  - `restart_authorization_packet_ready = True`;
+  - `observed_process_action = start_absent_target`;
+  - `will_start_new_process = True`.
+- Current objective/manifest verdict remains unchanged:
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `packet_status = READY_FOR_AUTHORIZATION_REVIEW_NOT_COLLECTION_EVIDENCE`;
+  - `manifest_status = BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - `current_artifacts_can_make_near_deployable = False`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc_restart_authorization_packet.py scripts\test_btc_paper_restart_safety.py scripts\build_btc1h_clean_clock_collection_preflight.py scripts\test_btc1h_clean_clock_collection_preflight.py`;
+  - `python -m pytest scripts\test_btc_paper_restart_safety.py scripts\test_btc1h_clean_clock_collection_preflight.py -q --basetemp .pytest-codex-tmp-btc1h-start-ready-auth-final`
+    -> `13 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_start_ready_auth_latest_codex --start-at restart_authorization_packet --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `56 / 56` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  this supersedes the immediately prior start/restart authorization blocker:
+  the safe authorization review lane is now ready, but no process control was
+  taken and no clean evidence rows exist yet. Explicit user authorization,
+  future official-settled rows, execution-realism fields, and row-for-row replay
+  parity are still required before BTC1H can become near-deployable.
+
+## 2026-05-22 - BTC1H packet/objective expose start-ready but no-evidence state
+
+- Updated `scripts\build_btc1h_next_forward_candidate_packet.py` so the BTC1H
+  next-forward packet carries the clean-clock preflight's corrected process
+  state fields in `btc1h_current_evidence_snapshot.csv`, `run_info.json`, and
+  `report.md`.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so the objective
+  summary and clean-evidence-clock requirement show the same authorization
+  state instead of only the high-level packet status.
+- Current BTC1H candidate packet state:
+  - `packet_status = READY_FOR_AUTHORIZATION_REVIEW_NOT_COLLECTION_EVIDENCE`;
+  - `restart_authorization_status =
+    READY_FOR_USER_AUTHORIZATION_TO_START`;
+  - `restart_authorization_packet_ready = True`;
+  - `expected_process_state = start_or_restart_allowed`;
+  - `observed_process_action = start_absent_target`;
+  - `will_start_new_process = True`;
+  - `will_restart_process = False`;
+  - `authorization_ready_but_collection_evidence_false = True`;
+  - `clean_clock_collection_evidence_ready = False`;
+  - `no_process_action_taken = True`.
+- Current BTC1H objective summary remains unchanged on deployability:
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_next_forward_candidate_packet.py scripts\test_btc1h_next_forward_candidate_packet.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py`;
+  - `python -m pytest scripts\test_btc1h_next_forward_candidate_packet.py scripts\test_btc1h_objective_completion_audit.py -q --basetemp .pytest-codex-tmp-btc1h-packet-objective-start-state`
+    -> `2 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_packet_objective_start_state_latest_codex --start-at btc1h_next_forward_candidate_packet --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `14 / 14` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  the handoff packet and objective audit now agree with the start-ready
+  authorization lane: absent BTC1H paper shadow targets could be started only
+  after explicit user authorization, but no start/restart occurred and there is
+  still no clean collection evidence. This is not near-deployable evidence.
+
+## 2026-05-22 - BTC1H faithful replay missing-field counts clarified
+
+- Updated `scripts\build_btc1h_faithful_replay_data_contract.py` so the
+  faithful replay contract distinguishes:
+  - overall missing required sidecar fields;
+  - summed target-level missing-field occurrences across replay root causes;
+  - unique target-level missing fields that block the unresolved exact-input
+    replay targets.
+- Updated `scripts\build_btc1h_objective_completion_audit.py` and
+  `scripts\build_btc1h_remaining_evidence_manifest.py` so downstream summaries
+  and reports carry the same counts.
+- Current regenerated faithful replay contract:
+  - `missing_required_field_count = 17`;
+  - `root_cause_target_missing_required_field_count = 16`;
+  - `root_cause_target_missing_required_field_occurrence_count = 16`;
+  - `root_cause_target_unique_missing_required_field_count = 8`;
+  - target missing field ids are
+    `signal_scan.model_ttl_policy;signal_scan.model_policy_version;signal_scan.ttl_min;signal_scan.close_time;signal_scan.btc_candle_time;signal_scan.btc_candle_age_sec;signal_scan.btc_rv60;signal_scan.btc_ret_10m_usd`;
+  - `current_artifacts_can_support_faithful_replay = False`.
+- Current objective/manifest verdict remains unchanged:
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `manifest_status = BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_faithful_replay_data_contract.py scripts\test_btc1h_faithful_replay_data_contract.py scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py`;
+  - `python -m pytest scripts\test_btc1h_faithful_replay_data_contract.py scripts\test_btc1h_objective_completion_audit.py scripts\test_btc1h_remaining_evidence_manifest.py -q --basetemp .pytest-codex-tmp-btc1h-faithful-count-clarity`
+    -> `5 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_faithful_count_clarity_latest_codex --start-at btc1h_faithful_replay_data_contract --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `28 / 28` steps. The
+    `deployment_readiness` return code `1` was correctly treated as PASS by the
+    controller because it means no production-ready candidates.
+- Interpretation:
+  the apparent `17` versus `16` mismatch was not a deployability improvement.
+  It is the difference between all missing sidecar contract fields and the
+  repeated target-level fields needed for the two unresolved exact-input replay
+  failures. Current artifacts still cannot produce faithful row-for-row BTC1H
+  replay evidence.
+
+## 2026-05-22 - BTC1H available-data coverage rows now carry blockers
+
+- Updated `scripts\build_btc1h_remaining_evidence_manifest.py` so
+  `btc1h_available_data_coverage.csv` writes a `blockers` column in addition
+  to the existing `blocker_summary`, and the manifest report includes that
+  column in the available-data coverage table.
+- Current available-data coverage now says every data class has
+  `current_rows_count_for_promotion = False` and
+  `can_make_near_deployable_now = False`, with row-level blockers:
+  - historical/proxy and live-WS rows are research-only unless clean-clock,
+    official-settlement, execution-realism, and replay gates pass;
+  - replay coverage audits are plumbing only and do not replace official clean
+    rows or row-for-row faithful replay;
+  - current sidecar/snapshot replay artifacts are blocked by
+    `missing_required_sidecar_fields;clean_policy_identity_not_ready;future_exact_model_input_capture_required;current_replay_not_promotion_usable;current_snapshot_repairs_not_promotion_usable`;
+  - source readiness is future collection capability after authorization, not
+    current collection evidence.
+- Current summary remains unchanged:
+  - `manifest_status = BLOCKED_MISSING_CLEAN_FORWARD_EVIDENCE`;
+  - `known_available_data_can_make_near_deployable = False`;
+  - `known_available_data_deployable_countable_rows = 0`;
+  - `current_artifacts_can_make_near_deployable = False`;
+  - `no_process_action_taken = True`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_remaining_evidence_manifest.py scripts\test_btc1h_remaining_evidence_manifest.py`;
+  - `python -m pytest scripts\test_btc1h_remaining_evidence_manifest.py -q --basetemp .pytest-codex-tmp-btc1h-coverage-blockers`
+    -> `2 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_btc1h_available_data_blockers_latest_codex --start-at btc1h_remaining_evidence_manifest --stop-after gpt_pro_action_status --skip-packet`
+    -> selected read-only refresh passed `6 / 6` steps.
+- Interpretation:
+  this does not improve deployability, but it makes the current no-near-
+  deployable conclusion easier to audit: every available data source now states
+  why it cannot satisfy the original BTC1H objective today.
+
+## 2026-05-22 - BTC1H candidate rows now explain research-only status
+
+- Updated `scripts\build_btc1h_objective_completion_audit.py` so
+  `btc1h_candidate_objective_status.csv` now carries candidate-level evidence
+  classification:
+  - `candidate_research_class`;
+  - `candidate_is_research_only`;
+  - `current_available_data_class`;
+  - `promotion_gate_failures`;
+  - `why_not_near_deployable`;
+  - `next_evidence_to_reconsider`.
+- Current regenerated candidate classes:
+  - `high_conf_80_entry70_no_chase` =
+    `active_forward_control_research_only`, with only
+    `research_plus_official_diagnostic_only` available data;
+  - `high_conf_80_entry59_70_no_chase` =
+    `causal_replay_runner_up_research_only`, with the runner-up still not
+    independent from the active snapshot;
+  - `high_conf_80_no_chase` =
+    `basis_robust_watchlist_research_only`, with no clean forward official
+    validation;
+  - `high_conf_80` =
+    `multi_holdout_historical_promising_research_only`, but still
+    low-priority/rejected despite historical positives.
+- Every candidate row still has:
+  - `promotion_countable_available_data = False`;
+  - `candidate_promotion_evidence_status =
+    NO_PROMOTION_COUNTABLE_AVAILABLE_DATA`;
+  - hard promotion failures across official settlement, execution realism,
+    faithful replay, and clean evidence-clock gates.
+- Current summary remains unchanged:
+  - `objective_complete = False`;
+  - `current_verdict =
+    objective_incomplete_no_deployable_or_near_deployable_btc1h_candidate`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `promising_research_candidates = 3`;
+  - critical blockers remain
+    `official_settlement_gate;execution_realism_gate;faithful_live_replay_gate;clean_evidence_clock_gate`.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py -q --basetemp .pytest-codex-tmp-btc1h-candidate-research-only`
+    -> `1 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status`
+    -> selected read-only refresh passed `7 / 7` steps.
+- Interpretation:
+  this is a reporting and guardrail improvement, not a deployment improvement.
+  The top BTC1H policies are still research-only until future clean-clock rows
+  satisfy official settlement, execution realism, and row-for-row replay gates.
+
+## 2026-05-22 - BTC1H candidate blocker proof now links to source artifacts
+
+- Extended `scripts\build_btc1h_objective_completion_audit.py` again so each
+  `btc1h_candidate_objective_status.csv` row now includes:
+  - `promotion_blocker_evidence_snapshot`, a compact candidate-level proof with
+    available-data status, research rows, official diagnostic rows,
+    near/deployable-countable row counts, forward official rows/PnL,
+    proxy-mismatch rate, replay promotion usability, replay exact-match rate,
+    and hard gate failures;
+  - `promotion_blocker_evidence_sources`, the artifact paths that support that
+    row's blocker verdict.
+- Current active-control proof snapshot:
+  - `available_data_status = RESEARCH_PLUS_OFFICIAL_DIAGNOSTIC_ONLY`;
+  - `near_deployable_countable_rows = 0`;
+  - `deployable_countable_rows = 0`;
+  - `forward_official_rows = 11`;
+  - `forward_official_pnl = 0.5`;
+  - `forward_proxy_mismatch_rate = 0.0909`;
+  - `replay_ledger_promotion_usable = False`;
+  - `replay_ledger_exact_match_rate = 0.818182`;
+  - promotion failures remain official settlement, execution realism, faithful
+    replay, clean evidence clock, and statistical/basis caveats.
+- Source artifacts now listed per row include the multi-holdout candidate gate
+  summary, research-priority matrix, holdout provenance, promotion-gap matrix,
+  official PnL path, execution filter/basis audits, snapshot execution audit,
+  replay coverage, faithful replay data contract, replay repair target/attempt
+  audits, and the next-forward candidate packet run info.
+- Current summary remains unchanged:
+  - `objective_complete = False`;
+  - `deployable_candidates = 0`;
+  - `near_deployable_candidates = 0`;
+  - `promising_research_candidates = 3`;
+  - no current row is promotion-countable or near-deployable-countable.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_objective_completion_audit.py scripts\test_btc1h_objective_completion_audit.py`;
+  - `python -m pytest scripts\test_btc1h_objective_completion_audit.py -q --basetemp .pytest-codex-tmp-btc1h-source-backed-candidate-blockers`
+    -> `1 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status`
+    -> selected read-only refresh passed `7 / 7` steps.
+- Interpretation:
+  this makes the negative BTC1H conclusion easier to audit from a single CSV
+  row per candidate. It still does not create deployable or near-deployable
+  evidence, and no process/start/restart/trading action was taken.
+
+## 2026-05-22 - BTC1H candidate promotion deficits quantified
+
+- Added `scripts\build_btc1h_candidate_promotion_deficit_audit.py` and
+  `scripts\test_btc1h_candidate_promotion_deficit_audit.py`, then wired the
+  new audit into `scripts\refresh_btc_evidence_stack.py` immediately after the
+  objective completion audit.
+- New artifact:
+  `backtest_outputs\btc1h_candidate_promotion_deficit_latest_codex\btc1h_candidate_promotion_deficits.csv`.
+  It quantifies, per candidate:
+  - clean official row deficit versus the `50` row minimum;
+  - whether current data is promotion-countable;
+  - proxy/official mismatch excess versus the `2%` maximum;
+  - execution-field completeness deficit;
+  - replay exact-match deficit and promotion-usable replay modes;
+  - faithful replay missing field counts;
+  - clean policy-identity row deficit;
+  - whether current artifacts can make the candidate near-deployable.
+- Current regenerated summary:
+  - `candidates_current_artifacts_can_make_near_deployable = 0`;
+  - `candidates_with_no_promotion_countable_data = 4`;
+  - `current_clean_post_restart_official_rows = 0`;
+  - `clean_official_row_deficit = 50`;
+  - active `high_conf_80_entry70_no_chase`
+    `active_proxy_official_mismatch_rate_excess = 0.0709`;
+  - active replay exact-match deficit is `0.181818`;
+  - active execution-field completeness deficit under the promotion gate is
+    `1.0`;
+  - faithful replay still has `17` overall missing required fields and `8`
+    unique target-level missing fields.
+- Current candidate deficit blockers:
+  - active `entry70_no_chase` is blocked by no promotion-countable available
+    data, too few clean official rows, mismatch rate above limit, incomplete
+    execution fields, non-promotion-usable row-for-row replay, missing faithful
+    replay capture fields, and missing clean policy identity rows;
+  - the runner-up and watchlist variants additionally have no forward official
+    rows.
+- Validation:
+  - `python -m py_compile scripts\build_btc1h_candidate_promotion_deficit_audit.py scripts\test_btc1h_candidate_promotion_deficit_audit.py scripts\refresh_btc_evidence_stack.py scripts\test_btc_evidence_stack_refresh.py`;
+  - `python -m pytest scripts\test_btc1h_candidate_promotion_deficit_audit.py scripts\test_btc_evidence_stack_refresh.py -q --basetemp .pytest-codex-tmp-btc1h-promotion-deficit`
+    -> `8 passed`;
+  - `python scripts\refresh_btc_evidence_stack.py --out-dir backtest_outputs\btc_evidence_stack_refresh_latest_codex --start-at btc1h_objective_completion_audit --stop-after gpt_pro_action_status`
+    -> selected read-only refresh passed `8 / 8` steps. The refresh now plans
+    `69` total steps and includes `btc1h_candidate_promotion_deficit_audit` as
+    step `62`.
+- Interpretation:
+  this makes the gap to near-deployable explicit and numeric. It does not
+  create promotion evidence: all BTC1H candidates remain research-only under
+  the original official-settlement, execution-realism, faithful-replay, and
+  clean-clock gates.

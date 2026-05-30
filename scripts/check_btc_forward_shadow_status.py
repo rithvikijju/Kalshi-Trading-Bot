@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -55,7 +56,7 @@ TARGETS = [
     {
         "name": "btc15m_q250_qty500_firstskip_yes_shadow",
         "family": "BTC15M",
-        "kind": "paper_shadow_preregistered_not_started",
+        "kind": "paper_shadow",
         "script": "btc15m_f2_q250_qty500_firstskip_yes_shadow.py",
         "engine_script": "btc15m_lowdd_live.py",
         "capture_db": PROJECT_ROOT
@@ -128,9 +129,61 @@ def matching_processes() -> list[dict[str, str]]:
             "pid": str(row.get("ProcessId", "")),
             "created_at_utc": str(row.get("CreationDateUtc", "")),
             "command_line": str(row.get("CommandLine", "")),
+            "process_source": "command_line_snapshot",
         }
         for row in data
     ]
+
+
+def process_from_pid(pid: Any) -> dict[str, str] | None:
+    text = "" if pid is None else str(pid).strip()
+    if not text:
+        return None
+    try:
+        int(text)
+    except ValueError:
+        return None
+    cmd = [
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        f"Get-Process -Id {text} -ErrorAction SilentlyContinue | "
+        "Where-Object { $_.ProcessName -like 'python*' } | "
+        "Select-Object Id,"
+        "@{Name='CreationDateUtc';Expression={ try { $_.StartTime.ToUniversalTime().ToString('o') } catch { '' } }} "
+        "| ConvertTo-Json -Depth 3",
+    ]
+    try:
+        raw = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        return None
+    return {
+        "pid": str(data.get("Id", text)),
+        "created_at_utc": str(data.get("CreationDateUtc", "")),
+        "command_line": "",
+        "process_source": "capture_status_sidecar_pid",
+    }
+
+
+def sidecar_pid_process(path: Path) -> dict[str, str] | None:
+    sidecar = path.with_name(path.name + ".status.json")
+    if not sidecar.exists():
+        return None
+    try:
+        data = json.loads(sidecar.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+    return process_from_pid(data.get("pid"))
 
 
 def process_hygiene(command_matches: list[dict[str, str]]) -> dict[str, Any]:
@@ -163,6 +216,7 @@ def parse_iso_utc(value: str) -> datetime | None:
     text = value.strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
+    text = re.sub(r"(\.\d{6})\d+([+-]\d\d:\d\d)$", r"\1\2", text)
     try:
         ts = datetime.fromisoformat(text)
     except ValueError:
@@ -270,6 +324,7 @@ def load_capture_status_sidecar(path: Path) -> tuple[dict[str, Any], str]:
         {
             "capture_read_source": "sidecar_after_live_lock",
             "capture_sidecar_path": str(sidecar),
+            "capture_sidecar_pid": str(data.get("pid") or ""),
             "capture_sidecar_mtime_utc": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
             "capture_sidecar_updated_at_utc": str(data.get("updated_at_utc") or ""),
             "replay_sidecar_path": replay_sidecar,
@@ -320,6 +375,7 @@ def summarize_duckdb(path: Path, retries: int, sleep_s: float) -> dict[str, Any]
         "capture_error": "",
         "capture_snapshot_error": "",
         "capture_sidecar_path": "",
+        "capture_sidecar_pid": "",
         "capture_sidecar_mtime_utc": "",
         "capture_sidecar_updated_at_utc": "",
         "capture_sidecar_error": "",
@@ -515,6 +571,10 @@ def main() -> int:
     target_scripts = {str(target["script"]) for target in TARGETS}
     for target in TARGETS:
         command_matches = [p for p in processes if target["script"] in p["command_line"]]
+        if not command_matches:
+            sidecar_process = sidecar_pid_process(Path(target["capture_db"]))
+            if sidecar_process is not None:
+                command_matches = [sidecar_process]
         row = {
             "name": target["name"],
             "family": target["family"],
@@ -524,6 +584,7 @@ def main() -> int:
             "running": bool(command_matches),
             "pids": ",".join(p["pid"] for p in command_matches),
             "process_created_at_utc": ",".join(p.get("created_at_utc", "") for p in command_matches),
+            "process_source": ",".join(p.get("process_source", "") for p in command_matches),
         }
         row.update(process_hygiene(command_matches))
         row.update(

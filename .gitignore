@@ -16,6 +16,8 @@ paper_trades.jsonl
 logs/
 backtest_outputs/
 .codex_work/
+.pytest-codex-tmp*/
+runtime/
 gpt_pro_packets/
 docs/gpt_pro_reviews/
 *.duckdb

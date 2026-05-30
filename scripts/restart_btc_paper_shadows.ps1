@@ -49,6 +49,7 @@ $targets = @(
 )
 
 $untouchedProcesses = @("scripts\btc15m_live_capture.py")
+$script:ProcessInspectionWarnings = [System.Collections.Generic.List[string]]::new()
 
 function Normalize-CommandLine {
     param([string]$Text)
@@ -68,20 +69,80 @@ function Test-CommandMatchesScript {
     return ($cmd -like "*$needle*")
 }
 
+function Get-CaptureStatusPathForScript {
+    param([string]$Script)
+    switch ($Script) {
+        "scripts\btc15m_f2_q250_qty500_firstskip_shadow.py" {
+            return (Join-Path $repo ".codex_work\btc15m_f2_q250_qty500_firstskip_shadow\btc15m_f2_q250_qty500_firstskip_shadow_capture.duckdb.status.json")
+        }
+        "scripts\btc15m_f2_q250_qty500_firstskip_yes_shadow.py" {
+            return (Join-Path $repo ".codex_work\btc15m_f2_q250_qty500_firstskip_yes_shadow\btc15m_f2_q250_qty500_firstskip_yes_shadow_capture.duckdb.status.json")
+        }
+        "scripts\btc15m_f2_q1000_yes_shadow.py" {
+            return (Join-Path $repo ".codex_work\btc15m_f2_q1000_yes_shadow\btc15m_f2_q1000_yes_shadow_capture.duckdb.status.json")
+        }
+        "scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py" {
+            return (Join-Path $homeDir ".btc_kalshi_bot\btc_1hr_high_conf80_entry70_no_chase_shadow_capture.duckdb.status.json")
+        }
+        "scripts\btc15m_live_capture.py" {
+            return (Join-Path $homeDir ".btc_kalshi_bot\btc15m_live_capture.duckdb.status.json")
+        }
+        default {
+            return ""
+        }
+    }
+}
+
+function Get-TargetProcessFromStatusSidecar {
+    param([string]$Script)
+    $statusPath = Get-CaptureStatusPathForScript -Script $Script
+    if (-not $statusPath -or -not (Test-Path -LiteralPath $statusPath)) {
+        return @()
+    }
+    try {
+        $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+        $pid = [int]$status.pid
+    } catch {
+        return @()
+    }
+    if ($pid -le 0) {
+        return @()
+    }
+    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    if (-not $proc -or ([string]$proc.ProcessName) -notlike "python*") {
+        return @()
+    }
+    @([pscustomobject][ordered]@{
+        ProcessId = $pid
+        CommandLine = "$Script via capture_status_sidecar"
+        InspectionSource = "capture_status_sidecar_pid"
+    })
+}
+
 function Get-TargetProcesses {
     param([string]$Script)
-    $all = Get-CimInstance Win32_Process -Filter "name = 'python.exe'"
-    @($all | Where-Object { Test-CommandMatchesScript -CommandLine $_.CommandLine -Script $Script })
+    try {
+        $all = Get-CimInstance Win32_Process -Filter "name = 'python.exe'"
+        return @($all | Where-Object { Test-CommandMatchesScript -CommandLine $_.CommandLine -Script $Script })
+    } catch {
+        $script:ProcessInspectionWarnings.Add("Get-CimInstance denied for target process inspection; using capture status sidecar PID fallback for $Script")
+        return @(Get-TargetProcessFromStatusSidecar -Script $Script)
+    }
 }
 
 function Get-MatchingBtcPythonProcesses {
-    $all = Get-CimInstance Win32_Process -Filter "name = 'python.exe'"
-    @($all | Where-Object {
-        $_.CommandLine -like "*Kalshi-Trading-Bot*" -or
-        $_.CommandLine -like "*btc15m*" -or
-        $_.CommandLine -like "*btc_1hr*" -or
-        $_.CommandLine -like "*predexon*"
-    })
+    try {
+        $all = Get-CimInstance Win32_Process -Filter "name = 'python.exe'"
+        return @($all | Where-Object {
+            $_.CommandLine -like "*Kalshi-Trading-Bot*" -or
+            $_.CommandLine -like "*btc15m*" -or
+            $_.CommandLine -like "*btc_1hr*" -or
+            $_.CommandLine -like "*predexon*"
+        })
+    } catch {
+        $script:ProcessInspectionWarnings.Add("Get-CimInstance denied for unmanaged process inspection; unmanaged command-line process list unavailable")
+        return @()
+    }
 }
 
 function Get-UnmanagedMatchingProcesses {
@@ -192,6 +253,7 @@ $plan = [ordered]@{
     unmanaged_matching_process_count = $unmanagedRows.Count
     unmanaged_matching_processes = $unmanagedRows
     unmanaged_process_acknowledgement = [bool]$IUnderstandUnmanagedBtcProcessesRemain
+    process_inspection_warnings = @($script:ProcessInspectionWarnings)
     targets = $planRows
     warning = "This workflow starts/restarts paper shadows only. It does not deploy live trading and intentionally leaves capture-only BTC15M running."
 }
@@ -204,6 +266,11 @@ if ($unmanagedRows.Count -ne 0) {
     Write-Host ""
     Write-Host "Unmanaged matching BTC/Predexon Python processes were found. They are not touched by this restart workflow:"
     $unmanagedRows | Format-Table process_id, command_line -AutoSize
+}
+if ($script:ProcessInspectionWarnings.Count -ne 0) {
+    Write-Host ""
+    Write-Host "Process inspection warnings:"
+    $script:ProcessInspectionWarnings | ForEach-Object { Write-Host "  $_" }
 }
 Write-Host "Plan written to $planPath"
 

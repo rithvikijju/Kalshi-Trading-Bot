@@ -54,6 +54,71 @@ def latest_dirs(prefixes: list[str]) -> list[Path]:
     return out
 
 
+def latest_named_or_prefixed_dirs(names: list[str], prefixes: list[str]) -> Path | None:
+    """Return the freshest existing output dir across stable aliases and timestamped dirs."""
+    candidates: list[Path] = []
+    for name in names:
+        path = BACKTEST_ROOT / name
+        if path.is_dir():
+            candidates.append(path)
+    for prefix in prefixes:
+        match = latest_dir(prefix)
+        if match is not None:
+            candidates.append(match)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def latest_shadow_official_dir() -> Path | None:
+    for name in (
+        "remote_btc_shadow_official_settlement_latest_codex",
+        "btc_shadow_official_settlement_latest_codex",
+    ):
+        path = BACKTEST_ROOT / name
+        if path.is_dir():
+            return path
+    for prefix in ("remote_btc_shadow_official_settlement_", "btc_shadow_official_settlement_"):
+        match = latest_dir(prefix)
+        if match is not None:
+            return match
+    return None
+
+
+def latest_btc1h_multi_holdout_dir() -> Path | None:
+    return latest_named_or_prefixed_dirs(
+        ["btc1h_multi_holdout_research_latest_codex"],
+        ["btc1h_multi_holdout_research_"],
+    )
+
+
+def latest_btc1h_replay_reconciliation_dir() -> Path | None:
+    stable = BACKTEST_ROOT / "btc1h_replay_vs_ledger_reconciliation_latest_codex"
+    if stable.is_dir():
+        return stable
+    candidates: list[Path] = []
+    for path in BACKTEST_ROOT.glob("btc1h_replay_vs_ledger_reconciliation_*"):
+        if path.is_dir() and "selected_scans" not in path.name and "fullscan" not in path.name:
+            candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def latest_btc1h_clean_evidence_clock_dir() -> Path | None:
+    return latest_named_or_prefixed_dirs(
+        ["btc1h_clean_evidence_clock_gate_latest_codex"],
+        ["btc1h_clean_evidence_clock_gate_"],
+    )
+
+
+def latest_btc1h_basis_mismatch_dir() -> Path | None:
+    return latest_named_or_prefixed_dirs(
+        ["btc1h_official_basis_mismatch_audit_latest_codex"],
+        ["btc1h_official_basis_mismatch_audit_"],
+    )
+
+
 def read_csv(path: Path | None) -> pd.DataFrame:
     if path is None or not path.exists():
         return pd.DataFrame()
@@ -368,6 +433,56 @@ def add_btc1h(rows: list[dict[str, Any]], audit_dir: Path | None) -> None:
         )
 
 
+def add_btc1h_multi_holdout(rows: list[dict[str, Any]], df: pd.DataFrame, min_official: int) -> None:
+    """Add the current BTC1H multi-holdout research gate rows to readiness."""
+    if df.empty:
+        return
+    for _, row in df.iterrows():
+        candidate = str(row.get("variant", row.get("candidate", "")))
+        blockers = reason_tokens(row.get("deploy_blockers", ""))
+        official_rows = to_float(row, "forward_official_rows")
+        official_pnl = to_float(row, "forward_official_pnl")
+        mismatch_rate = to_float(row, "forward_official_mismatch_rate", default=float("nan"))
+        reasons: list[str] = []
+        reasons.extend(blockers)
+        if not to_bool(row.get("deployable_now", False)) and not blockers:
+            reasons.append("btc1h_multi_holdout_not_deployable")
+        if official_rows < min_official:
+            reasons.append("too_few_forward_official_rows")
+        if official_pnl <= 0:
+            reasons.append("forward_official_pnl_not_positive")
+        if pd.isna(mismatch_rate) or mismatch_rate > 0:
+            reasons.append("forward_official_proxy_mismatch_not_zero")
+        rows.append(
+            {
+                "family": "BTC1H",
+                "candidate": candidate,
+                "source": "btc1h_multi_holdout_research",
+                "production_ready": to_bool(row.get("deployable_now", False)) and len(set(reasons)) == 0,
+                "failure_reasons": ";".join(sorted(set(reasons))),
+                "pred_trades": row.get("historical_trades", ""),
+                "pred_pnl": row.get("historical_pnl_sum", ""),
+                "live_proxy_trades": "",
+                "live_proxy_pnl": "",
+                "live_official_trades": official_rows,
+                "live_official_pnl": official_pnl,
+                "live_official_win_rate": "",
+                "btc1h_research_status": row.get("research_status", ""),
+                "btc1h_research_promising": to_bool(row.get("research_promising", False)),
+                "btc1h_near_deployable_candidate": to_bool(row.get("near_deployable_candidate", False)),
+                "btc1h_all_positive_holdouts": to_float(row, "all_positive_holdouts"),
+                "btc1h_all_holdouts": to_float(row, "all_holdouts"),
+                "btc1h_ws_positive_cadences": to_float(row, "ws_positive_cadences"),
+                "btc1h_ws_cadences": to_float(row, "ws_cadences"),
+                "btc1h_forward_snapshot_parity_status": row.get("forward_snapshot_parity_status", ""),
+                "btc1h_selected_signal_model_parity_status": row.get("selected_signal_model_parity_status", ""),
+                "btc1h_replay_ledger_promotion_usable": to_bool(row.get("replay_ledger_promotion_usable", False)),
+                "btc1h_replay_ledger_exact_match_rate": to_float(row, "replay_ledger_exact_match_rate"),
+                "btc1h_replay_ledger_blockers": row.get("replay_ledger_blockers", ""),
+            }
+        )
+
+
 def add_shadow_official(
     rows: list[dict[str, Any]],
     df: pd.DataFrame,
@@ -593,6 +708,88 @@ def frozen_policy_reasons(row: pd.Series | None) -> tuple[list[str], dict[str, A
     return reasons, values
 
 
+def policy_epoch_reasons(
+    policy_df: pd.DataFrame,
+    ledger: str,
+    *,
+    expected_ttl_policy: str,
+    expected_policy_version: str,
+    min_official_rows: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Require forward official rows to belong to the expected model-policy epoch."""
+    if policy_df.empty:
+        return ["shadow_official_policy_summary_missing"], {}
+    required = {"ledger", "scope", "model_ttl_policy", "model_policy_version", "official_filled_rows"}
+    if not required.issubset(set(policy_df.columns)):
+        missing = sorted(required - set(policy_df.columns))
+        return ["shadow_official_policy_summary_missing_fields"], {
+            "shadow_official_policy_missing_fields": ";".join(missing),
+        }
+
+    ledger_rows = policy_df[policy_df["ledger"].astype(str).eq(ledger)].copy()
+    if ledger_rows.empty:
+        return ["shadow_official_policy_ledger_missing"], {
+            "shadow_official_policy_status": "MISSING_LEDGER",
+        }
+
+    scoped = ledger_rows[ledger_rows["scope"].astype(str).str.lower().eq("since")].copy()
+    if scoped.empty:
+        scoped = ledger_rows
+
+    expected = scoped[
+        scoped["model_ttl_policy"].fillna("").astype(str).eq(expected_ttl_policy)
+        & scoped["model_policy_version"].fillna("").astype(str).eq(expected_policy_version)
+    ].copy()
+    blank_rows = scoped[
+        scoped["model_ttl_policy"].fillna("").astype(str).str.strip().eq("")
+        | scoped["model_policy_version"].fillna("").astype(str).str.strip().eq("")
+    ].copy()
+
+    reasons: list[str] = []
+    values: dict[str, Any] = {
+        "shadow_official_expected_model_ttl_policy": expected_ttl_policy,
+        "shadow_official_expected_model_policy_version": expected_policy_version,
+        "shadow_official_policy_blank_rows": float(
+            pd.to_numeric(blank_rows.get("official_filled_rows", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+        ),
+    }
+    if expected.empty:
+        values.update(
+            {
+                "shadow_official_policy_status": "EXPECTED_POLICY_MISSING",
+                "shadow_official_policy_official_rows": 0.0,
+                "shadow_official_policy_official_pnl": 0.0,
+                "shadow_official_policy_proxy_mismatches": 0.0,
+            }
+        )
+        reasons.append("shadow_official_expected_policy_missing")
+    else:
+        official_rows = float(pd.to_numeric(expected["official_filled_rows"], errors="coerce").fillna(0).sum())
+        official_pnl = float(pd.to_numeric(expected.get("official_pnl", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        mismatches = float(
+            pd.to_numeric(expected.get("official_proxy_result_mismatches", pd.Series(dtype=float)), errors="coerce")
+            .fillna(0)
+            .sum()
+        )
+        values.update(
+            {
+                "shadow_official_policy_status": "EXPECTED_POLICY_PRESENT",
+                "shadow_official_policy_official_rows": official_rows,
+                "shadow_official_policy_official_pnl": official_pnl,
+                "shadow_official_policy_proxy_mismatches": mismatches,
+            }
+        )
+        if official_rows < min_official_rows:
+            reasons.append("shadow_official_expected_policy_too_few_official_rows")
+        if official_pnl <= 0:
+            reasons.append("shadow_official_expected_policy_pnl_not_positive")
+        if mismatches > 0:
+            reasons.append("shadow_official_expected_policy_proxy_official_mismatch")
+    if values["shadow_official_policy_blank_rows"] > 0:
+        reasons.append("shadow_official_blank_policy_rows_present")
+    return reasons, values
+
+
 def source_freshness_reasons(row: pd.Series | None) -> tuple[list[str], dict[str, Any]]:
     if row is None:
         return ["shadow_source_freshness_status_missing"], {}
@@ -807,6 +1004,133 @@ def apply_settlement_basis_gates(summary: pd.DataFrame, basis_gates: pd.DataFram
     return summary
 
 
+def btc1h_clean_evidence_clock_reasons(
+    df: pd.DataFrame,
+    *,
+    min_official_rows: int,
+) -> tuple[list[str], dict[str, Any]]:
+    if df.empty:
+        return ["btc1h_clean_evidence_clock_gate_missing"], {}
+    row = df.iloc[0]
+    ready = to_bool(row.get("clean_evidence_clock_ready", False))
+    gate_status = as_text(row.get("gate_status", ""))
+    values = {
+        "btc1h_clean_evidence_clock_status": gate_status,
+        "btc1h_clean_evidence_clock_ready": ready,
+        "btc1h_clean_evidence_clock_next_action": as_text(row.get("next_action", "")),
+        "btc1h_clean_evidence_clock_blocker_count": to_float(row, "blocker_count"),
+        "btc1h_clean_clock_sidecar_signal_missing_fields": as_text(row.get("sidecar_signal_missing_fields", "")),
+        "btc1h_clean_clock_sidecar_order_missing_fields": as_text(
+            row.get("sidecar_order_decision_missing_fields", "")
+        ),
+        "btc1h_clean_clock_expected_policy_official_rows": to_float(row, "expected_policy_official_rows"),
+        "btc1h_clean_clock_blank_policy_official_rows": to_float(row, "blank_policy_official_rows"),
+        "btc1h_clean_clock_official_rows": to_float(row, "official_rows"),
+        "btc1h_clean_clock_official_pnl": to_float(row, "official_pnl"),
+        "btc1h_clean_clock_proxy_official_mismatches": to_float(row, "official_proxy_mismatches"),
+        "btc1h_clean_clock_captured_ttl_available_rows": to_float(row, "captured_ttl_available_rows"),
+        "btc1h_clean_clock_selected_signal_rows": to_float(row, "selected_signal_rows"),
+        "btc1h_clean_clock_replay_ledger_promotion_usable": to_bool(row.get("replay_ledger_promotion_usable", False)),
+    }
+    reasons: list[str] = []
+    if not ready:
+        reasons.append("btc1h_clean_evidence_clock_not_ready")
+    if gate_status == "BLOCKED_CONTROLLED_RESTART_REQUIRED":
+        reasons.append("btc1h_controlled_restart_required_for_clean_evidence_clock")
+    if values["btc1h_clean_clock_sidecar_signal_missing_fields"]:
+        reasons.append("btc1h_clean_clock_sidecar_model_inputs_missing")
+    if values["btc1h_clean_clock_sidecar_order_missing_fields"]:
+        reasons.append("btc1h_clean_clock_sidecar_order_policy_fields_missing")
+    if values["btc1h_clean_clock_expected_policy_official_rows"] <= 0:
+        reasons.append("btc1h_clean_clock_expected_policy_rows_missing")
+    if values["btc1h_clean_clock_blank_policy_official_rows"] > 0:
+        reasons.append("btc1h_clean_clock_blank_policy_rows_present")
+    if values["btc1h_clean_clock_captured_ttl_available_rows"] < values["btc1h_clean_clock_selected_signal_rows"]:
+        reasons.append("btc1h_clean_clock_captured_ttl_missing")
+    if not values["btc1h_clean_clock_replay_ledger_promotion_usable"]:
+        reasons.append("btc1h_clean_clock_replay_not_promotion_usable")
+    if values["btc1h_clean_clock_official_rows"] < min_official_rows:
+        reasons.append("btc1h_clean_clock_too_few_official_rows")
+    if values["btc1h_clean_clock_official_pnl"] <= 0:
+        reasons.append("btc1h_clean_clock_official_pnl_not_positive")
+    if values["btc1h_clean_clock_proxy_official_mismatches"] > 0:
+        reasons.append("btc1h_clean_clock_proxy_official_mismatch_present")
+    return reasons, values
+
+
+def apply_btc1h_clean_evidence_clock_gate(
+    summary: pd.DataFrame,
+    clean_clock_df: pd.DataFrame,
+    *,
+    min_official_rows: int,
+) -> pd.DataFrame:
+    if summary.empty:
+        return summary
+    reasons, values = btc1h_clean_evidence_clock_reasons(clean_clock_df, min_official_rows=min_official_rows)
+    mask = candidate_mask(summary, exact="high_conf_80_entry70_no_chase") | candidate_mask(
+        summary, prefix="btc1h_high_conf80_entry70_no_chase_shadow:"
+    )
+    apply_reason_blockers(summary, mask, reasons, values)
+    return summary
+
+
+def btc1h_basis_mismatch_reasons(
+    df: pd.DataFrame,
+    *,
+    min_official_rows: int,
+) -> tuple[list[str], dict[str, Any]]:
+    if df.empty:
+        return ["btc1h_basis_mismatch_audit_missing"], {}
+    row = df.iloc[0]
+    audit_status = as_text(row.get("audit_status", ""))
+    deployable_guard = to_bool(row.get("deployable_guard_now", False))
+    values = {
+        "btc1h_basis_audit_status": audit_status,
+        "btc1h_basis_deployable_guard_now": deployable_guard,
+        "btc1h_basis_guard_recommendation": as_text(row.get("guard_recommendation", "")),
+        "btc1h_basis_official_rows": to_float(row, "official_rows"),
+        "btc1h_basis_official_pnl": to_float(row, "official_pnl"),
+        "btc1h_basis_proxy_pnl": to_float(row, "proxy_pnl"),
+        "btc1h_basis_official_minus_proxy_pnl": to_float(row, "official_minus_proxy_pnl"),
+        "btc1h_basis_official_proxy_mismatches": to_float(row, "official_proxy_mismatches"),
+        "btc1h_basis_official_proxy_mismatch_rate": to_float(row, "official_proxy_mismatch_rate"),
+        "btc1h_basis_proxy_win_official_loss_flips": to_float(row, "proxy_win_official_loss_flips"),
+        "btc1h_basis_near_proxy_boundary_rows": to_float(row, "near_proxy_boundary_rows"),
+        "btc1h_basis_near_official_boundary_rows": to_float(row, "near_official_boundary_rows"),
+        "btc1h_basis_p95_abs_basis_usd": to_float(row, "p95_abs_official_minus_proxy_spot"),
+        "btc1h_basis_max_abs_basis_usd": to_float(row, "max_abs_official_minus_proxy_spot"),
+        "btc1h_basis_max_adverse_basis_usd": to_float(row, "max_adverse_basis_usd"),
+    }
+    reasons: list[str] = []
+    if values["btc1h_basis_official_rows"] < min_official_rows:
+        reasons.append("btc1h_basis_too_few_official_rows")
+    if values["btc1h_basis_official_proxy_mismatches"] > 0:
+        reasons.append("btc1h_basis_proxy_official_mismatch_present")
+    if values["btc1h_basis_proxy_win_official_loss_flips"] > 0:
+        reasons.append("btc1h_basis_proxy_win_official_loss_flip")
+    if not deployable_guard:
+        reasons.append("btc1h_basis_guard_not_deployable")
+    if "TOO_FEW_OFFICIAL_ROWS" in audit_status:
+        reasons.append("btc1h_basis_audit_too_few_official_rows")
+    return reasons, values
+
+
+def apply_btc1h_basis_mismatch_audit(
+    summary: pd.DataFrame,
+    basis_df: pd.DataFrame,
+    *,
+    min_official_rows: int,
+) -> pd.DataFrame:
+    if summary.empty:
+        return summary
+    reasons, values = btc1h_basis_mismatch_reasons(basis_df, min_official_rows=min_official_rows)
+    mask = candidate_mask(summary, exact="high_conf_80_entry70_no_chase") | candidate_mask(
+        summary, prefix="btc1h_high_conf80_entry70_no_chase_shadow:"
+    )
+    apply_reason_blockers(summary, mask, reasons, values)
+    return summary
+
+
 def checklist_passes(df: pd.DataFrame, check: str, column: str = "passes_for_evidence_clock") -> bool:
     row = first_row(df, "check", check)
     if row is None:
@@ -886,10 +1210,14 @@ def apply_execution_and_schema_gates(
     shadow_status_df: pd.DataFrame | None = None,
     frozen_policy_df: pd.DataFrame | None = None,
     basis_gates_df: pd.DataFrame | None = None,
+    shadow_official_policy_df: pd.DataFrame | None = None,
     post_restart_verification_info: dict[str, Any] | None = None,
     post_restart_verification_checklist_df: pd.DataFrame | None = None,
     post_restart_target_df: pd.DataFrame | None = None,
     shadow_status_info: dict[str, Any] | None = None,
+    btc1h_expected_ttl_policy: str = "",
+    btc1h_expected_policy_version: str = "",
+    min_live_official_trades: int = 30,
 ) -> pd.DataFrame:
     """Fold execution realism and live ledger schema audits into readiness rows.
 
@@ -904,6 +1232,8 @@ def apply_execution_and_schema_gates(
         shadow_status_df = pd.DataFrame()
     if frozen_policy_df is None:
         frozen_policy_df = pd.DataFrame()
+    if shadow_official_policy_df is None:
+        shadow_official_policy_df = pd.DataFrame()
     if post_restart_verification_checklist_df is None:
         post_restart_verification_checklist_df = pd.DataFrame()
     if post_restart_target_df is None:
@@ -996,6 +1326,16 @@ def apply_execution_and_schema_gates(
             post_restart_target_df,
             ledger=ledger,
         )
+        policy_blockers: list[str] = []
+        policy_values: dict[str, Any] = {}
+        if ledger == "btc1h_high_conf80_entry70_no_chase_shadow":
+            policy_blockers, policy_values = policy_epoch_reasons(
+                shadow_official_policy_df,
+                ledger,
+                expected_ttl_policy=btc1h_expected_ttl_policy,
+                expected_policy_version=btc1h_expected_policy_version,
+                min_official_rows=min_live_official_trades,
+            )
         mask = masks[0].copy()
         for next_mask in masks[1:]:
             mask |= next_mask
@@ -1007,13 +1347,15 @@ def apply_execution_and_schema_gates(
             + post_restart_blockers
             + frozen_policy_blockers
             + source_freshness_blockers
-            + verifier_blockers,
+            + verifier_blockers
+            + policy_blockers,
             exec_values
             | schema_values
             | post_restart_values
             | frozen_policy_values
             | source_freshness_values
-            | verifier_values,
+            | verifier_values
+            | policy_values,
         )
 
     reconciliation_specs = [
@@ -1064,6 +1406,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-pred-trades", type=int, default=50)
     p.add_argument("--min-live-proxy-trades", type=int, default=50)
     p.add_argument("--min-live-official-trades", type=int, default=30)
+    p.add_argument("--btc1h-expected-model-ttl-policy", default="scan_time_close_minus_now_v1")
+    p.add_argument("--btc1h-expected-model-policy-version", default="btc1h_live_model_20260522_scan_ttl_v1")
     p.add_argument("--credentials-env", type=Path, default=PROJECT_ROOT / "credentials.env")
     return p.parse_args()
 
@@ -1084,7 +1428,11 @@ def main() -> int:
         ]
     )
     btc1h_dir = latest_dir("btc1h_promotion_gate_audit_")
-    shadow_official_dir = latest_dir("btc_shadow_official_settlement_")
+    btc1h_multi_holdout_dir = latest_btc1h_multi_holdout_dir()
+    btc1h_replay_reconciliation_dir = latest_btc1h_replay_reconciliation_dir()
+    btc1h_clean_evidence_clock_dir = latest_btc1h_clean_evidence_clock_dir()
+    btc1h_basis_mismatch_dir = latest_btc1h_basis_mismatch_dir()
+    shadow_official_dir = latest_shadow_official_dir()
     execution_realism_dir = latest_dir("btc_execution_realism_audit_")
     ledger_schema_dir = latest_dir("btc_ledger_schema_preflight_")
     post_restart_dir = latest_dir("btc_post_restart_collection_gate_")
@@ -1119,6 +1467,11 @@ def main() -> int:
     )
     add_btc15m_latest_live_replay(rows, latest_live_replay_dirs, args.min_live_official_trades)
     add_btc1h(rows, btc1h_dir)
+    add_btc1h_multi_holdout(
+        rows,
+        read_csv(btc1h_multi_holdout_dir / "btc1h_candidate_gate_summary.csv" if btc1h_multi_holdout_dir else None),
+        args.min_live_official_trades,
+    )
     add_shadow_official(
         rows,
         read_csv(shadow_official_dir / "shadow_official_summary.csv" if shadow_official_dir else None),
@@ -1148,10 +1501,32 @@ def main() -> int:
         read_csv(shadow_status_dir / "shadow_status.csv" if shadow_status_dir else None),
         read_csv(frozen_policy_dir / "frozen_policy_parity_summary.csv" if frozen_policy_dir else None),
         read_csv(basis_risk_dir / "settlement_basis_risk_gates.csv" if basis_risk_dir else None),
+        read_csv(shadow_official_dir / "shadow_official_policy_summary.csv" if shadow_official_dir else None),
         read_json(post_restart_verification_dir / "run_info.json" if post_restart_verification_dir else None),
         read_csv(post_restart_verification_dir / "post_restart_verification_checklist.csv" if post_restart_verification_dir else None),
         read_csv(post_restart_verification_dir / "post_restart_target_status.csv" if post_restart_verification_dir else None),
         shadow_status_info,
+        args.btc1h_expected_model_ttl_policy,
+        args.btc1h_expected_model_policy_version,
+        args.min_live_official_trades,
+    )
+    summary = apply_btc1h_clean_evidence_clock_gate(
+        summary,
+        read_csv(
+            btc1h_clean_evidence_clock_dir / "btc1h_clean_evidence_clock_summary.csv"
+            if btc1h_clean_evidence_clock_dir
+            else None
+        ),
+        min_official_rows=args.min_live_official_trades,
+    )
+    summary = apply_btc1h_basis_mismatch_audit(
+        summary,
+        read_csv(
+            btc1h_basis_mismatch_dir / "btc1h_basis_mismatch_summary.csv"
+            if btc1h_basis_mismatch_dir
+            else None
+        ),
+        min_official_rows=args.min_live_official_trades,
     )
     summary["production_ready"] = summary["production_ready"].astype(bool)
     summary = summary.sort_values(
@@ -1169,6 +1544,16 @@ def main() -> int:
         "rest_official_dir": str(rest_dir.relative_to(PROJECT_ROOT)) if rest_dir else "",
         "latest_live_replay_dirs": [str(path.relative_to(PROJECT_ROOT)) for path in latest_live_replay_dirs],
         "btc1h_gate_dir": str(btc1h_dir.relative_to(PROJECT_ROOT)) if btc1h_dir else "",
+        "btc1h_multi_holdout_dir": str(btc1h_multi_holdout_dir.relative_to(PROJECT_ROOT)) if btc1h_multi_holdout_dir else "",
+        "btc1h_replay_reconciliation_dir": str(btc1h_replay_reconciliation_dir.relative_to(PROJECT_ROOT))
+        if btc1h_replay_reconciliation_dir
+        else "",
+        "btc1h_clean_evidence_clock_dir": str(btc1h_clean_evidence_clock_dir.relative_to(PROJECT_ROOT))
+        if btc1h_clean_evidence_clock_dir
+        else "",
+        "btc1h_basis_mismatch_audit_dir": str(btc1h_basis_mismatch_dir.relative_to(PROJECT_ROOT))
+        if btc1h_basis_mismatch_dir
+        else "",
         "shadow_official_dir": str(shadow_official_dir.relative_to(PROJECT_ROOT)) if shadow_official_dir else "",
         "execution_realism_dir": str(execution_realism_dir.relative_to(PROJECT_ROOT)) if execution_realism_dir else "",
         "ledger_schema_dir": str(ledger_schema_dir.relative_to(PROJECT_ROOT)) if ledger_schema_dir else "",
@@ -1187,6 +1572,8 @@ def main() -> int:
         "min_pred_trades": args.min_pred_trades,
         "min_live_proxy_trades": args.min_live_proxy_trades,
         "min_live_official_trades": args.min_live_official_trades,
+        "btc1h_expected_model_ttl_policy": args.btc1h_expected_model_ttl_policy,
+        "btc1h_expected_model_policy_version": args.btc1h_expected_model_policy_version,
         "cf_benchmarks_credentials_present": cf_present,
         "production_ready_count": int(summary["production_ready"].sum()),
     }
@@ -1207,6 +1594,10 @@ def main() -> int:
         f"- BTC15M materialized first-signal grid: `{out_info['materialized_grid_dir']}`",
         f"- REST official fill: `{out_info['rest_official_dir']}`",
         f"- BTC1H gate: `{out_info['btc1h_gate_dir']}`",
+        f"- BTC1H multi-holdout gate: `{out_info['btc1h_multi_holdout_dir']}`",
+        f"- BTC1H replay-vs-ledger reconciliation: `{out_info['btc1h_replay_reconciliation_dir']}`",
+        f"- BTC1H clean evidence clock gate: `{out_info['btc1h_clean_evidence_clock_dir']}`",
+        f"- BTC1H official basis/mismatch audit: `{out_info['btc1h_basis_mismatch_audit_dir']}`",
         f"- Shadow official ledger audit: `{out_info['shadow_official_dir']}`",
         f"- Execution-realism audit: `{out_info['execution_realism_dir']}`",
         f"- Shadow ledger schema preflight: `{out_info['ledger_schema_dir']}`",
@@ -1218,6 +1609,7 @@ def main() -> int:
         f"- Unmanaged matching BTC processes: `{out_info['process_hygiene_unmanaged_matching_process_count']}`",
         f"- Frozen wrapper policy parity: `{out_info['frozen_policy_parity_dir']}`",
         f"- Settlement-basis risk gate: `{out_info['settlement_basis_risk_dir']}`",
+        f"- BTC1H expected model policy: `{args.btc1h_expected_model_policy_version}` / `{args.btc1h_expected_model_ttl_policy}`",
         f"- CF Benchmarks credentials present: `{cf_present}`",
         "",
         "## Summary",
@@ -1233,7 +1625,7 @@ def main() -> int:
             "historical Predexon evidence where applicable. It also requires "
             "passing execution-realism, live paper-ledger schema checks, "
             "running-source freshness, paper-vs-replay reconciliation, "
-            "and settlement-basis gates. "
+            "BTC1H model-policy and clean evidence-clock gates, and settlement-basis gates. "
             "Proxy-only profitability is not sufficient."
         ),
     ]
