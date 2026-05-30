@@ -1423,7 +1423,7 @@ class LiveCaptureWriter:
             log.debug("capture status sidecar write failed: %r", exc)
 
     def _write_replay_sidecar_rows(self, table: str, rows: list[dict[str, Any]]) -> None:
-        if table not in {"ws_orderbook_top", "signal_scan", "order_decision", "ws_lifecycle"} or not rows:
+        if table not in {"ws_orderbook_top", "signal_scan", "order_decision", "ws_lifecycle", "coinbase_ticker"} or not rows:
             return
         try:
             with self.replay_sidecar_path.open("a", encoding="utf-8") as f:

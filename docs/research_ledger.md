@@ -16062,3 +16062,32 @@ artifacts:
   PowerShell parser checks passed for
   `start_btc_remote_collectors.ps1`, `stop_btc_remote_collectors.ps1`,
   `ensure_btc_remote_collectors.ps1`, and `status_btc_remote_collectors.ps1`.
+
+### 2026-05-30 - Raw Coinbase replay sidecar fidelity patch
+
+- Fixed the main future-data blocker from the `06:40Z..11:18Z` sidecar audit:
+  lock-free materialized sidecar slices had to synthesize `coinbase_ticker`
+  from `ws_orderbook_top.btc_spot`, so they could not prove promotion-grade BTC
+  tick age. The DuckDB writer already stored raw `coinbase_ticker` rows, and
+  `materialize_btc_replay_sidecar.py` already preserved raw Coinbase rows when
+  present. The missing piece was the replay-sidecar allowlist.
+- Updated `scripts\btc_1hr_research_live.py` so `LiveCaptureWriter` appends
+  `coinbase_ticker` rows to `.replay.jsonl` alongside `ws_orderbook_top`,
+  `ws_lifecycle`, `signal_scan`, and `order_decision`.
+- Added `scripts\test_btc_capture_writer_replay_sidecar.py` to prove the
+  writer emits raw Coinbase rows into both the DuckDB table and replay sidecar,
+  and records `replay_sidecar_rows_by_table.coinbase_ticker` in the status
+  sidecar.
+- Validation:
+  `python -m pytest scripts\test_btc_capture_writer_replay_sidecar.py
+  scripts\test_btc_replay_sidecar_materialization.py -q --basetemp
+  .pytest-codex-tmp-coinbase-sidecar` passed with `4` tests.
+  `python -m py_compile scripts\btc_1hr_research_live.py
+  scripts\test_btc_capture_writer_replay_sidecar.py
+  scripts\materialize_btc_replay_sidecar.py
+  scripts\test_btc_replay_sidecar_materialization.py` passed.
+- Interpretation:
+  existing replay sidecars before this code reaches a restarted collector remain
+  research-only for Coinbase tick-age evidence. Future sidecar materializations
+  after a controlled restart can be audited for raw Coinbase tick coverage
+  without pausing the live DuckDB writer.
