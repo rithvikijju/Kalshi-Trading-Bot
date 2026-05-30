@@ -15057,3 +15057,42 @@ artifacts:
   research-only: the full replay bootstrap lower tail crosses zero, the profit
   probability is below a `95%` robustness gate, and the forward sample is far
   below a reasonable promotion count.
+
+### 2026-05-30 - Lowdd paper fill replay parity audit
+
+- Added `scripts/audit_btc15m_lowdd_paper_replay_parity.py` and
+  `scripts/test_btc15m_lowdd_paper_replay_parity.py`.
+- Materialized the lowdd replay sidecar for
+  `2026-05-30T07:00:00Z..2026-05-30T08:20:00Z` into ignored remote runtime:
+  `runtime\sidecar_slices\btc15m_lowdd_20260530_0700_0820.duckdb`.
+  Counts: `106,109` top-book rows, `6,638` lifecycle rows, `49,590` signal
+  scans, `3` order decisions, and `101,985` synthetic Coinbase rows from
+  top-book `btc_spot`. This is wrapper-parity evidence, not promotion-grade
+  raw Coinbase tick-age replay.
+- Offline generic replay on that slice:
+  `current_lowdd_no_rv` had `3` trades across the three post-restart events,
+  single-contract PnL `+$0.42`, return on premium `26.58%`, win rate
+  `66.67%`, max drawdown `-$0.25`.
+- The row-level paper/sidecar/replay parity audit output is:
+  `runtime\remote_backtests\btc15m_lowdd_paper_replay_parity_20260530_0700_0820`.
+- Paper ledger versus live sidecar:
+  all `3 / 3` post-restart paper fills had matching `signal_scan` selected rows
+  and `order_decision` paper-fill rows with exact entry-price parity:
+  - id `13`: paper `0.55`, signal `0.55`, order `0.55`;
+  - id `14`: paper `0.23`, signal `0.23`, order `0.23`;
+  - id `15`: paper `0.65`, signal `0.65`, order `0.65`.
+- Paper ledger versus generic replay:
+  ids `13` and `14` matched the generic replay price exactly, but id `15`
+  did not: paper/live sidecar entry was `0.65`, while the generic offline
+  `current_lowdd_no_rv` replay row for the same event/market/side used `0.74`.
+  Verdict counts:
+  `2` `full_live_and_generic_replay_parity_pass`, `1`
+  `live_sidecar_parity_pass_generic_replay_price_mismatch`.
+- Interpretation:
+  the running paper wrapper is producing faithful sidecar signal/order rows, so
+  fresh paper fills can count for the post-restart forward-evidence clock.
+  However, the generic `backtest_btc15m_live_holdout.py` lowdd rule is not
+  perfectly policy-equivalent to the live wrapper on every row. Use the live
+  sidecar selected/order rows as the authoritative replay-parity check for
+  post-restart paper fills; treat generic replay summaries as conservative
+  diagnostics unless row-level price parity passes.
