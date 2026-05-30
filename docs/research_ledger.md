@@ -16694,3 +16694,46 @@ artifacts:
   `python -m py_compile scripts\build_btc15m_research_candidate_screen.py`
   passed. This screen is a reporting/research-control tool only; it does not
   alter any live or paper process.
+
+### 2026-05-30 - LightGBM non-trading sidecar preregistration
+
+- Added `scripts\build_btc15m_ml_sidecar_preregistration.py` and focused tests
+  in `scripts\test_btc15m_ml_sidecar_preregistration.py`.
+  The script freezes the `lightgbm_tabular` candidate as a diagnostic metric
+  only. It does not start a process, submit orders, write paper orders, tune
+  thresholds, or let old rows count as forward evidence.
+- Fresh packet artifact:
+  `backtest_outputs\btc15m_ml_sidecar_preregistration_20260530_1215`.
+  Freeze status:
+  `FROZEN_NON_TRADING_FORWARD_METRIC` for
+  `btc15m_lightgbm_tabular_nontrading_sidecar`.
+- Frozen model contract:
+  model artifact
+  `backtest_outputs\btc15m_april_top_models_20260514_clean\lightgbm_tabular.pkl`,
+  SHA256
+  `492c51f924472b5510c16e7113f5972c01290d3e89e251b69597cad7ff8cdcb6`,
+  `67` model features, validation gate `pred_win_prob >= 0.82` and
+  `pred_ev >= 0.20`. Selection policy is first selected row per event after
+  executable side-candidate scoring.
+- Forward scoring contract:
+  evaluate only from raw websocket capture using `received_at_ns`,
+  causal Coinbase as-of joins, executable side asks, spread `<= 2c`, visible
+  quantity `>= 1`, TTL `0..15m`, entry `1c..99c`, and BTC spot age `<= 90s`.
+  Kalshi REST official settlement is required for counted rows; proxy labels
+  remain diagnostic only.
+- Current evidence and blockers:
+  the full-raw ML grid has `48` clean proxy rows, proxy 2c PnL `+$3.00`,
+  `5` official-subset rows, official 2c PnL `+$1.37`, proxy win rate `62.5%`,
+  and official-subset win rate `80%`. The packet keeps deployment blocked by
+  `official_rows_below_forward_review_min` and
+  `clean_proxy_rows_below_forward_review_min`. This is not a paper-ordering
+  shadow and should be scored on future raw-capture snapshots before any
+  paper/live process is discussed.
+- Validation:
+  `python scripts\build_btc15m_ml_sidecar_preregistration.py --out-dir backtest_outputs\btc15m_ml_sidecar_preregistration_20260530_1215`
+  ran successfully. `python -m py_compile scripts\build_btc15m_ml_sidecar_preregistration.py scripts\test_btc15m_ml_sidecar_preregistration.py`
+  passed. `python -m pytest scripts\test_btc15m_ml_sidecar_preregistration.py -q --basetemp .pytest-codex-tmp-ml-sidecar`
+  passed with `2` tests. A plain pytest run without `--basetemp` hit the
+  machine-local Windows temp permission issue
+  `PermissionError: C:\Users\ahmed\AppData\Local\Temp\pytest-of-ahmed`; the
+  repo-local rerun passed.
