@@ -134,6 +134,15 @@ $statusPaths = @(
 $sidecars = @($statusPaths | ForEach-Object { Read-StatusSidecar -Path $_ })
 $allProcessesRunning = $status -and $status.status -eq "ALL_RUNNING"
 $allSidecarsFresh = ($sidecars | Where-Object { $_.fresh }).Count -eq $sidecars.Count
+$unsafeSupervisionRows = @()
+if ($status -and $status.rows) {
+    $unsafeSupervisionRows = @(
+        $status.rows | Where-Object {
+            [string]$_.task_supervision_status -eq "PROCESS_RUNNING_TASK_NOT_RUNNING"
+        }
+    )
+}
+$hasProcessRunningTaskNotRunning = $unsafeSupervisionRows.Count -gt 0
 $allProcessesInStartupGrace = $false
 if ($allProcessesRunning -and $status.rows) {
     $runningRows = @($status.rows)
@@ -152,7 +161,14 @@ if ($allProcessesRunning -and $status.rows) {
 
 $action = "noop"
 $startResult = $null
-if (!$allProcessesRunning -or (!$allSidecarsFresh -and !$allProcessesInStartupGrace)) {
+$restartBlockedReason = ""
+if ($hasProcessRunningTaskNotRunning) {
+    $action = "blocked_process_running_task_not_running"
+    $restartBlockedReason = (
+        "One or more collectors are live but their scheduled task is not running; " +
+        "not restarting because that could create duplicate writers against a locked DB."
+    )
+} elseif (!$allProcessesRunning -or (!$allSidecarsFresh -and !$allProcessesInStartupGrace)) {
     $action = "restart_collectors"
     $startResult = & (Join-Path $PSScriptRoot "start_btc_remote_collectors.ps1") -RepoRoot $RepoRoot | Out-String
     Start-Sleep -Seconds 10
@@ -167,6 +183,8 @@ $result = [pscustomobject]@{
     watchdog = $watchdog
     process_status = $status
     sidecar_status = $sidecars
+    restart_blocked_reason = $restartBlockedReason
+    unsafe_supervision_rows = $unsafeSupervisionRows
     start_result = $startResult
 }
 $resultPath = Join-Path $runtimeDir "btc_collectors_ensure_latest.json"

@@ -15322,3 +15322,37 @@ artifacts:
   alive, but not task-supervised. Do not use `schtasks /Run` or
   `ensure_btc_remote_collectors.ps1` casually while PID `6084` is still holding
   the raw DB, because that could attempt to start a duplicate writer.
+
+### 2026-05-30 - Collector ensure unsafe-restart guard
+
+- Patched `scripts/ensure_btc_remote_collectors.ps1` so it checks the new
+  `task_supervision_status` rows before deciding to restart collectors.
+- New behavior:
+  if any row reports `PROCESS_RUNNING_TASK_NOT_RUNNING`, `ensure` returns
+  `action = blocked_process_running_task_not_running`, includes
+  `unsafe_supervision_rows`, and does not call
+  `start_btc_remote_collectors.ps1`.
+- Local validation:
+  both `ensure_btc_remote_collectors.ps1` and `status_btc_remote_collectors.ps1`
+  parsed with `[scriptblock]::Create(...)`.
+- Remote validation:
+  deployed only the patched `ensure` and `status` scripts to the laptop working
+  copy, then ran:
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+  C:\Users\ClawService\Kalshi-Trading-Bot\scripts\ensure_btc_remote_collectors.ps1
+  -RepoRoot C:\Users\ClawService\Kalshi-Trading-Bot`.
+- Remote output:
+  `action = blocked_process_running_task_not_running`,
+  `restart_blocked_reason` explicitly says a live collector has a non-running
+  task and restart could create duplicate locked-DB writers, and
+  `start_result = null`.
+- The blocked row is the raw BTC15M capture:
+  PID `6084`, process source `capture_status_sidecar`, task
+  `KalshiBTC_btc15m_live_capture`, `task_runtime_status = Ready`, row-level
+  `task_supervision_status = PROCESS_RUNNING_TASK_NOT_RUNNING`.
+- The raw sidecar remained fresh during the `ensure` check:
+  status age about `4s`, `dropped = 0`, `queue_depth = 0`.
+- Interpretation:
+  the watchdog/ensure path is now safer in the current laptop state. It will
+  not automatically start a duplicate raw capture while the unsupervised PID is
+  alive and holding the active DuckDB.
