@@ -79,6 +79,26 @@ function Read-FreshCaptureStatusPid {
     }
 }
 
+function Get-TargetArgs {
+    param([hashtable]$Target)
+    if ($Target.ContainsKey("args") -and $Target.args) {
+        return @($Target.args)
+    }
+    return @()
+}
+
+function ConvertTo-PowerShellArrayLiteral {
+    param([object[]]$Values)
+    if (!$Values -or $Values.Count -eq 0) {
+        return "@()"
+    }
+    $quoted = @()
+    foreach ($value in $Values) {
+        $quoted += ("'{0}'" -f ([string]$value).Replace("'", "''"))
+    }
+    return "@({0})" -f ($quoted -join ", ")
+}
+
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 $Python = Resolve-Python -RepoRoot $RepoRoot -Python $Python
 Read-CredentialPath -RepoRoot $RepoRoot
@@ -93,9 +113,22 @@ if (!$SkipStopExisting) {
     & (Join-Path $PSScriptRoot "stop_btc_remote_collectors.ps1") -RepoRoot $RepoRoot -Quiet
 }
 
+$dbDir = Join-Path $env:USERPROFILE ".btc_kalshi_bot"
 $targets = @(
-    @{ name = "btc15m_live_capture"; script = "scripts\btc15m_live_capture.py" },
-    @{ name = "btc15m_lowdd_forward_shadow"; script = "scripts\btc15m_lowdd_live.py" }
+    @{ name = "btc15m_live_capture"; script = "scripts\btc15m_live_capture.py"; args = @() },
+    @{
+        name = "btc15m_lowdd_forward_shadow"
+        script = "scripts\btc15m_lowdd_live.py"
+        args = @(
+            "--mode", "paper",
+            "--env", "prod",
+            "--strategy", "lowdd",
+            "--shadow-bankroll", "100",
+            "--trade-db-path", (Join-Path $dbDir "btc15m_lowdd_forward_shadow_trades.db"),
+            "--capture-db-path", (Join-Path $dbDir "btc15m_lowdd_forward_shadow_capture.duckdb"),
+            "--capture-writer", "persistent"
+        )
+    }
 )
 
 $env:BTC15M_CAPTURE_WRITER = "persistent"
@@ -115,6 +148,7 @@ $started = @()
 $now = Get-Date -Format "yyyyMMdd_HHmmss"
 $taskStartTime = (Get-Date).AddMinutes(5).ToString("HH:mm")
 foreach ($target in $targets) {
+    $targetArgs = Get-TargetArgs -Target $target
     $targetStartUtc = (Get-Date).ToUniversalTime()
     $stdout = Join-Path $logDir "$($target.name)_$now.out.log"
     $stderr = Join-Path $logDir "$($target.name)_$now.err.log"
@@ -124,10 +158,11 @@ foreach ($target in $targets) {
     $taskName = "KalshiBTC_$($target.name)"
     Remove-Item -LiteralPath $latestPidJson -Force -ErrorAction SilentlyContinue
     if ($LaunchMode -eq "direct") {
-        $proc = Start-Process -FilePath $Python -ArgumentList @("-u", $target.script) -WorkingDirectory $RepoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+        $proc = Start-Process -FilePath $Python -ArgumentList (@("-u", $target.script) + $targetArgs) -WorkingDirectory $RepoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
         $startRecord = [pscustomobject]@{
             name = $target.name
             script = $target.script
+            args = $targetArgs
             launcher_pid = 0
             child_process_id = $proc.Id
             started_at_utc = (Get-Date).ToUniversalTime().ToString("o")
@@ -150,11 +185,13 @@ foreach ($target in $targets) {
         }
         continue
     }
+    $scriptArgsLiteral = ConvertTo-PowerShellArrayLiteral -Values $targetArgs
     $wrapperText = @"
 `$ErrorActionPreference = "Stop"
 `$repoRoot = "$RepoRoot"
 `$python = "$Python"
 `$script = "$($target.script)"
+`$scriptArgs = $scriptArgsLiteral
 `$stdout = "$stdout"
 `$stderr = "$stderr"
 `$pidJson = "$pidJson"
@@ -172,10 +209,11 @@ if (Test-Path -LiteralPath `$venvSite) {
         `$env:PYTHONPATH = `$repoRoot + ";" + `$venvSite
     }
 }
-`$proc = Start-Process -FilePath `$python -ArgumentList @("-u", `$script) -WorkingDirectory `$repoRoot -RedirectStandardOutput `$stdout -RedirectStandardError `$stderr -WindowStyle Hidden -PassThru
+`$proc = Start-Process -FilePath `$python -ArgumentList (@("-u", `$script) + `$scriptArgs) -WorkingDirectory `$repoRoot -RedirectStandardOutput `$stdout -RedirectStandardError `$stderr -WindowStyle Hidden -PassThru
 `$startRecord = [pscustomobject]@{
     name = "$($target.name)"
     script = `$script
+    args = `$scriptArgs
     launcher_pid = `$PID
     child_process_id = `$proc.Id
     started_at_utc = (Get-Date).ToUniversalTime().ToString("o")
@@ -188,6 +226,7 @@ if (Test-Path -LiteralPath `$venvSite) {
 `$exitRecord = [pscustomobject]@{
     name = "$($target.name)"
     script = `$script
+    args = `$scriptArgs
     launcher_pid = `$PID
     child_process_id = `$proc.Id
     started_at_utc = (Get-Content -LiteralPath `$pidJson -Raw | ConvertFrom-Json).started_at_utc

@@ -12,12 +12,35 @@ def read_script(name: str) -> str:
 def test_remote_start_defaults_to_current_active_btc15m_targets_only():
     source = read_script("start_btc_remote_collectors.ps1")
 
-    assert 'name = "btc15m_live_capture"; script = "scripts\\btc15m_live_capture.py"' in source
-    assert 'name = "btc15m_lowdd_forward_shadow"; script = "scripts\\btc15m_lowdd_live.py"' in source
+    assert 'name = "btc15m_live_capture"; script = "scripts\\btc15m_live_capture.py"; args = @()' in source
+    assert 'name = "btc15m_lowdd_forward_shadow"' in source
+    assert 'script = "scripts\\btc15m_lowdd_live.py"' in source
     assert 'name = "btc15m_q250_qty500_firstskip_shadow"' not in source
     assert 'name = "btc15m_q250_qty500_firstskip_yes_shadow"' not in source
     assert 'name = "btc15m_q1000_yes_shadow"' not in source
     assert 'name = "btc1h_high_conf80_entry70_no_chase_shadow"' not in source
+
+
+def test_remote_start_lowdd_target_is_paper_forward_shadow_not_live_defaults():
+    source = read_script("start_btc_remote_collectors.ps1")
+
+    for token in (
+        '"--mode", "paper"',
+        '"--env", "prod"',
+        '"--strategy", "lowdd"',
+        '"--shadow-bankroll", "100"',
+        '"--trade-db-path"',
+        '"btc15m_lowdd_forward_shadow_trades.db"',
+        '"--capture-db-path"',
+        '"btc15m_lowdd_forward_shadow_capture.duckdb"',
+        '"--capture-writer", "persistent"',
+    ):
+        assert token in source
+
+    assert '"btc15m_lowdd_live_trades.db"' not in source
+    assert '"btc15m_live_capture.duckdb"' not in source
+    assert '(@("-u", $target.script) + $targetArgs)' in source
+    assert '(@("-u", `$script) + `$scriptArgs)' in source
 
 
 def test_remote_stop_knows_current_active_lowdd_target_and_legacy_cleanup():

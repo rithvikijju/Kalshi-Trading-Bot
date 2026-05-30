@@ -21,6 +21,25 @@ This ledger tracks strategy research paths so we do not repeatedly rediscover re
 
 ## Ledger Entries
 
+### 2026-05-30 - Remote lowdd start wrapper repair
+
+- Found the current-active remote start wrapper was launching
+  `btc15m_lowdd_live.py` with live-mode defaults after the raw Coinbase
+  sidecar deployment. That pointed the lowdd child at
+  `btc15m_live_capture.duckdb`, collided with the raw collector's DuckDB lock,
+  and produced writer failures.
+- Stopped only the bad lowdd child PID `10936` and launcher PID `13344`; left
+  the raw BTC15M collector running.
+- Patched `scripts/start_btc_remote_collectors.ps1` so the
+  `btc15m_lowdd_forward_shadow` target launches explicitly as paper forward
+  shadow evidence: `--mode paper`, `--strategy lowdd`,
+  `--shadow-bankroll 100`,
+  `btc15m_lowdd_forward_shadow_trades.db`, and
+  `btc15m_lowdd_forward_shadow_capture.duckdb`.
+- Next: redeploy the launcher, restart the current-active collectors, and
+  verify both sidecars are fresh with `failed=false`, `dropped=0`, and raw
+  Coinbase replay rows present.
+
 ### 2026-05-27 - Remote websocket snapshot backtest and shadow cleanup
 
 Output:
