@@ -15422,3 +15422,80 @@ artifacts:
   casual restarts. Continue collecting lowdd paper rows and periodically rerun
   this bounded evidence packet; do not promote until the gate passes on a much
   larger official-settled forward sample.
+
+### 2026-05-30 - BTC collector status active-target cleanup and six-row lowdd refresh
+
+- Patched `scripts/status_btc_remote_collectors.ps1` so the current active
+  target set is explicit:
+  `btc15m_live_capture` plus `btc15m_lowdd_forward_shadow`. The script still
+  reports stale manifest rows as `manifest_legacy`, but now adds lowdd as
+  `current_active_observed` when the old manifest does not include it.
+- Patched `scripts/ensure_btc_remote_collectors.ps1` so freshness checks cover
+  only the current active sidecars: raw BTC15M capture and lowdd forward.
+  If current active rows are unhealthy, `ensure` now blocks with
+  `blocked_current_active_manual_restart_required` instead of calling the
+  legacy `start_btc_remote_collectors.ps1`, which would launch stale
+  q250/q1000/BTC1H targets.
+- Validation:
+  local parse passed for both PowerShell scripts, and a fake manifest test
+  produced a `btc15m_lowdd_forward_shadow` row with
+  `target_set = current_active_observed`.
+- Deployed only the patched `status` and `ensure` scripts to the laptop and
+  validated against live state at about `2026-05-30T09:53Z`:
+  `current_active_status = ALL_CURRENT_ACTIVE_RUNNING`.
+  Current active rows:
+  raw PID `6084`, `task_runtime_status = Ready`,
+  `task_supervision_status = PROCESS_RUNNING_TASK_NOT_RUNNING`;
+  lowdd PID `12796`, `task_runtime_status = Running`,
+  `task_supervision_status = TASK_PROCESS_ALIGNED`.
+  `ensure` remained safe with
+  `action = blocked_process_running_task_not_running`, and both current active
+  sidecars were fresh with `dropped = 0`.
+- Refreshed the post-restart lowdd paper ledger through
+  `2026-05-30T09:53Z`:
+  artifact `backtest_outputs\btc15m_lowdd_postrestart_20260530_0640_0953`.
+  Result: `6` trades, all `6` officially settled, `5` wins, official PnL
+  `+$14.27`, premium `$27.73`, return on premium `51.4605%`, max drawdown
+  `-$0.97`.
+- Materialized matching raw and lowdd replay sidecar windows
+  `2026-05-30T06:40:00Z..2026-05-30T09:53:00Z` without pausing collection.
+  Raw slice counts:
+  `225,976` top-book rows, `1,063` lifecycle rows, `214,115` synthetic
+  Coinbase rows, `14` BTC15M events. Fidelity artifact:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_0640_0953`.
+  Verdict remained research-only:
+  `promotion_grade_coinbase_ticks=false`,
+  `top_book_gaps_over_threshold`, valid-book rate `99.5699%`.
+- Official live-holdout replay artifact:
+  `backtest_outputs\btc15m_live_holdout_20260530_0640_0953`.
+  `current_lowdd_no_rv` produced `6` trades, `+$1.49` one-contract PnL,
+  `42.4501%` return on premium, `83.3333%` win rate, max drawdown `-$0.25`.
+  `cheap_pair_lock_rr` stayed diagnostic-positive with `6` trades, `+$0.24`,
+  but it is still not separately execution-audited.
+- Lowdd sidecar-selected replay artifact:
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_20260530_0640_0953`.
+  It found the same `6` selected/order rows, all settled, scaled order PnL
+  `+$14.27`, premium `$27.73`, win rate `83.3333%`, max drawdown `-$0.97`.
+  It also surfaced `order_price_mismatch_rows = 1`: the
+  `KXBTC15M-26MAY300545-45` NO row was selected at `57c` and paper-filled at
+  `58c` about `0.56s` later.
+- Parity artifact:
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_20260530_0640_0953`.
+  `5 / 6` rows passed live sidecar parity; one failed live sidecar price
+  parity due to the `57c -> 58c` selected/order reprice. Generic raw replay had
+  one additional price mismatch.
+- Promotion gate artifact:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_0640_0953_rerun`.
+  Verdict:
+  `production_ready=false`,
+  `research_status=research_blocked_or_rejected`.
+  Blockers:
+  sample-size gates, `order_price_mismatch_rows_nonzero`, and
+  `live_sidecar_parity_not_all_rows`.
+- Interpretation:
+  lowdd economics improved from `4` to `6` settled post-fix rows, but the new
+  6-row packet found a live selected-price-to-order-price mismatch. Treat this
+  as a real execution/parity blocker until the wrapper/gate distinguishes
+  acceptable quote-movement repricing from policy drift. Do not promote; keep
+  collecting and next inspect whether the 1c reprice is expected and logged
+  well enough to count order-price PnL without weakening execution realism.

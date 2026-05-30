@@ -8,18 +8,31 @@ $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 $runtimeDir = Join-Path $RepoRoot "runtime"
 $manifestPath = Join-Path $runtimeDir "btc_collectors_processes.json"
 
-if (!(Test-Path -LiteralPath $manifestPath)) {
-    [pscustomobject]@{
-        repo_root = $RepoRoot
-        status = "NO_MANIFEST"
-        manifest = $manifestPath
-        rows = @()
-    } | ConvertTo-Json -Depth 5
-    exit 1
+if (Test-Path -LiteralPath $manifestPath) {
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+} else {
+    $manifest = [pscustomobject]@{ started = @() }
 }
-
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $rows = @()
+$currentActiveTargets = @(
+    [pscustomobject]@{
+        name = "btc15m_live_capture"
+        script = "scripts\btc15m_live_capture.py"
+        process_id = 0
+        launcher_pid = 0
+        task_name = "KalshiBTC_btc15m_live_capture"
+        pid_json = ""
+    },
+    [pscustomobject]@{
+        name = "btc15m_lowdd_forward_shadow"
+        script = "scripts\btc15m_lowdd_live.py"
+        process_id = 0
+        launcher_pid = 0
+        task_name = "KalshiBTC_btc15m_lowdd_forward_shadow"
+        pid_json = ""
+    }
+)
+$currentActiveNames = @($currentActiveTargets | ForEach-Object { [string]$_.name })
 
 function Get-CaptureStatusPath {
     param(
@@ -28,6 +41,7 @@ function Get-CaptureStatusPath {
     )
     switch ($Name) {
         "btc15m_live_capture" { return (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_live_capture.duckdb.status.json") }
+        "btc15m_lowdd_forward_shadow" { return (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_lowdd_forward_shadow_capture.duckdb.status.json") }
         "btc15m_q250_qty500_firstskip_shadow" { return (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_shadow\btc15m_f2_q250_qty500_firstskip_shadow_capture.duckdb.status.json") }
         "btc15m_q250_qty500_firstskip_yes_shadow" { return (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_yes_shadow\btc15m_f2_q250_qty500_firstskip_yes_shadow_capture.duckdb.status.json") }
         "btc15m_q1000_yes_shadow" { return (Join-Path $RepoRoot ".codex_work\btc15m_f2_q1000_yes_shadow\btc15m_f2_q1000_yes_shadow_capture.duckdb.status.json") }
@@ -130,7 +144,11 @@ function Get-TaskSupervisionStatus {
     return "PROCESS_AND_TASK_NOT_RUNNING"
 }
 
-foreach ($row in @($manifest.started)) {
+function New-CollectorStatusRow {
+    param(
+        [object]$Row,
+        [string]$TargetSet
+    )
     $manifestTaskName = [string]$row.task_name
     $expectedTaskName = $manifestTaskName
     if (!$expectedTaskName -and $row.name) {
@@ -168,9 +186,11 @@ foreach ($row in @($manifest.started)) {
     }
     $taskStatus = Get-TaskRuntimeStatus -TaskName $expectedTaskName
     $supervisionStatus = Get-TaskSupervisionStatus -ExpectedProcess ([bool]$expectedProcess) -TaskName $expectedTaskName -TaskStatus $taskStatus
-    $rows += [pscustomobject]@{
+    return [pscustomobject]@{
         name = $row.name
         script = $row.script
+        target_set = $TargetSet
+        current_active = ($currentActiveNames -contains ([string]$row.name))
         process_id = $targetPid
         manifest_process_id = $manifestPid
         process_id_source = $pidSource
@@ -194,10 +214,37 @@ foreach ($row in @($manifest.started)) {
     }
 }
 
+$manifestNames = @{}
+foreach ($row in @($manifest.started)) {
+    $manifestNames[[string]$row.name] = $true
+    $targetSet = if ($currentActiveNames -contains ([string]$row.name)) { "current_active_manifest" } else { "manifest_legacy" }
+    $rows += New-CollectorStatusRow -Row $row -TargetSet $targetSet
+}
+foreach ($target in $currentActiveTargets) {
+    if (!$manifestNames.ContainsKey([string]$target.name)) {
+        $rows += New-CollectorStatusRow -Row $target -TargetSet "current_active_observed"
+    }
+}
+
+$manifestRows = @($rows | Where-Object { $_.target_set -in @("current_active_manifest", "manifest_legacy") })
+$currentRows = @($rows | Where-Object { $_.current_active })
+
 [pscustomobject]@{
     repo_root = $RepoRoot
+    manifest = $manifestPath
     checked_at_utc = (Get-Date).ToUniversalTime().ToString("o")
-    status = if (@($rows | Where-Object { $_.running }).Count -eq @($manifest.started).Count) { "ALL_RUNNING" } else { "MISSING_PROCESS" }
+    status = if (!(Test-Path -LiteralPath $manifestPath)) {
+        "NO_MANIFEST"
+    } elseif (@($manifestRows | Where-Object { $_.running }).Count -eq @($manifestRows).Count) {
+        "ALL_RUNNING"
+    } else {
+        "MISSING_PROCESS"
+    }
+    current_active_status = if (@($currentRows | Where-Object { $_.running }).Count -eq @($currentRows).Count) {
+        "ALL_CURRENT_ACTIVE_RUNNING"
+    } else {
+        "CURRENT_ACTIVE_MISSING_PROCESS"
+    }
     supervision_status = if (@($rows | Where-Object { $_.task_supervision_status -eq "PROCESS_RUNNING_TASK_NOT_RUNNING" }).Count -gt 0) {
         "PROCESS_RUNNING_TASK_NOT_RUNNING"
     } elseif (@($rows | Where-Object { $_.task_supervision_status -eq "TASK_MISSING" }).Count -gt 0) {

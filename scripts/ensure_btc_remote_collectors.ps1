@@ -126,13 +126,15 @@ try {
 
 $statusPaths = @(
     (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_live_capture.duckdb.status.json"),
-    (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_shadow\btc15m_f2_q250_qty500_firstskip_shadow_capture.duckdb.status.json"),
-    (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_yes_shadow\btc15m_f2_q250_qty500_firstskip_yes_shadow_capture.duckdb.status.json"),
-    (Join-Path $RepoRoot ".codex_work\btc15m_f2_q1000_yes_shadow\btc15m_f2_q1000_yes_shadow_capture.duckdb.status.json"),
-    (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc_1hr_high_conf80_entry70_no_chase_shadow_capture.duckdb.status.json")
+    (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_lowdd_forward_shadow_capture.duckdb.status.json")
 )
 $sidecars = @($statusPaths | ForEach-Object { Read-StatusSidecar -Path $_ })
-$allProcessesRunning = $status -and $status.status -eq "ALL_RUNNING"
+$hasCurrentActiveStatus = $status -and ($status.PSObject.Properties.Name -contains "current_active_status")
+$allProcessesRunning = if ($hasCurrentActiveStatus) {
+    $status.current_active_status -eq "ALL_CURRENT_ACTIVE_RUNNING"
+} else {
+    $status -and $status.status -eq "ALL_RUNNING"
+}
 $allSidecarsFresh = ($sidecars | Where-Object { $_.fresh }).Count -eq $sidecars.Count
 $unsafeSupervisionRows = @()
 if ($status -and $status.rows) {
@@ -167,6 +169,12 @@ if ($hasProcessRunningTaskNotRunning) {
     $restartBlockedReason = (
         "One or more collectors are live but their scheduled task is not running; " +
         "not restarting because that could create duplicate writers against a locked DB."
+    )
+} elseif ($hasCurrentActiveStatus -and (!$allProcessesRunning -or (!$allSidecarsFresh -and !$allProcessesInStartupGrace))) {
+    $action = "blocked_current_active_manual_restart_required"
+    $restartBlockedReason = (
+        "The current active target set is BTC15M raw capture plus lowdd paper forward. " +
+        "Not calling legacy start_btc_remote_collectors.ps1 automatically because it would launch stale q250/q1000/BTC1H targets."
     )
 } elseif (!$allProcessesRunning -or (!$allSidecarsFresh -and !$allProcessesInStartupGrace)) {
     $action = "restart_collectors"
