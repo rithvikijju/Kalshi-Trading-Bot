@@ -16566,3 +16566,40 @@ artifacts:
   `10` post-restart rows. It is still not enough to deploy or increase risk:
   the evidence is sample-small and should keep collecting until the frozen gate
   reaches at least `50` clean official-settled selected/order/paper rows.
+
+### 2026-05-30 - Repeatable lowdd remote evidence refresh
+
+- Added `scripts\refresh_btc15m_lowdd_remote_evidence.py` and
+  `scripts\test_refresh_btc15m_lowdd_remote_evidence.py` so the lowdd forward
+  refresh is no longer a manual SSH/SFTP notebook of commands. The script reads
+  SSH credentials from `CLAW_PASS` or `--password`, snapshots the remote SQLite
+  trade ledger via `sqlite3.Connection.backup`, uploads the current
+  `scripts\materialize_btc_replay_sidecar.py` to the remote laptop, materializes
+  only `signal_scan` and `order_decision` rows from the remote replay JSONL, and
+  then runs the existing official paper, selected-signal, paper/sidecar parity,
+  and promotion-gate scripts locally.
+- Proof run:
+  `python scripts\refresh_btc15m_lowdd_remote_evidence.py --stamp 20260530_1540 --since-utc 2026-05-30T06:33:25+00:00`.
+  Run info:
+  `runtime\remote_snapshots\lowdd_refresh_20260530_1540\refresh_run_info.json`
+  (ignored). The remote status sidecars were fresh at run time:
+  raw top-book latest `2026-05-30T15:37:06Z`, lowdd signal-scan latest
+  `2026-05-30T15:37:06Z`, `failed=false` for both, `dropped=0` for both.
+- The proof run reproduced the current lowdd gate without copying the full
+  multi-GB sidecar: `304,690` signal-scan rows and `11` order-decision rows
+  were materialized into ignored runtime storage. The refreshed official paper
+  summary remained `10` trades, `10` settled, `9` wins, `1` loss, official PnL
+  `+$26.96`, premium `$49.04`, return on premium `+54.98%`, and max drawdown
+  `-$0.97`.
+- Refreshed parity stayed clean: `10/10` live-sidecar parity passes,
+  `0` live-sidecar price mismatches, `2` selected-signal to order-entry reprices
+  within the `2c` audit limit, and `0` generic replay price mismatches in the
+  signal/order-only parity mode.
+- Refreshed promotion gate:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_remote_20260530_1540`.
+  Verdict was still `research_promising_insufficient_forward_sample`, with the
+  same sample-size blockers:
+  `selected_rows_below_min`, `settled_rows_below_min`, `order_rows_below_min`,
+  and `paper_settled_rows_below_min`. This gives the research loop a repeatable
+  command to rerun when the remote ledger accrues more official-settled rows,
+  while preserving the no-deploy conclusion until the 50-row gate is met.
