@@ -15659,3 +15659,52 @@ artifacts:
   lowdd and raw BTC15M; the next useful check is another bounded refresh once
   new paper fills arrive, plus a separate adapter experiment if we want to test
   `kalshi_v2` branches against BTC15M binary markets.
+
+### 2026-05-30 - Machine-readable branch replayability inventory
+
+- Added `scripts\audit_btc_branch_replayability.py` to make branch coverage
+  auditable instead of narrative-only. The script:
+  - lists remote branches by commit date;
+  - inspects relevant branch files from Git without checking them out;
+  - detects current BTC15M replay tools, `kalshi_v2` model/harness branches,
+    and alternate arbitrage/backtester branches;
+  - inspects the chosen DuckDB capture schema and market/lifecycle contents;
+  - writes CSV, JSON, and Markdown artifacts explaining whether each branch is
+    directly replayable on the capture or needs an adapter/harness.
+- Validation:
+  `python -m py_compile scripts\audit_btc_branch_replayability.py` passed.
+  Initial execution found and fixed a Windows Git-output decode issue by
+  forcing UTF-8 with replacement in the subprocess wrapper. A second run also
+  corrected the classification so `kalshi_v2` branches without a captured
+  DuckDB backtest harness are not mislabeled as directly replayable.
+- Replayability artifact:
+  `backtest_outputs\btc_branch_replayability_20260530_1012`.
+  Input capture:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1012\btc15m_raw_20260530_0640_1012.duckdb`.
+  Capture market/lifecycle facts:
+  `15` total markets, `15` BTC15M binary markets, `0` cumulative `-T`
+  markets, `0` lifecycle `determined` rows, and `4` lifecycle `settled` rows.
+- Branch inventory result across `19` remote branches:
+  - `1` directly replayable current BTC15M branch:
+    `origin/sami`.
+  - `3` `kalshi_v2` branches with a captured-DuckDB backtest harness but not
+    directly replayable on this BTC15M slice:
+    `origin/claude/v2-backtest-harness`, `origin/arb-v3`, and
+    `origin/claude/v2-sami-strategy-backtest`. Blockers were
+    `missing_ws_orderbook_top_dedup`, `missing_coinbase_ticker_all`,
+    `missing_ws_lifecycle_all`, `no_cumulative_T_markets`, and
+    `no_determined_lifecycle_rows`.
+  - `14` `kalshi_v2` model/strategy branches without a branch-local captured
+    DuckDB backtest harness, classified as
+    `not_directly_replayable_needs_harness`.
+  - `1` GNN/arbitrage branch classified as `not_btc_capture_replay_ready`
+    because no BTC15M captured-DuckDB replay contract was detected.
+- Interpretation:
+  for the currently collected BTC15M binary DuckDB slice, `origin/sami` is the
+  only branch that can be honestly replayed directly. The `kalshi_v2` branch
+  family may still contain useful modeling ideas, but testing it on this data
+  requires an explicit adapter: map current `ws_orderbook_top` /
+  `coinbase_ticker` / `ws_lifecycle` to the old `_dedup` / `_all` names,
+  replace lifecycle `determined` parsing with official REST settlement or
+  settled-event parsing, and redesign the market model for BTC15M up/down
+  binaries rather than cumulative strike (`-T`) markets.
