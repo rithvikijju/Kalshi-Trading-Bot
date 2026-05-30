@@ -15232,3 +15232,61 @@ artifacts:
   fresh window and agrees closely with the lowdd sidecar. It is not
   promotion-grade Coinbase tick-age evidence because these materialized
   Coinbase rows are synthetic from top-book `btc_spot`.
+
+### 2026-05-30 - Readable raw-capture probe and supervision caveat
+
+- Goal:
+  get fresh real `coinbase_ticker` evidence without relying on synthetic
+  Coinbase rows from the replay sidecar.
+- First attempted a non-invasive same-machine copy of the active raw
+  `btc15m_live_capture.duckdb` plus `.wal`. Windows denied reading the active
+  main DB while persistent capture PID `6084` held the file.
+- Then attempted a controlled raw-capture pause using scheduled task
+  `\KalshiBTC_btc15m_live_capture`. `schtasks /End` succeeded, but the child
+  Python writer PID `6084` remained alive and `taskkill /PID 6084 /F` returned
+  `Access denied`, so the DB remained locked and no full fresh snapshot was
+  obtained.
+- Important supervision state after that attempt:
+  the raw child process continued collecting, but the scheduled task wrapper
+  showed `Ready` rather than `Running`. Final status at about
+  `2026-05-30T09:20Z`: raw capture `failed=false`, `last_error=""`,
+  `dropped=0`, `queue_depth=0`, latest top-book
+  `2026-05-30T09:20:10.341083Z`, latest Coinbase
+  `2026-05-30T09:20:06.201371Z`, `17,134,854` top-book rows, and `202,731`
+  Coinbase rows. Lowdd remained live with latest top-book
+  `2026-05-30T09:20:12.341856Z` and no new order decision after
+  `2026-05-30T08:25:09.739962Z`.
+- Safer workaround:
+  ran a separate finite capture-only probe using the readable writer, without
+  touching the live collector:
+  `scripts\btc15m_live_capture.py --capture-db-path
+  C:\Users\ClawService\.btc_kalshi_bot\codex_btc15m_readable_probe_20260530_0915.duckdb
+  --capture-writer readable --duration-sec 180 --refresh-sec 10 --health-sec 30`.
+  It exited cleanly with `failed=false`, `last_error=""`, `dropped=0`, and a
+  small readable DB copied locally under ignored `runtime\remote_snapshots`.
+- Fidelity audit output:
+  `backtest_outputs\btc15m_readable_probe_fidelity_20260530_0915`.
+  Window: `2026-05-30T09:14:20Z..2026-05-30T09:17:40Z`.
+  Probe counts: `1,493` top-book rows, `43` lifecycle rows, `24` real
+  Coinbase ticker rows, `8` capture-health rows. Coinbase schema included raw
+  fields, so `promotion_grade_coinbase_ticks=true`.
+- Probe top-book quality:
+  no timestamp/ticker errors, no out-of-range prices, no crossed books, no
+  negative quantities, and no gaps over `120s`. The only filterable issue was
+  `27` null-book-field rows, leaving `1,466 / 1,493` valid top-book rows
+  (`98.1916%`). Verdict:
+  `filtered_top_book_research_grade=true`.
+- Probe versus active raw replay sidecar:
+  materialized active raw sidecar window
+  `runtime\sidecar_slices\btc15m_raw_sidecar_20260530_0914_0918.duckdb`
+  had `1,741` top-book rows, `30` lifecycle rows, and `1,604` synthetic
+  Coinbase rows. Bucket parity against the readable probe matched all `34 / 34`
+  probe buckets and `34 / 37` sidecar buckets. YES-mid mean, p95, and max
+  difference were all `0c`; all matched buckets were within `1c`.
+- Interpretation:
+  the readable writer path can produce fresh, promotion-grade real Coinbase
+  tick evidence while agreeing exactly with the active raw sidecar on matched
+  top-book buckets in this short probe. The existing persistent raw process is
+  still collecting, but its task-wrapper supervision state needs care before
+  any future planned pause/restart; do not start a duplicate persistent writer
+  against the same DB.
