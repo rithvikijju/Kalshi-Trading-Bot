@@ -171,11 +171,11 @@ if ($hasProcessRunningTaskNotRunning) {
         "not restarting because that could create duplicate writers against a locked DB."
     )
 } elseif ($hasCurrentActiveStatus -and (!$allProcessesRunning -or (!$allSidecarsFresh -and !$allProcessesInStartupGrace))) {
-    $action = "blocked_current_active_manual_restart_required"
-    $restartBlockedReason = (
-        "The current active target set is BTC15M raw capture plus lowdd paper forward. " +
-        "Not calling legacy start_btc_remote_collectors.ps1 automatically because it would launch stale q250/q1000/BTC1H targets."
-    )
+    $action = "restart_current_active_collectors"
+    $startResult = & (Join-Path $PSScriptRoot "start_btc_remote_collectors.ps1") -RepoRoot $RepoRoot | Out-String
+    Start-Sleep -Seconds 10
+    $status = Get-StatusObject -RepoRoot $RepoRoot
+    $sidecars = @($statusPaths | ForEach-Object { Read-StatusSidecar -Path $_ })
 } elseif (!$allProcessesRunning -or (!$allSidecarsFresh -and !$allProcessesInStartupGrace)) {
     $action = "restart_collectors"
     $startResult = & (Join-Path $PSScriptRoot "start_btc_remote_collectors.ps1") -RepoRoot $RepoRoot | Out-String

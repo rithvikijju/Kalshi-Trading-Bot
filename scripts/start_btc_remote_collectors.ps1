@@ -50,6 +50,7 @@ function Get-CaptureStatusPath {
     )
     switch ($Name) {
         "btc15m_live_capture" { return (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_live_capture.duckdb.status.json") }
+        "btc15m_lowdd_forward_shadow" { return (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_lowdd_forward_shadow_capture.duckdb.status.json") }
         "btc15m_q250_qty500_firstskip_shadow" { return (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_shadow\btc15m_f2_q250_qty500_firstskip_shadow_capture.duckdb.status.json") }
         "btc15m_q250_qty500_firstskip_yes_shadow" { return (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_yes_shadow\btc15m_f2_q250_qty500_firstskip_yes_shadow_capture.duckdb.status.json") }
         "btc15m_q1000_yes_shadow" { return (Join-Path $RepoRoot ".codex_work\btc15m_f2_q1000_yes_shadow\btc15m_f2_q1000_yes_shadow_capture.duckdb.status.json") }
@@ -94,10 +95,7 @@ if (!$SkipStopExisting) {
 
 $targets = @(
     @{ name = "btc15m_live_capture"; script = "scripts\btc15m_live_capture.py" },
-    @{ name = "btc15m_q250_qty500_firstskip_shadow"; script = "scripts\btc15m_f2_q250_qty500_firstskip_shadow.py" },
-    @{ name = "btc15m_q250_qty500_firstskip_yes_shadow"; script = "scripts\btc15m_f2_q250_qty500_firstskip_yes_shadow.py" },
-    @{ name = "btc15m_q1000_yes_shadow"; script = "scripts\btc15m_f2_q1000_yes_shadow.py" },
-    @{ name = "btc1h_high_conf80_entry70_no_chase_shadow"; script = "scripts\btc_1hr_high_conf80_entry70_no_chase_shadow.py" }
+    @{ name = "btc15m_lowdd_forward_shadow"; script = "scripts\btc15m_lowdd_live.py" }
 )
 
 $env:BTC15M_CAPTURE_WRITER = "persistent"

@@ -16039,3 +16039,26 @@ artifacts:
   policy. The raw sidecar is useful for research replay, but promotion-grade
   BTC tick-age evidence still requires a direct readable DuckDB snapshot or
   raw Coinbase sidecar capture rather than synthetic Coinbase rows.
+
+### 2026-05-30 - Remote collector target-set guardrail
+
+- Fixed a remote operations drift that could have harmed future evidence
+  collection. `status_btc_remote_collectors.ps1` and
+  `ensure_btc_remote_collectors.ps1` already treated the current active target
+  set as BTC15M raw capture plus BTC15M lowdd forward paper shadow, but
+  `start_btc_remote_collectors.ps1` still defaulted to legacy
+  q250/q1000/BTC1H shadows and `stop_btc_remote_collectors.ps1` did not
+  explicitly know the lowdd status sidecar, pid file, task name, or script.
+- Updated start/ensure/stop behavior so the automatic current-active restart
+  path starts only:
+  `scripts\btc15m_live_capture.py` and `scripts\btc15m_lowdd_live.py`.
+  The stop script still cleans up legacy q250/q1000/BTC1H task/process names
+  so stale shadows do not keep writing confusing evidence.
+- Added `scripts\test_btc_remote_collector_target_set.py` to lock this target
+  set in tests.
+- Validation:
+  `python -m pytest scripts\test_btc_remote_collector_target_set.py -q
+  --basetemp .pytest-codex-tmp-remote-targets` passed with `3` tests.
+  PowerShell parser checks passed for
+  `start_btc_remote_collectors.ps1`, `stop_btc_remote_collectors.ps1`,
+  `ensure_btc_remote_collectors.ps1`, and `status_btc_remote_collectors.ps1`.

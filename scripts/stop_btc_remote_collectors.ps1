@@ -16,6 +16,7 @@ function Get-CaptureStatusPaths {
     param([string]$RepoRoot)
     return @(
         (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_live_capture.duckdb.status.json"),
+        (Join-Path $env:USERPROFILE ".btc_kalshi_bot\btc15m_lowdd_forward_shadow_capture.duckdb.status.json"),
         (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_shadow\btc15m_f2_q250_qty500_firstskip_shadow_capture.duckdb.status.json"),
         (Join-Path $RepoRoot ".codex_work\btc15m_f2_q250_qty500_firstskip_yes_shadow\btc15m_f2_q250_qty500_firstskip_yes_shadow_capture.duckdb.status.json"),
         (Join-Path $RepoRoot ".codex_work\btc15m_f2_q1000_yes_shadow\btc15m_f2_q1000_yes_shadow_capture.duckdb.status.json"),
@@ -117,6 +118,7 @@ Stop-CaptureSidecarPids -RepoRoot $RepoRoot
 if (Test-Path -LiteralPath $pidDir) {
     $latestPidFiles = @(
         "btc15m_live_capture.pid.json",
+        "btc15m_lowdd_forward_shadow.pid.json",
         "btc15m_q250_qty500_firstskip_shadow.pid.json",
         "btc15m_q250_qty500_firstskip_yes_shadow.pid.json",
         "btc15m_q1000_yes_shadow.pid.json",
@@ -155,6 +157,7 @@ if (Test-Path -LiteralPath $manifestPath) {
 
 foreach ($taskName in @(
     "KalshiBTC_btc15m_live_capture",
+    "KalshiBTC_btc15m_lowdd_forward_shadow",
     "KalshiBTC_btc15m_q250_qty500_firstskip_shadow",
     "KalshiBTC_btc15m_q250_qty500_firstskip_yes_shadow",
     "KalshiBTC_btc15m_q1000_yes_shadow",
@@ -168,6 +171,7 @@ foreach ($taskName in @(
 # denied; in that case we rely only on the manifest PIDs and do not broaden.
 $exactScripts = @(
     "btc15m_live_capture.py",
+    "btc15m_lowdd_live.py",
     "btc15m_f2_q250_qty500_firstskip_shadow.py",
     "btc15m_f2_q250_qty500_firstskip_yes_shadow.py",
     "btc15m_f2_q1000_yes_shadow.py",
