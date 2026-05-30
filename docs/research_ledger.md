@@ -16737,3 +16737,43 @@ artifacts:
   machine-local Windows temp permission issue
   `PermissionError: C:\Users\ahmed\AppData\Local\Temp\pytest-of-ahmed`; the
   repo-local rerun passed.
+
+### 2026-05-30 - Remote raw LightGBM sidecar score
+
+- Added `scripts\score_btc15m_ml_sidecar_remote_raw.py` and focused tests in
+  `scripts\test_score_btc15m_ml_sidecar_remote_raw.py`.
+  The scorer connects to the laptop, materializes a time-bounded slice of the
+  raw replay JSONL into ignored local runtime DuckDB, runs the frozen
+  `lightgbm_tabular` replay locally, and writes a metric-only gate summary. It
+  does not start, stop, or restart any remote process and does not submit live
+  or paper orders.
+- Fresh score artifact:
+  `backtest_outputs\btc15m_ml_sidecar_remote_raw_score_20260530_1235`.
+  Input window: `2026-05-30T13:00:00Z` through raw capture end
+  `2026-05-30T16:14:03.838195Z`.
+- Remote raw capture status during the score was healthy:
+  `failed=false`, `dropped=0`, raw capture PID `13912`, raw status mtime
+  `2026-05-30T16:14:00Z`, raw top-book latest
+  `2026-05-30T16:14:00.283996Z`, raw replay file size
+  `12,857,855,176` bytes.
+- Materialized remote raw sidecar slice:
+  `241,340` `ws_orderbook_top` rows, `2,959` raw `coinbase_ticker` rows,
+  `13,918` `ws_lifecycle` rows, `0` `order_decision` rows, and `258,217`
+  raw sidecar rows loaded. Coinbase source was `raw_sidecar`, not synthetic.
+- ML scoring result:
+  the frozen LightGBM feature reconstruction produced `380,168` executable
+  side-candidate rows across `12` candidate events, but the frozen gate
+  (`pred_win_prob >= 0.82`, `pred_ev >= 0.20`) selected `0` trades. Gate
+  summary: `proxy_rows=0`, `official_rows=0`, `proxy_pnl_2c=$0.00`,
+  `official_pnl_2c=$0.00`, `research_status=metric_only_collect_more`,
+  blockers
+  `no_selected_proxy_rows;clean_proxy_rows_below_min;official_rows_below_min`,
+  advisory `no_official_settled_rows_yet`.
+- Interpretation:
+  this is evidence against starting a LightGBM paper-ordering shadow right now.
+  The only correct action is to keep scoring later raw-capture snapshots
+  offline and keep lowdd as the only active forward paper path.
+- Validation:
+  `python -m py_compile scripts\score_btc15m_ml_sidecar_remote_raw.py scripts\test_score_btc15m_ml_sidecar_remote_raw.py`
+  passed. `python -m pytest scripts\test_score_btc15m_ml_sidecar_remote_raw.py -q --basetemp .pytest-codex-tmp-ml-remote-score-2`
+  passed with `3` tests.
