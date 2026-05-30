@@ -164,6 +164,10 @@ def evaluate_gate(
     live_pass_rows = to_int(parity_summary.get("live_sidecar_parity_pass_rows"))
     generic_mismatch_rows = to_int(parity_summary.get("generic_replay_price_mismatch_rows"))
     order_price_mismatch_rows = to_int(selected_summary.get("order_price_mismatch_rows"))
+    live_sidecar_price_mismatch_rows = to_int(parity_summary.get("live_sidecar_price_mismatch_rows"))
+    signal_order_reprice_rows = to_int(parity_summary.get("signal_order_reprice_rows"))
+    signal_order_reprice_over_limit_rows = to_int(parity_summary.get("signal_order_reprice_over_limit_rows"))
+    max_signal_order_worse_reprice_cents = to_float(parity_summary.get("max_signal_order_worse_reprice_cents"))
     signal_pnl = to_float(selected_summary.get("signal_one_contract_pnl"))
     order_pnl = to_float(selected_summary.get("order_scaled_pnl"))
     paper_pnl = to_float(paper_summary.get("official_pnl"))
@@ -175,6 +179,13 @@ def evaluate_gate(
 
     blockers: list[str] = [f"missing_{name}_input" for name in missing_inputs]
     advisories: list[str] = []
+    has_reprice_classification = "signal_order_reprice_rows" in parity_summary
+    selected_order_reprice_classified = (
+        has_reprice_classification
+        and order_price_mismatch_rows <= signal_order_reprice_rows
+        and signal_order_reprice_over_limit_rows == 0
+        and live_sidecar_price_mismatch_rows == 0
+    )
 
     if selected_rows < args.min_selected_rows:
         blockers.append("selected_rows_below_min")
@@ -188,8 +199,14 @@ def evaluate_gate(
         blockers.append("unsettled_selected_rows")
     if paper_rows != paper_settled_rows:
         blockers.append("unsettled_paper_rows")
-    if order_price_mismatch_rows > args.max_order_price_mismatch_rows:
+    if live_sidecar_price_mismatch_rows > 0:
+        blockers.append("live_sidecar_price_mismatch_rows_nonzero")
+    if signal_order_reprice_over_limit_rows > 0:
+        blockers.append("signal_order_reprice_over_limit_rows_nonzero")
+    if order_price_mismatch_rows > args.max_order_price_mismatch_rows and not selected_order_reprice_classified:
         blockers.append("order_price_mismatch_rows_nonzero")
+    if order_price_mismatch_rows > 0 and selected_order_reprice_classified:
+        advisories.append("selected_order_reprice_within_config_limit")
     if order_pnl <= 0:
         blockers.append("order_scaled_pnl_not_positive")
     if signal_pnl <= 0:
@@ -211,6 +228,11 @@ def evaluate_gate(
     if generic_mismatch_rows > 0:
         advisories.append("generic_replay_price_mismatch_sidecar_selected_is_authoritative")
 
+    price_parity_ok = (
+        live_sidecar_price_mismatch_rows == 0
+        and signal_order_reprice_over_limit_rows == 0
+        and (order_price_mismatch_rows == 0 or selected_order_reprice_classified)
+    )
     unique_blockers = sorted(set(blockers))
     production_ready = len(unique_blockers) == 0
     if production_ready:
@@ -218,7 +240,7 @@ def evaluate_gate(
     elif (
         order_pnl > 0
         and signal_pnl > 0
-        and order_price_mismatch_rows == 0
+        and price_parity_ok
         and live_pass_rate >= args.min_live_sidecar_parity_pass_rate
     ):
         research_status = "research_promising_insufficient_forward_sample"
@@ -242,6 +264,10 @@ def evaluate_gate(
         "live_sidecar_parity_pass_rate": round(live_pass_rate, 6),
         "generic_replay_price_mismatch_rows": generic_mismatch_rows,
         "order_price_mismatch_rows": order_price_mismatch_rows,
+        "live_sidecar_price_mismatch_rows": live_sidecar_price_mismatch_rows,
+        "signal_order_reprice_rows": signal_order_reprice_rows,
+        "signal_order_reprice_over_limit_rows": signal_order_reprice_over_limit_rows,
+        "max_signal_order_worse_reprice_cents": round(max_signal_order_worse_reprice_cents, 6),
         "signal_one_contract_pnl": round(signal_pnl, 6),
         "signal_one_contract_premium": round(signal_premium, 6),
         "signal_max_drawdown": round(signal_max_drawdown, 6),
@@ -320,6 +346,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "notes": [
             "Gate consumes sidecar-selected replay, paper/live-sidecar parity, and post-restart official paper rows.",
             "Generic replay price mismatches are advisory when live sidecar-selected parity passes.",
+            "Selected-signal to order-entry reprices are advisory only when the paper order matches the live sidecar order and the reprice stayed within the audit limit.",
             "Passing this gate still requires explicit human approval before any live deployment.",
         ],
     }
@@ -339,6 +366,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "paper_settled_rows",
         "order_scaled_pnl",
         "order_max_drawdown",
+        "order_price_mismatch_rows",
+        "signal_order_reprice_rows",
+        "max_signal_order_worse_reprice_cents",
     ]
     drawdown_cols = [
         "sequence",

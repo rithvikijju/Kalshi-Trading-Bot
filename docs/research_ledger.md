@@ -15499,3 +15499,59 @@ artifacts:
   acceptable quote-movement repricing from policy drift. Do not promote; keep
   collecting and next inspect whether the 1c reprice is expected and logged
   well enough to count order-price PnL without weakening execution realism.
+
+### 2026-05-30 - BTC15M lowdd selected-to-order reprice parity audit
+
+- Inspected the active wrapper path in `scripts\btc15m_lowdd_live.py`.
+  The sidecar `signal_scan` row is recorded with `action = selected` before
+  the hot-book reprice. The order/paper-fill path then reprices from the
+  current book with `BTC15M_MAX_REPRICE_WORSE_CENTS` defaulting to `2.0c`.
+- Verified the only six-row mismatch directly from the materialized lowdd
+  sidecar slice:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_0953\btc15m_lowdd_20260530_0640_0953.duckdb`.
+  For `KXBTC15M-26MAY300545-45`, the selected NO signal was at
+  `2026-05-30T09:40:10.207556Z` with entry `57c`; the nearest prior book was
+  age `2.012ms` with `no_ask = 57c`. The paper order was at
+  `2026-05-30T09:40:10.769246Z` with entry `58c`; the nearest prior book was
+  age `0.998ms` with `no_ask = 58c`. The order used `8` contracts, YES limit
+  `42c`, estimated cost `$4.78`, and net edge `14.25c`.
+- Patched `scripts\audit_btc15m_lowdd_paper_replay_parity.py` so paper/order
+  parity remains mandatory, but bounded selected-signal-to-order reprices are
+  classified separately. The audit now emits
+  `live_sidecar_price_mismatch_rows`, `signal_order_reprice_rows`,
+  `signal_order_reprice_over_limit_rows`, and
+  `max_signal_order_worse_reprice_cents`.
+- Patched `scripts\build_btc15m_lowdd_forward_promotion_gate.py` so a selected
+  price mismatch is not a blocker when the audit proves order/paper parity and
+  the selected-to-order reprice stayed inside the configured cap. True
+  live-sidecar order price mismatches and over-limit reprices remain blockers.
+- Validation:
+  `python -m pytest scripts\test_btc15m_lowdd_paper_replay_parity.py scripts\test_btc15m_lowdd_forward_promotion_gate.py -q --basetemp .pytest-codex-tmp-lowdd-reprice`
+  passed with `11` tests. `python -m py_compile` also passed for the touched
+  audit, gate, and test scripts.
+- Rerun parity artifact:
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_20260530_0640_0953_reprice_audit`.
+  Result: `6 / 6` live sidecar parity pass rows,
+  `live_sidecar_price_mismatch_rows = 0`,
+  `signal_order_reprice_rows = 1`,
+  `signal_order_reprice_over_limit_rows = 0`,
+  `max_signal_order_worse_reprice_cents = 1.0`, and
+  `generic_replay_price_mismatch_rows = 2`.
+- Rerun promotion gate artifact:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_0640_0953_reprice_audit`.
+  Verdict changed to
+  `production_ready=false`,
+  `research_status=research_promising_insufficient_forward_sample`.
+  Remaining blockers are only the sample-size gates:
+  `selected_rows_below_min`, `settled_rows_below_min`,
+  `order_rows_below_min`, and `paper_settled_rows_below_min`.
+  Advisories are
+  `generic_replay_price_mismatch_sidecar_selected_is_authoritative` and
+  `selected_order_reprice_within_config_limit`.
+- Interpretation:
+  the 57c-to-58c row is expected live quote movement during the wrapper's
+  guarded reprice path, not a policy/parity drift. The order/paper official
+  economics remain matched at `+$14.27` on `$27.73` premium across `6` settled
+  rows. This improves the lowdd status from rejected to promising, but it is
+  still not deployable because the forward sample is too small and the raw
+  materialized slice still uses synthetic Coinbase rows.

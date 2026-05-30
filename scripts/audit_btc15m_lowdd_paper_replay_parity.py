@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", default="current_lowdd_no_rv")
     parser.add_argument("--price-tolerance", type=float, default=1e-9)
     parser.add_argument("--time-tolerance-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--max-signal-order-reprice-cents",
+        type=float,
+        default=2.0,
+        help="Maximum allowed selected-signal to order-entry worse reprice in cents.",
+    )
     return parser.parse_args()
 
 
@@ -170,19 +176,35 @@ def time_ok(value: float | None, tolerance: float) -> bool:
 def row_verdict(
     signal_diff: float | None,
     order_diff: float | None,
+    signal_order_reprice_cents: float | None,
     signal_dt: float | None,
     order_dt: float | None,
     replay_match: pd.Series | None,
     replay_diff: float | None,
     price_tolerance: float,
     time_tolerance: float,
+    max_signal_order_reprice_cents: float,
 ) -> str:
     if signal_diff is None or order_diff is None:
         return "fail_live_sidecar_missing"
-    if not diff_ok(signal_diff, price_tolerance) or not diff_ok(order_diff, price_tolerance):
+    order_matches_paper = diff_ok(order_diff, price_tolerance)
+    signal_matches_paper = diff_ok(signal_diff, price_tolerance)
+    signal_order_reprice_ok = (
+        signal_order_reprice_cents is not None
+        and signal_order_reprice_cents <= max_signal_order_reprice_cents + 1e-9
+    )
+    if not order_matches_paper:
         return "fail_live_sidecar_price_mismatch"
     if not time_ok(signal_dt, time_tolerance) or not time_ok(order_dt, time_tolerance):
         return "fail_live_sidecar_time_mismatch"
+    if not signal_matches_paper:
+        if not signal_order_reprice_ok:
+            return "fail_signal_order_reprice_over_limit"
+        if replay_match is None:
+            return "live_sidecar_order_parity_pass_signal_reprice_generic_replay_missing"
+        if not diff_ok(replay_diff, price_tolerance):
+            return "live_sidecar_order_parity_pass_signal_reprice_generic_replay_price_mismatch"
+        return "live_sidecar_order_parity_pass_signal_reprice"
     if replay_match is None:
         return "live_sidecar_parity_pass_generic_replay_missing"
     if not diff_ok(replay_diff, price_tolerance):
@@ -197,6 +219,7 @@ def audit_rows(
     replay: pd.DataFrame,
     price_tolerance: float,
     time_tolerance: float,
+    max_signal_order_reprice_cents: float,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for _, paper_row in paper.sort_values("created_at").iterrows():
@@ -209,6 +232,12 @@ def audit_rows(
         signal_dt = time_diff_sec(signal, paper_row)
         order_dt = time_diff_sec(order, paper_row)
         replay_dt = time_diff_sec(replay_match, paper_row)
+        signal_order_reprice_cents = None
+        if signal is not None and order is not None:
+            try:
+                signal_order_reprice_cents = (float(order.get("entry_price")) - float(signal.get("entry_price"))) * 100.0
+            except Exception:
+                signal_order_reprice_cents = None
         rows.append(
             {
                 "paper_id": paper_row.get("id"),
@@ -227,6 +256,7 @@ def audit_rows(
                 "order_entry_price": None if order is None else order.get("entry_price"),
                 "order_price_diff": order_diff,
                 "order_time_diff_sec": order_dt,
+                "signal_order_reprice_cents": signal_order_reprice_cents,
                 "replay_time": None if replay_match is None else replay_match.get("received_at_utc"),
                 "replay_entry_price": None if replay_match is None else replay_match.get("entry_price"),
                 "replay_price_diff": replay_diff,
@@ -235,12 +265,14 @@ def audit_rows(
                 "verdict": row_verdict(
                     signal_diff,
                     order_diff,
+                    signal_order_reprice_cents,
                     signal_dt,
                     order_dt,
                     replay_match,
                     replay_diff,
                     price_tolerance,
                     time_tolerance,
+                    max_signal_order_reprice_cents,
                 ),
             }
         )
@@ -254,12 +286,32 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     live_pass = sum(
         count
         for verdict, count in verdict_counts.items()
-        if verdict.startswith("full_live") or verdict.startswith("live_sidecar_parity_pass")
+        if (
+            verdict.startswith("full_live")
+            or verdict.startswith("live_sidecar_parity_pass")
+            or verdict.startswith("live_sidecar_order_parity_pass")
+        )
     )
-    generic_mismatch = verdict_counts.get("live_sidecar_parity_pass_generic_replay_price_mismatch", 0)
+    reprice_values = [
+        float(row["signal_order_reprice_cents"])
+        for row in rows
+        if row.get("signal_order_reprice_cents") is not None and abs(float(row["signal_order_reprice_cents"])) > 1e-9
+    ]
+    signal_reprice_rows = len(reprice_values)
+    generic_mismatch = (
+        verdict_counts.get("live_sidecar_parity_pass_generic_replay_price_mismatch", 0)
+        + verdict_counts.get("live_sidecar_order_parity_pass_signal_reprice_generic_replay_price_mismatch", 0)
+    )
+    live_sidecar_price_mismatch = verdict_counts.get("fail_live_sidecar_price_mismatch", 0)
+    signal_reprice_over_limit = verdict_counts.get("fail_signal_order_reprice_over_limit", 0)
     return {
         "paper_rows": len(rows),
         "live_sidecar_parity_pass_rows": live_pass,
+        "live_sidecar_price_mismatch_rows": live_sidecar_price_mismatch,
+        "signal_order_reprice_rows": signal_reprice_rows,
+        "signal_order_reprice_over_limit_rows": signal_reprice_over_limit,
+        "max_signal_order_reprice_cents": max(reprice_values) if reprice_values else 0.0,
+        "max_signal_order_worse_reprice_cents": max([value for value in reprice_values if value > 0.0], default=0.0),
         "generic_replay_price_mismatch_rows": generic_mismatch,
         "verdict_counts": verdict_counts,
     }
@@ -288,7 +340,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     paper = load_csv(args.paper_trades)
     selected, orders = load_sidecar_tables(args.materialized_db)
     replay = strategy_replay_rows(args.replay_trades, args.strategy)
-    rows = audit_rows(paper, selected, orders, replay, args.price_tolerance, args.time_tolerance_sec)
+    rows = audit_rows(
+        paper,
+        selected,
+        orders,
+        replay,
+        args.price_tolerance,
+        args.time_tolerance_sec,
+        args.max_signal_order_reprice_cents,
+    )
     summary = summarize(rows)
     write_csv(args.out_dir / "paper_replay_parity_rows.csv", rows)
     (args.out_dir / "paper_replay_parity_summary.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
@@ -300,6 +360,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "strategy": args.strategy,
         "price_tolerance": args.price_tolerance,
         "time_tolerance_sec": args.time_tolerance_sec,
+        "max_signal_order_reprice_cents": args.max_signal_order_reprice_cents,
     }
     (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     report_df = pd.DataFrame(rows)
@@ -310,6 +371,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "paper_entry_price",
         "signal_entry_price",
         "order_entry_price",
+        "signal_order_reprice_cents",
         "replay_entry_price",
         "signal_time_diff_sec",
         "order_time_diff_sec",
