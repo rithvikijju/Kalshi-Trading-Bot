@@ -14847,3 +14847,50 @@ artifacts:
   full-snapshot strategy window is negative for cheap-tail variants. Lowdd has
   one clean post-restart official-settled win; keep collecting, but do not
   promote from a single row.
+
+### 2026-05-30 - Lowdd post-restart report gate and replay parity row
+
+- Added `scripts/build_btc15m_lowdd_postrestart_report.py`, a reusable
+  post-restart evidence gate for the BTC15M lowdd paper shadow. It reads only
+  ledger rows at or after a configured clean-restart timestamp, fetches official
+  Kalshi settlement, computes PnL using the lowdd ledger's recorded fee as a
+  total fill fee, audits optional sidecar signal/order counts, and writes
+  CSV/JSON/Markdown reports.
+- Added `scripts/test_btc15m_lowdd_postrestart_report.py` covering:
+  total-fee PnL semantics, post-restart SQLite filtering, and row-order max
+  drawdown summary.
+- Ran the report on the remote lowdd ledger with
+  `--since-utc 2026-05-30T06:33:25+00:00`. Remote artifact:
+  `runtime\remote_backtests\btc15m_lowdd_postrestart_latest`.
+  Summary:
+  `1` trade, `1` settled, `1` win, `0` losses, official PnL `+$3.02`,
+  premium `$3.98`, return on premium `75.8794%`, max drawdown `$0.00`.
+- Sidecar context since the clean restart:
+  `93,560` top-book rows, `5,139` lifecycle rows, `42,693` signal scans,
+  and exactly `1` order decision. Signal actions:
+  `38,486 none`, `2,998 skip`, `1,209 blocked`, `1 selected`.
+  The only order action was `paper_fill / filled` at
+  `2026-05-30T07:25:01.599934Z`.
+- Materialized the lowdd sidecar window
+  `2026-05-30T07:00:00Z..07:30:00Z`:
+  `40,555` top-book rows, `3,454` lifecycle rows, `18,762` signal scans,
+  `1` order decision, and `38,885` synthetic Coinbase rows.
+- Offline replay on that same lowdd capture window reproduced the live paper
+  lowdd decision:
+  `current_lowdd_no_rv` had `1` trade, event
+  `KXBTC15M-26MAY300330`, market `KXBTC15M-26MAY300330-30`, side `yes`,
+  entry `0.55`, first entry `2026-05-30T07:25:00.023952Z`, official result
+  `yes`, single-contract PnL `+$0.43`. The paper ledger scaled the same
+  decision to `7` contracts, recorded total fee `$0.13`, and official PnL
+  `+$3.02`.
+- Other diagnostic rules on the same tiny two-event window:
+  `cheap_yes_rr_first` and `cheap_tail_best_side_first` were `+$0.527` on
+  `2` trades, `cheap_no_rr_first` was `-$0.620` on `1` trade,
+  `cheap_pair_lock_rr` was `+$0.010` on `1`, and
+  `cheap_tail_position_aware` was `-$0.093` on `2`. These are exploratory only.
+- Interpretation:
+  the lowdd post-restart accounting/execution path now has one official-settled
+  row with replay parity. This validates that the previous stale-exposure
+  blocker is fixed for at least one selected signal. It does not validate a
+  deployable strategy; continue counting only future post-restart official
+  rows and inspect row-level drawdown before promotion discussion.
