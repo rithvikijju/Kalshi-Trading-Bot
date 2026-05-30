@@ -14894,3 +14894,68 @@ artifacts:
   blocker is fixed for at least one selected signal. It does not validate a
   deployable strategy; continue counting only future post-restart official
   rows and inspect row-level drawdown before promotion discussion.
+
+### 2026-05-30 - Full-snapshot rolling-window replay and second lowdd post-restart row
+
+- Added `scripts/build_btc15m_live_holdout_window_grid.py`, a rolling-window
+  replay driver for already-snapshotted BTC15M DuckDB captures. It reuses the
+  filtered live-holdout scoring path without repeatedly copying the same
+  multi-GB snapshot. Added `scripts/test_btc15m_live_holdout_window_grid.py`
+  for window clipping and bad-bound validation.
+- Ran the grid on the remote full raw snapshot
+  `runtime\duckdb_snapshots\raw_btc15m_full_20260530_071126\btc15m_live_capture.duckdb`
+  for `2026-05-29T16:00:00Z..2026-05-30T07:00:00Z`, using one-hour windows and
+  real Coinbase ticks. Remote artifact:
+  `runtime\remote_backtests\btc15m_full_snapshot_window_grid_20260529_1600_20260530_0700`.
+- Aggregate official-settled replay results:
+  - `current_lowdd_no_rv`: `21` trades across `21` events, official PnL
+    `+$2.40`, premium `$13.60`, return on premium `+17.647%`, win rate
+    `76.19%`, max drawdown `-$0.90`, positive/negative/flat windows
+    `10 / 2 / 3`.
+  - `cheap_yes_rr_first`: `42` trades, official PnL `+$2.566`, premium
+    `$13.434`, return on premium `+19.10%`, win rate `38.10%`, max drawdown
+    `-$1.434`.
+  - `cheap_no_rr_first`: `41` trades, official PnL `-$7.347`, return on
+    premium `-51.21%`.
+  - `cheap_tail_best_side_first`: `60` trades, official PnL `-$4.451`, return
+    on premium `-30.80%`.
+  - `cheap_tail_position_aware`: `60` trades, official PnL `-$5.061`, return
+    on premium `-19.42%`.
+  - `cheap_pair_lock_rr`: `21` diagnostic pair-lock rows, official PnL
+    `+$1.11`, return on premium `+5.58%`; this remains diagnostic only until
+    pair timing and executable two-leg behavior are audited.
+- `current_lowdd_no_rv` window path:
+  `+0.57`, `-0.90`, `+0.29`, `+0.11`, `+0.24`, `+0.09`, `+0.39`, `+0.43`,
+  `-0.04`, `+0.25`, `+0.11`, `+0.86`, then three flat no-trade hours from
+  `04:00Z..07:00Z`. This is promising as a replay stability check, but it
+  still includes pre-restart replay rows and is not live-paper promotion
+  evidence.
+- Refreshed the remote lowdd post-restart report after the `07:55Z` decision.
+  Artifact:
+  `runtime\remote_backtests\btc15m_lowdd_postrestart_latest`.
+  Since the clean restart at `2026-05-30T06:33:25Z`, the sidecar has `117,397`
+  top-book rows, `54,126` signal scans, `2` selected signals, and `2`
+  `paper_fill / filled` order decisions.
+- Post-restart lowdd official-settled rows:
+  - id `13`: `KXBTC15M-26MAY300330-30`, YES, `7` contracts at `0.55`, total
+    fee `$0.13`, quote age `3.0025ms`, top visible qty `154`, Kalshi result
+    YES, official PnL `+$3.02`.
+  - id `14`: `KXBTC15M-26MAY300400-00`, NO, `4` contracts at `0.23`, total
+    fee `$0.05`, quote age `56.1282ms`, top visible qty `30`, Kalshi result
+    YES, official PnL `-$0.97`.
+- Post-restart lowdd summary is now `2` trades, `2` settled, `1` win, `1` loss,
+  official PnL `+$2.05`, premium `$4.95`, return on premium `41.4141%`, win
+  rate `50%`, max drawdown `-$0.97`.
+- Remote live health from sidecar tails at `2026-05-30T08:04Z`: raw BTC15M
+  capture latest top-book row was `2026-05-30T08:03:57.561998Z`; lowdd latest
+  top-book row was `2026-05-30T08:03:59.833492Z`, latest signal scan was
+  `2026-05-30T08:03:59.834478Z`, and the latest order decision was the
+  `07:55:28.491029Z` filled NO paper row. Scheduled-task/process enumeration
+  through CIM was denied over SSH, so sidecar freshness is the operational
+  health evidence for this check.
+- Interpretation:
+  the 15-hour full-snapshot replay makes lowdd worth continued forward testing,
+  but the fresh official paper ledger is still too small and already has one
+  loss. Keep the raw collector and lowdd paper shadow running; do not promote
+  or size up without substantially more post-restart official-settled rows and
+  row-level drawdown stability.
