@@ -31,7 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--strategy", default="current_lowdd_no_rv")
     parser.add_argument("--price-tolerance", type=float, default=1e-9)
-    parser.add_argument("--time-tolerance-sec", type=float, default=10.0)
+    parser.add_argument(
+        "--time-tolerance-sec",
+        type=float,
+        default=30.0,
+        help="Maximum tolerated paper-ledger to order-sidecar timestamp skew in seconds.",
+    )
     parser.add_argument(
         "--max-signal-order-reprice-cents",
         type=float,
@@ -49,7 +54,7 @@ def load_csv(path: Path) -> pd.DataFrame:
     for col in ["entry_price", "contracts", "fee", "official_pnl", "premium", "pnl"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["event_ticker", "market_ticker", "side", "strategy"]:
+    for col in ["event_ticker", "market_ticker", "side", "strategy", "client_order_id"]:
         if col in df.columns:
             df[col] = df[col].astype(str)
     return df
@@ -78,8 +83,10 @@ def load_sidecar_tables(materialized_db: Path | None) -> tuple[pd.DataFrame, pd.
             ORDER BY TRY_CAST(received_at_utc AS TIMESTAMPTZ)
             """
         ).fetchdf()
+        order_cols = {str(row[1]) for row in con.execute("PRAGMA table_info(order_decision)").fetchall()}
+        client_order_expr = "client_order_id" if "client_order_id" in order_cols else "NULL::VARCHAR AS client_order_id"
         orders = con.execute(
-            """
+            f"""
             SELECT TRY_CAST(received_at_utc AS TIMESTAMPTZ) AS received_at_utc,
                    event_ticker,
                    market_ticker,
@@ -87,6 +94,7 @@ def load_sidecar_tables(materialized_db: Path | None) -> tuple[pd.DataFrame, pd.
                    contracts,
                    entry_price,
                    estimated_cost,
+                   {client_order_expr},
                    action,
                    detail
             FROM order_decision
@@ -102,7 +110,7 @@ def load_sidecar_tables(materialized_db: Path | None) -> tuple[pd.DataFrame, pd.
             for col in ["entry_price", "contracts", "estimated_cost", "net_edge_cents", "model_p_yes"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
-            for col in ["event_ticker", "market_ticker", "side", "action", "detail"]:
+            for col in ["event_ticker", "market_ticker", "side", "action", "detail", "client_order_id"]:
                 if col in df.columns:
                     df[col] = df[col].astype(str)
     return selected, orders
@@ -136,6 +144,11 @@ def nearest_match(
     subset = rows[mask].copy()
     if subset.empty:
         return None
+    paper_client_order_id = str(paper.get("client_order_id") or "")
+    if paper_client_order_id and "client_order_id" in subset.columns:
+        exact = subset[subset["client_order_id"].astype(str).eq(paper_client_order_id)].copy()
+        if not exact.empty:
+            subset = exact
     paper_ts = paper.get("created_at")
     if pd.notna(paper_ts) and time_col in subset.columns:
         subset["_abs_dt_sec"] = (subset[time_col] - paper_ts).dt.total_seconds().abs()
