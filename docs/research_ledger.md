@@ -15131,3 +15131,37 @@ artifacts:
   useful for broader research-window diagnostics, but it is not allowed to
   prove wrapper policy parity unless its row-level selected prices match the
   sidecar-selected rows.
+
+### 2026-05-30 - Lowdd forward promotion gate
+
+- Added `scripts/build_btc15m_lowdd_forward_promotion_gate.py` and
+  `scripts/test_btc15m_lowdd_forward_promotion_gate.py`.
+- Purpose:
+  convert the current post-restart lowdd evidence stack into a machine-readable
+  promotion decision. Inputs are the sidecar-selected official replay, the
+  paper/live-sidecar parity audit, and the post-restart official paper summary.
+  The gate does not rescore data or tune thresholds.
+- Ran it on the latest lowdd artifacts:
+  - selected replay:
+    `runtime\remote_backtests\btc15m_lowdd_sidecar_selected_20260530_0700_0820`;
+  - parity audit:
+    `runtime\remote_backtests\btc15m_lowdd_paper_replay_parity_20260530_0700_0820`;
+  - post-restart paper report:
+    `runtime\remote_backtests\btc15m_lowdd_postrestart_latest`.
+- Output:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_latest`.
+- Gate result:
+  `production_ready = false`,
+  `research_status = research_promising_insufficient_forward_sample`.
+- Passing evidence:
+  live sidecar parity is `3 / 3`, order price mismatch rows are `0`,
+  one-contract signal PnL is `+$0.51`, paper-order-scaled PnL is `+$5.05`,
+  and order-scaled max drawdown is `-$0.97`.
+- Blockers:
+  `selected_rows_below_min`, `settled_rows_below_min`, `order_rows_below_min`,
+  and `paper_settled_rows_below_min`; all are caused by only `3` settled
+  forward rows versus the default `50` row minimum.
+- Advisory:
+  generic replay still has `1` price mismatch, so generic top-book replay
+  remains diagnostic. The sidecar-selected replay is the authoritative
+  wrapper-parity path for future lowdd paper fills.
