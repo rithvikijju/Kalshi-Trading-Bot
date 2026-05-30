@@ -49,7 +49,93 @@ function Read-CaptureStatusPid {
     }
 }
 
+function Get-TaskRuntimeStatus {
+    param([string]$TaskName)
+    if (!$TaskName) {
+        return [pscustomobject]@{
+            task_exists = $false
+            task_runtime_status = ""
+            task_status_source = "no_task_name"
+            task_status_error = ""
+        }
+    }
+    try {
+        if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if ($task) {
+                return [pscustomobject]@{
+                    task_exists = $true
+                    task_runtime_status = [string]$task.State
+                    task_status_source = "Get-ScheduledTask"
+                    task_status_error = ""
+                }
+            }
+        }
+    } catch {
+        # Fall back to schtasks below.
+    }
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = cmd.exe /c "schtasks /Query /TN `"$TaskName`" /FO LIST /V" 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+    if ($exitCode -ne 0) {
+        return [pscustomobject]@{
+            task_exists = $false
+            task_runtime_status = "MISSING_TASK"
+            task_status_source = "schtasks"
+            task_status_error = ($output -join "`n")
+        }
+    }
+    $status = ""
+    foreach ($line in @($output)) {
+        if ([string]$line -match '^\s*Status:\s*(.+?)\s*$') {
+            $status = $Matches[1].Trim()
+            break
+        }
+    }
+    return [pscustomobject]@{
+        task_exists = $true
+        task_runtime_status = $status
+        task_status_source = "schtasks"
+        task_status_error = ""
+    }
+}
+
+function Get-TaskSupervisionStatus {
+    param(
+        [bool]$ExpectedProcess,
+        [string]$TaskName,
+        [object]$TaskStatus
+    )
+    if (!$TaskName) {
+        return "NO_TASK_DIRECT_LAUNCH"
+    }
+    if (!$TaskStatus.task_exists) {
+        return "TASK_MISSING"
+    }
+    $runtime = ([string]$TaskStatus.task_runtime_status).Trim().ToLowerInvariant()
+    if ($ExpectedProcess -and $runtime -ne "running") {
+        return "PROCESS_RUNNING_TASK_NOT_RUNNING"
+    }
+    if (!$ExpectedProcess -and $runtime -eq "running") {
+        return "TASK_RUNNING_PROCESS_MISSING"
+    }
+    if ($ExpectedProcess) {
+        return "TASK_PROCESS_ALIGNED"
+    }
+    return "PROCESS_AND_TASK_NOT_RUNNING"
+}
+
 foreach ($row in @($manifest.started)) {
+    $manifestTaskName = [string]$row.task_name
+    $expectedTaskName = $manifestTaskName
+    if (!$expectedTaskName -and $row.name) {
+        $expectedTaskName = "KalshiBTC_$([string]$row.name)"
+    }
     $manifestPid = [int]$row.process_id
     $targetPid = $manifestPid
     $pidSource = "manifest"
@@ -80,6 +166,8 @@ foreach ($row in @($manifest.started)) {
             $pidInfo = $null
         }
     }
+    $taskStatus = Get-TaskRuntimeStatus -TaskName $expectedTaskName
+    $supervisionStatus = Get-TaskSupervisionStatus -ExpectedProcess ([bool]$expectedProcess) -TaskName $expectedTaskName -TaskStatus $taskStatus
     $rows += [pscustomobject]@{
         name = $row.name
         script = $row.script
@@ -87,10 +175,16 @@ foreach ($row in @($manifest.started)) {
         manifest_process_id = $manifestPid
         process_id_source = $pidSource
         launcher_pid = $row.launcher_pid
-        task_name = $row.task_name
+        manifest_task_name = $manifestTaskName
+        task_name = $expectedTaskName
         process_name = $processName
         running = [bool]$expectedProcess
         running_status = if ($expectedProcess) { "RUNNING_EXPECTED_PYTHON" } elseif ($proc) { "PID_REUSED_OR_UNEXPECTED_PROCESS" } else { "MISSING_PROCESS" }
+        task_exists = $taskStatus.task_exists
+        task_runtime_status = $taskStatus.task_runtime_status
+        task_status_source = $taskStatus.task_status_source
+        task_status_error = $taskStatus.task_status_error
+        task_supervision_status = $supervisionStatus
         start_time = $startTime
         cpu_seconds = if ($proc -and $proc.CPU -ne $null) { [math]::Round($proc.CPU, 3) } else { "" }
         working_set_mb = if ($proc) { [math]::Round($proc.WorkingSet64 / 1MB, 1) } else { "" }
@@ -103,6 +197,15 @@ foreach ($row in @($manifest.started)) {
 [pscustomobject]@{
     repo_root = $RepoRoot
     checked_at_utc = (Get-Date).ToUniversalTime().ToString("o")
-    status = if (($rows | Where-Object { $_.running }).Count -eq @($manifest.started).Count) { "ALL_RUNNING" } else { "MISSING_PROCESS" }
+    status = if (@($rows | Where-Object { $_.running }).Count -eq @($manifest.started).Count) { "ALL_RUNNING" } else { "MISSING_PROCESS" }
+    supervision_status = if (@($rows | Where-Object { $_.task_supervision_status -eq "PROCESS_RUNNING_TASK_NOT_RUNNING" }).Count -gt 0) {
+        "PROCESS_RUNNING_TASK_NOT_RUNNING"
+    } elseif (@($rows | Where-Object { $_.task_supervision_status -eq "TASK_MISSING" }).Count -gt 0) {
+        "TASK_MISSING"
+    } elseif (@($rows | Where-Object { $_.task_supervision_status -eq "TASK_RUNNING_PROCESS_MISSING" }).Count -gt 0) {
+        "TASK_RUNNING_PROCESS_MISSING"
+    } else {
+        "TASK_SUPERVISION_OK"
+    }
     rows = $rows
 } | ConvertTo-Json -Depth 5

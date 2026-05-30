@@ -15290,3 +15290,35 @@ artifacts:
   still collecting, but its task-wrapper supervision state needs care before
   any future planned pause/restart; do not start a duplicate persistent writer
   against the same DB.
+
+### 2026-05-30 - Collector status supervision patch
+
+- Patched `scripts/status_btc_remote_collectors.ps1` to report scheduled-task
+  supervision separately from process liveness. The script now:
+  - derives the expected task name as `KalshiBTC_<collector_name>` when the
+    runtime manifest has a blank `task_name`;
+  - reports `manifest_task_name`, resolved `task_name`, `task_exists`,
+    `task_runtime_status`, `task_status_source`, `task_status_error`, and
+    `task_supervision_status` per row;
+  - emits a top-level `supervision_status` while preserving the existing
+    process-level `status` field, so watchdog logic that keys off process
+    liveness is not silently changed.
+- Local validation:
+  parsed the PowerShell script with `[scriptblock]::Create(...)` and ran it
+  against a fake runtime manifest. The fake missing-task case now produces
+  top-level `supervision_status = TASK_MISSING`.
+- Deployed only the patched status script to the remote working copy and ran it
+  against the real manifest. Output confirmed the raw capture supervision
+  issue directly:
+  - top-level `supervision_status = PROCESS_RUNNING_TASK_NOT_RUNNING`;
+  - `btc15m_live_capture` process PID `6084` is alive and read from
+    `capture_status_sidecar`;
+  - resolved task name is `KalshiBTC_btc15m_live_capture`;
+  - `task_exists = true`, `task_runtime_status = Ready`;
+  - row-level `task_supervision_status =
+    PROCESS_RUNNING_TASK_NOT_RUNNING`.
+- Interpretation:
+  status tooling now makes the current laptop state explicit: raw capture is
+  alive, but not task-supervised. Do not use `schtasks /Run` or
+  `ensure_btc_remote_collectors.ps1` casually while PID `6084` is still holding
+  the raw DB, because that could attempt to start a duplicate writer.
