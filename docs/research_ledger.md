@@ -36,9 +36,21 @@ This ledger tracks strategy research paths so we do not repeatedly rediscover re
   `--shadow-bankroll 100`,
   `btc15m_lowdd_forward_shadow_trades.db`, and
   `btc15m_lowdd_forward_shadow_capture.duckdb`.
-- Next: redeploy the launcher, restart the current-active collectors, and
-  verify both sidecars are fresh with `failed=false`, `dropped=0`, and raw
-  Coinbase replay rows present.
+- Deployed the patched code bundle with credentials/data excluded, then
+  restarted current-active collectors through Task Scheduler. Verified at
+  `2026-05-30T11:51:55Z`: raw PID `12940` and lowdd PID `4992` were both
+  `TASK_PROCESS_ALIGNED`; both sidecars were fresh with `failed=false`,
+  `dropped=0`, and empty `last_error`.
+- The fixed lowdd PID JSON recorded explicit args:
+  `--mode paper`, `--env prod`, `--strategy lowdd`,
+  `--shadow-bankroll 100`,
+  `btc15m_lowdd_forward_shadow_trades.db`,
+  `btc15m_lowdd_forward_shadow_capture.duckdb`, and
+  `--capture-writer persistent`.
+- Post-restart replay sidecar fidelity marker: raw sidecar had
+  `coinbase_ticker=109` replay rows and lowdd sidecar had `coinbase_ticker=26`
+  replay rows by the final check, confirming future bounded materializations
+  no longer need synthetic Coinbase ticks for new rows.
 
 ### 2026-05-27 - Remote websocket snapshot backtest and shadow cleanup
 
