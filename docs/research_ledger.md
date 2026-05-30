@@ -15859,3 +15859,48 @@ artifacts:
   scripts\build_btc15m_lowdd_forward_promotion_gate.py
   scripts\test_btc15m_lowdd_sidecar_selected.py
   scripts\test_btc15m_lowdd_forward_promotion_gate.py` passed.
+
+### 2026-05-30 - BTC15M kalshi_v2 adapter feasibility audit
+
+- Added `scripts\audit_btc15m_kalshi_v2_adapter_feasibility.py` to move the
+  branch audit beyond "needs adapter" and answer whether the `kalshi_v2`
+  branch family can be adapted scientifically to the current BTC15M binary
+  websocket capture.
+- The audit separates:
+  - direct branch backtest feasibility;
+  - table-alias feasibility for current capture tables;
+  - REST metadata coverage for mapping BTC15M binary markets to floor strikes
+    and official outcomes;
+  - hold-to-settlement research-adapter feasibility; and
+  - original v2 TP/SL/time-exit deployability risk.
+- Artifact:
+  `backtest_outputs\btc15m_kalshi_v2_adapter_feasibility_20260530_1041`.
+  Input capture:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_1041\btc15m_raw_20260530_0640_1041.duckdb`.
+- Capture/REST preflight:
+  the slice has `17` BTC15M binary markets, `0` cumulative `-T` markets, and
+  synthetic/provenance-weak Coinbase ticks (`coinbase_raw_book_field_rate=0`).
+  Kalshi REST returned `17 / 17` captured markets matched, `17 / 17`
+  floor-strike rows, and `17 / 17` official result rows.
+- Branch results:
+  all `17` `kalshi_v2` refs were classified
+  `research_adapter_feasible_not_original_v2_deployable`.
+  For the `3` branches with `kalshi_v2/backtest.py`
+  (`origin/claude/v2-backtest-harness`, `origin/arb-v3`, and
+  `origin/claude/v2-sami-strategy-backtest`), direct execution is blocked by
+  missing `_dedup`/`_all` table names and, more importantly, by the absence of
+  cumulative `-T` markets because the branch backtest filters/parses `-T`
+  tickers. The other `kalshi_v2` refs still need a captured-DuckDB harness.
+- Scientific interpretation:
+  a branch-original replay is not honest on the current BTC15M slice. A new
+  preregistered research adapter is feasible: map each BTC15M binary market to
+  its REST `floor_strike`, use decision-time `ws_orderbook_top` rows, use
+  official REST settlement, and hold to settlement first. TP/SL/time-exit logic
+  from v2 remains excluded from deployment evidence until live exit-fill
+  behavior is validated independently.
+- Validation:
+  `python -m pytest scripts\test_btc15m_kalshi_v2_adapter_feasibility.py -q
+  --basetemp .pytest-codex-tmp-v2-adapter-2` passed with `3` tests.
+  `python -m py_compile
+  scripts\audit_btc15m_kalshi_v2_adapter_feasibility.py
+  scripts\test_btc15m_kalshi_v2_adapter_feasibility.py` passed.
