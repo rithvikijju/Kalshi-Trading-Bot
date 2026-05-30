@@ -14685,3 +14685,33 @@ artifacts:
   verify sizing no longer skips on the next selected signal, and compare any
   new paper fills to the raw-sidecar replay candidates before considering any
   deployment discussion.
+
+### 2026-05-30 - Remote post-restart lowdd and git hygiene check
+
+- Pulled and pushed branch `sami`; it was already aligned with `origin/sami`
+  and `git push` reported `Everything up-to-date`.
+- Remote branch scan after fetch showed `origin/sami` at commit `226b7f2`
+  from `2026-05-30`; the newest non-`sami` branch head remained
+  `origin/claude/v2-backtest-harness` at `4b62b23` from `2026-05-13`.
+- Remote raw BTC15M capture remained live and was not paused or restarted.
+  Status at `2026-05-30T06:46:16Z`: PID `14260`, `failed=false`,
+  `dropped=0`, queue depth `0`, `ws_orderbook_top=16,948,827`,
+  `ws_lifecycle=1,283,375`, `coinbase_ticker=201,301`, latest top-book row
+  `2026-05-30T06:46:16.691831Z`. `capture_raw_ws=false`, so this is faithful
+  top-of-book/lifecycle capture, not a full raw websocket frame archive.
+- Remote lowdd paper shadow remained live under scheduled task
+  `\KalshiBTC_btc15m_lowdd_forward_shadow`. Status at
+  `2026-05-30T06:46:19Z`: PID `12796`, `failed=false`, `dropped=0`,
+  queue depth `9`, latest `signal_scan=2026-05-30T06:46:18.773534Z`;
+  the latest `order_decision` was still pre-restart at
+  `2026-05-30T03:55:56.634518Z`.
+- Bounded replay-sidecar audit for
+  `received_at_utc >= 2026-05-30T06:33:25Z` found `18,746`
+  `ws_orderbook_top` rows, `1,022` lifecycle rows, and `9,487` signal scans.
+  Signal actions were `9,441 none` and `46 skip`; there were `0 selected`
+  rows, `0 order_decision` rows, and `0` post-restart ledger fills.
+- Interpretation:
+  the lowdd paper-accounting fix is running and no longer visibly stuck on the
+  old `sizing_budget_or_liquidity_zero` blocker, but no qualifying post-restart
+  signal has occurred yet. Leave the shadow running; do not retune thresholds
+  on this window.
