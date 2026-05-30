@@ -15096,3 +15096,38 @@ artifacts:
   sidecar selected/order rows as the authoritative replay-parity check for
   post-restart paper fills; treat generic replay summaries as conservative
   diagnostics unless row-level price parity passes.
+
+### 2026-05-30 - Sidecar-selected lowdd official replay
+
+- Added `scripts/backtest_btc15m_lowdd_sidecar_selected.py` and
+  `scripts/test_btc15m_lowdd_sidecar_selected.py`.
+- Purpose:
+  create a policy-equivalent replay path for the running lowdd paper wrapper by
+  using `signal_scan` rows where `action = selected`, rather than rescoring all
+  top-book rows in the generic replay harness. This preserves the live wrapper's
+  exact selected market, side, entry price, and scan cadence.
+- Ran it on the materialized lowdd sidecar slice
+  `runtime\sidecar_slices\btc15m_lowdd_20260530_0700_0820.duckdb`.
+  Output:
+  `runtime\remote_backtests\btc15m_lowdd_sidecar_selected_20260530_0700_0820`.
+- Official-settled sidecar-selected results:
+  - selected rows: `3`;
+  - settled rows: `3`;
+  - one-contract signal PnL: `+$0.51` on `$1.49` premium, return on premium
+    `34.2282%`, win rate `66.6667%`, max drawdown `-$0.25`;
+  - paper-order-scaled PnL: `+$5.05` on `$10.95` premium, return on premium
+    `46.1187%`, win rate `66.6667%`, max drawdown `-$0.97`;
+  - order price mismatch rows: `0`.
+- Row-level sidecar-selected official results:
+  - `KXBTC15M-26MAY300330-30`, YES at `0.55`, official YES, one-contract PnL
+    `+$0.43`, paper scaled PnL `+$3.02`;
+  - `KXBTC15M-26MAY300400-00`, NO at `0.23`, official YES, one-contract PnL
+    `-$0.25`, paper scaled PnL `-$0.97`;
+  - `KXBTC15M-26MAY300415-15`, YES at `0.65`, official YES, one-contract PnL
+    `+$0.33`, paper scaled PnL `+$3.00`.
+- Interpretation:
+  the sidecar-selected replay should be the authoritative wrapper-parity
+  backtest for fresh lowdd paper evidence. The generic top-book replay remains
+  useful for broader research-window diagnostics, but it is not allowed to
+  prove wrapper policy parity unless its row-level selected prices match the
+  sidecar-selected rows.
