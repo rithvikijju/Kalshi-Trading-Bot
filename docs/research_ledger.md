@@ -15356,3 +15356,69 @@ artifacts:
   the watchdog/ensure path is now safer in the current laptop state. It will
   not automatically start a duplicate raw capture while the unsupervised PID is
   alive and holding the active DuckDB.
+
+### 2026-05-30 - BTC15M post-restart lowdd forward evidence window
+
+- Remote status checked at about `2026-05-30T09:35Z`:
+  raw `btc15m_live_capture` was still fresh and live with PID `6084`,
+  `failed=false`, `dropped=0`, replay sidecar size about `12.63GB`, and
+  `task_supervision_status = PROCESS_RUNNING_TASK_NOT_RUNNING`.
+  Lowdd was separately task-supervised by
+  `\KalshiBTC_btc15m_lowdd_forward_shadow`, with fresh
+  `btc15m_lowdd_forward_shadow_capture.duckdb.status.json` and replay sidecar
+  writes.
+- Materialized a bounded post-restart window from remote replay sidecars
+  without pausing collection:
+  `2026-05-30T06:40:00Z..2026-05-30T09:15:00Z`.
+  Local ignored slices:
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_0915\btc15m_raw_20260530_0640_0915.duckdb`
+  and
+  `runtime\remote_snapshots\sidecar_slices_20260530_0640_0915\btc15m_lowdd_20260530_0640_0915.duckdb`.
+- Raw slice counts:
+  `189,370` top-book rows, `844` lifecycle rows, `180,520` synthetic Coinbase
+  rows, `11` BTC15M events. Fidelity artifact:
+  `backtest_outputs\btc15m_raw_sidecar_fidelity_20260530_0640_0915`.
+  Verdict remained research-only:
+  `promotion_grade_coinbase_ticks=false` because Coinbase rows are synthetic
+  from top-book `btc_spot`; top-book hard failure was
+  `top_book_gaps_over_threshold`; valid-book rate was `99.5849%`.
+- Official live-holdout replay artifact:
+  `backtest_outputs\btc15m_live_holdout_20260530_0640_0915`.
+  All `11` events had finalized Kalshi settlement. Results:
+  `current_lowdd_no_rv` had `4` trades, `+$0.75` one-contract PnL,
+  `+33.33%` return on premium, `75%` win rate, max drawdown `-$0.25`.
+  Other rule-pack rows were mixed/negative except small diagnostic positives:
+  `cheap_yes_rr_first` `+$0.619`, `cheap_pair_lock_rr` `+$0.160`.
+- Lowdd sidecar-selected replay artifact:
+  `backtest_outputs\btc15m_lowdd_sidecar_selected_20260530_0640_0915`.
+  The lowdd wrapper emitted `4` selected/paper-fill decisions in this bounded
+  window. All `4` officially settled. Sidecar-selected one-contract PnL was
+  `+$0.84`; scaled order PnL was `+$8.05` on `$16.95` premium, `75%` win rate,
+  max drawdown `-$0.97`, and `order_price_mismatch_rows=0`.
+- Copied only the small remote paper ledger DB to ignored runtime and generated
+  a bounded paper-ledger report with a new `--end-utc` option:
+  `backtest_outputs\btc15m_lowdd_postrestart_20260530_0640_0915_bounded`.
+  Same-window paper ledger matched sidecar-selected economics:
+  `4` trades, `4` settled, official PnL `+$8.05`, premium `$16.95`,
+  return on premium `47.4926%`, max drawdown `-$0.97`.
+- Paper/live-sidecar parity artifact:
+  `backtest_outputs\btc15m_lowdd_paper_replay_parity_20260530_0640_0915`.
+  All `4 / 4` paper rows passed live sidecar parity. Generic raw replay had
+  one price mismatch, recorded as advisory because the live sidecar-selected
+  order stream is the policy-equivalent source for wrapper parity.
+- Promotion gate artifact:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_20260530_0640_0915_rerun`.
+  Verdict:
+  `production_ready=false`,
+  `research_status=research_promising_insufficient_forward_sample`.
+  Blockers are only sample-size gates:
+  `selected_rows_below_min`, `settled_rows_below_min`, `order_rows_below_min`,
+  and `paper_settled_rows_below_min` (`4` rows vs `50` required).
+- Interpretation:
+  the accounting fix worked on the first bounded post-restart evidence window,
+  and lowdd is now the most promising active paper-forward candidate. It is
+  still not deployable: the sample is tiny, the raw materialized slice uses
+  synthetic Coinbase rows, and raw capture supervision remains unsafe for
+  casual restarts. Continue collecting lowdd paper rows and periodically rerun
+  this bounded evidence packet; do not promote until the gate passes on a much
+  larger official-settled forward sample.

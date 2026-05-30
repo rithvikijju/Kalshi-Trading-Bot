@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sidecar", type=Path, default=DEFAULT_SIDECAR)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     parser.add_argument("--since-utc", default=DEFAULT_SINCE_UTC)
+    parser.add_argument("--end-utc", default="", help="Optional exclusive UTC upper bound for paper rows.")
     parser.add_argument("--sleep", type=float, default=0.05)
     parser.add_argument("--skip-sidecar", action="store_true")
     return parser.parse_args()
@@ -78,7 +79,7 @@ def table_columns(con: sqlite3.Connection, table: str) -> list[str]:
     return [str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall()]
 
 
-def load_postrestart_trades(path: Path, since_utc: str) -> list[dict[str, Any]]:
+def load_postrestart_trades(path: Path, since_utc: str, end_utc: str = "") -> list[dict[str, Any]]:
     if not path.exists():
         return []
     con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
@@ -93,11 +94,17 @@ def load_postrestart_trades(path: Path, since_utc: str) -> list[dict[str, Any]]:
         time_col = next((col for col in ["created_at_utc", "created_at", "entry_ts_utc"] if col in cols), None)
         if time_col is None:
             return [dict(row) for row in con.execute("SELECT * FROM research_live_trades ORDER BY id").fetchall()]
+        clauses = [f"{time_col} >= ?"]
+        params = [since_utc]
+        if end_utc:
+            clauses.append(f"{time_col} < ?")
+            params.append(end_utc)
+        where_sql = " AND ".join(clauses)
         return [
             dict(row)
             for row in con.execute(
-                f"SELECT * FROM research_live_trades WHERE {time_col} >= ? ORDER BY {time_col}, id",
-                [since_utc],
+                f"SELECT * FROM research_live_trades WHERE {where_sql} ORDER BY {time_col}, id",
+                params,
             ).fetchall()
         ]
     finally:
@@ -327,7 +334,7 @@ def markdown_table(rows: list[dict[str, Any]], columns: list[str]) -> str:
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    trades = load_postrestart_trades(args.trade_db, args.since_utc)
+    trades = load_postrestart_trades(args.trade_db, args.since_utc, args.end_utc)
     official_rows = add_official_results(trades, args.sleep)
     summary = summarize_trades(official_rows)
     sidecar = {} if args.skip_sidecar else sidecar_audit(args.sidecar, args.since_utc)
@@ -339,6 +346,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "trade_db": str(args.trade_db),
         "sidecar": str(args.sidecar),
         "since_utc": args.since_utc,
+        "end_utc": args.end_utc,
         "summary": summary,
     }
     (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
@@ -347,6 +355,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "",
         f"Generated: `{manifest['created_at_utc']}`",
         f"Since UTC: `{args.since_utc}`",
+        f"End UTC: `{args.end_utc or 'unbounded'}`",
         f"Trade DB: `{args.trade_db}`",
         "",
         "## Summary",

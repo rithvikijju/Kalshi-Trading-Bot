@@ -54,6 +54,40 @@ def test_load_postrestart_trades_filters_by_created_at(tmp_path):
     assert [row["id"] for row in rows] == [2]
 
 
+def test_load_postrestart_trades_can_apply_exclusive_end(tmp_path):
+    db = tmp_path / "trades.db"
+    con = sqlite3.connect(db)
+    con.execute(
+        """
+        CREATE TABLE research_live_trades (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT,
+            event_ticker TEXT,
+            market_ticker TEXT,
+            side TEXT,
+            contracts INTEGER,
+            entry_price REAL
+        )
+        """
+    )
+    con.execute(
+        "INSERT INTO research_live_trades VALUES (1, '2026-05-30T07:00:00+00:00', 'in', 'in-00', 'yes', 1, 0.5)"
+    )
+    con.execute(
+        "INSERT INTO research_live_trades VALUES (2, '2026-05-30T09:25:00+00:00', 'late', 'late-00', 'no', 2, 0.4)"
+    )
+    con.commit()
+    con.close()
+
+    rows = load_postrestart_trades(
+        db,
+        "2026-05-30T06:33:25+00:00",
+        "2026-05-30T09:15:00+00:00",
+    )
+
+    assert [row["id"] for row in rows] == [1]
+
+
 def test_summarize_trades_reports_path_drawdown():
     rows = [
         {"official_result": "yes", "official_win": True, "official_pnl": 3.0, "official_premium": 4.0},
