@@ -16805,3 +16805,41 @@ artifacts:
   ran successfully. `python -m py_compile scripts\build_btc15m_research_candidate_screen.py scripts\test_btc15m_research_candidate_screen.py`
   passed. `python -m pytest scripts\test_btc15m_research_candidate_screen.py -q --basetemp .pytest-codex-tmp-candidate-screen`
   passed with `1` test.
+
+### 2026-05-31 - Research-loop refresh wrapper and latest forward status
+
+- Added `scripts\refresh_btc15m_research_loop.py` with focused tests in
+  `scripts\test_refresh_btc15m_research_loop.py`. The wrapper runs the
+  repeatable evidence loop: lowdd remote evidence refresh, frozen ML sidecar
+  remote raw scoring, candidate-screen rebuild, git branch recency snapshot,
+  and one compact report. It does not start, stop, restart, deploy, or submit
+  orders.
+- Latest lowdd forward gate artifact:
+  `backtest_outputs\btc15m_lowdd_forward_promotion_gate_remote_20260531_0025`.
+  The sample improved to `19` official-settled paper rows, `16` wins and `3`
+  losses, official PnL `+$43.08` on `$82.92` premium, max drawdown `-$4.70`,
+  and live sidecar parity `19/19` with `0` live-sidecar price mismatches.
+  Production remains blocked only by sample-size gates:
+  `order_rows_below_min;paper_settled_rows_below_min;selected_rows_below_min;settled_rows_below_min`.
+- Latest ML remote raw sidecar artifact:
+  `backtest_outputs\btc15m_ml_sidecar_remote_raw_score_20260531_0035`.
+  Scored the post-`2026-05-30T16:14:00Z` raw capture window through
+  `2026-05-31T00:33:49.038618Z`. The frozen LightGBM metric produced
+  `1,011,938` executable side-candidate rows across `33` candidate events but
+  only `2` proxy-selected rows, proxy PnL `+$0.08`, `0` official rows, and
+  blockers `clean_proxy_rows_below_min;official_rows_below_min`. It remains
+  metric-only and not a paper-ordering candidate.
+- Latest consolidated loop artifact:
+  `backtest_outputs\btc15m_research_loop_refresh_20260531_0045`.
+  The candidate screen still found `0` deployable candidates. Correct action:
+  keep raw capture and lowdd running, keep scoring ML offline, and do not start
+  new paper/live shadows from current branch, v2, regime, walk-forward, or ML
+  evidence.
+- Validation:
+  `python -m py_compile scripts\build_btc15m_research_candidate_screen.py scripts\refresh_btc15m_research_loop.py scripts\test_btc15m_research_candidate_screen.py scripts\test_refresh_btc15m_research_loop.py`
+  passed. Focused pytest with repo-local basetemp passed:
+  `scripts\test_btc15m_research_candidate_screen.py`,
+  `scripts\test_refresh_btc15m_research_loop.py`,
+  `scripts\test_score_btc15m_ml_sidecar_remote_raw.py`, and
+  `scripts\test_refresh_btc15m_lowdd_remote_evidence.py` all passed
+  (`10` tests total).
