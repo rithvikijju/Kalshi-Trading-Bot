@@ -564,6 +564,24 @@ def markdown_table(df: pd.DataFrame, cols: list[str], limit: int | None = None) 
     return "\n".join(lines)
 
 
+def ml_sidecar_report_line(screen: pd.DataFrame) -> str:
+    sidecar = screen[screen["candidate_id"].astype(str) == "btc15m_lightgbm_tabular_nontrading_sidecar"]
+    if sidecar.empty:
+        return "- `lightgbm_tabular` is frozen only as a non-trading diagnostic metric; no remote raw score is available in this screen."
+    src = sidecar.iloc[0]
+    proxy_rows = as_int(src.get("trades"))
+    official_rows = as_int(src.get("official_rows"))
+    status = clean_text(src.get("status"))
+    if proxy_rows == 0:
+        selection = "selected zero proxy rows"
+    else:
+        selection = f"selected {proxy_rows} proxy rows with {official_rows} official rows"
+    return (
+        "- `lightgbm_tabular` is frozen only as a non-trading diagnostic metric; "
+        f"the latest remote raw score {selection} and is `{status}`, so it is not a paper-ordering candidate."
+    )
+
+
 def build_report(screen: pd.DataFrame, info: dict[str, Any]) -> str:
     deployable = int(screen["deployable_now"].astype(bool).sum()) if "deployable_now" in screen else 0
     keep_collecting = screen[screen["forward_action"].astype(str).str.contains("keep_", na=False)]
@@ -590,7 +608,7 @@ def build_report(screen: pd.DataFrame, info: dict[str, Any]) -> str:
         f"- Deployable candidates now: `{deployable}`.",
         "- Keep the raw collector and lowdd forward shadow running; lowdd is positive but still below the official/parity sample gate.",
         "- Do not start a new trading or paper-ordering shadow from the current branch/regime/ML/v2 evidence.",
-        "- `lightgbm_tabular` is frozen only as a non-trading diagnostic metric; the latest remote raw score selected zero trades, so it is not a paper-ordering candidate.",
+        ml_sidecar_report_line(screen),
         "",
         "## Priority Rows",
         "",
