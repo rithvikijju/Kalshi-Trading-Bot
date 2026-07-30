@@ -1,0 +1,15 @@
+{
+  "n_trades": 131,
+  "wins": 0,
+  "losses": 131,
+  "win_rate": 0.0,
+  "total_net_pnl": -11.000000000000004,
+  "total_gross_pnl": -6.020000000000002,
+  "total_fees": 4.98,
+  "mean_net": -0.08396946564885499,
+  "median_net": -0.04,
+  "best_trade": -8.326672684688674e-17,
+  "worst_trade": -0.24000000000000007,
+  "std_pnl": 0.07078330299977831,
+  "throttled_count": 81
+}

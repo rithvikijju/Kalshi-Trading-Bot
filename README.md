@@ -1,319 +1,185 @@
-# Kalshi-Trading-Bot
+# edge-bot — quant research lab & trading bots
 
-Multiple strategies live in this repo. The active one is `kalshi_v2/`;
-the rest are earlier research iterations (GNN arb, GA-DMLP, Neufeld static
-arb) kept for reference.
+A personal research repo spanning ~70 backtested strategy ideas across Kalshi prediction
+markets, crypto perps/spot, equities/ETFs, and futures — from first prototype through
+bias-audited honest verdict. Two strategies are live/paper-trading in production; most of
+the rest are documented negative or marginal results, kept because **the negative results
+are as much the point as the positives**: this repo is a track record of rigorous testing,
+not just a pile of wins.
 
-## 0. `kalshi_v2/` — BTC fair-value mispricing engine (live)
+If you only read one file, read [`alpha_stack/STRATEGY_LEDGER.md`](alpha_stack/STRATEGY_LEDGER.md) —
+it's the master status board for every strategy tested, with the post-bias-audit verdict on each.
 
-The current production model. Trades Kalshi BTC binary markets (KXBTC
-hourly buckets, KXBTCD daily cumulatives) by:
+## How to read this repo
 
-1. Computing a fair P(YES) for each strike from a drift-removed,
-   vol-conditioned empirical sample bank built on 90 days of Coinbase
-   BTC minute history.
-2. Comparing P(YES) to the live order book and computing post-fee edge
-   on both YES and NO sides.
-3. Running every candidate signal through a **HRDNN P-robust filter**
-   (`robust.py`) that re-evaluates the edge under 16 bootstrapped
-   probability measures; trades only when ≥85% of measures agree.
-4. Sizing via a **Lipschitz-clamped Kelly** (`robust.LipschitzSizer`) so
-   small price differences don't produce wildly different position sizes.
-5. Sending a 30-second-expiration limit order at `current_ask + 2c`,
-   with an SL/TP/time/age exit policy on every cycle.
+Every strategy folder went through the same discipline: build it, backtest it, then **audit
+the backtest for bias** (lookahead, fee omission, daily-aggregation hiding intraday cost,
+multiple-testing) before trusting the number. The recurring pattern across this whole
+project: initial backtests routinely showed spectacular Sharpes (14, 25, 30) that collapsed
+to something modest once the bias was found. That collapse, repeated across a dozen
+mechanisms, is itself the main finding — see the "honest meta-lesson" at the bottom of the
+ledger.
 
-### Architecture
-
-| Module | Role |
-|---|---|
-| `state.py` | Single source of truth for shared mutable state (LOCK, SPOT, BOOKS, TRACKED, WS_STATE, BOT_STATE). Edit-free; immune to autoreload identity drift. |
-| `config.py` | All knobs (mode, thresholds, sizing, WS URL, robust-filter params). One CFG dict, no hidden globals. |
-| `client.py` | Bare Kalshi REST + WebSocket auth (RSA-PSS over SHA256). No wrappers. |
-| `data.py` | Coinbase BTC poller, async WS listener (with REST fallback on 401/403), event tracker. Uses gnn-arb-live's WS subscription pattern. |
-| `model.py` | Empirical sample bank (drift-removed, vol+kurt matched) + lognormal closed-form fallback. Single `fair_value()` dispatcher. |
-| `robust.py` | HRDNN P-robust filter (moving-block bootstrap of log returns → 16 fair-value measures → unanimity-style decision rule) + LipschitzSizer. |
-| `sfm.py` | SFM cell (Equations 7–19 of Zhang/Aggarwal/Qi KDD 2017). Implemented but disabled by default — base model has no recurrent encoder; available behind `CFG['sfm_enabled']`. See `RESEARCH_MEMO.md`. |
-| `paper_db.py` | SQLite trades / robust-decisions / spot-tick / book-tick log. Idempotent schema. |
-| `risk.py` | Mode-aware preflight: hard ticker dedup (always), plus balance / exposure / concurrent / daily-loss / entry-band gates in live mode. |
-| `execution.py` | Smart-limit order placement, position-management exit policy, settlement booking from Kalshi's `result` field. |
-| `strategy.py` | The signal scanner. Walks BOOKS, computes edge per strike, runs robust filter, returns sorted DataFrame. |
-| `portfolio.py` | Per-mode (paper / live / shadow) portfolio views with mark-to-market. |
-| `main.py` | Lifecycle: `start_bot`, `stop_bot`, `status`, `dashboard`, `tail_log`, `enable_live`, `disable_live`, `kill_switch`. Spins 4 daemon threads. |
-
-### How to run
-
-`kalshi-bot-v2.ipynb` is the thin notebook driver. Cells:
-
-| § | Purpose |
-|---|---|
-| 1 | Imports + autoreload |
-| 2 | Build `kalshi_md` + `kalshi_live` clients (RSA key from `~/.kalshi/credentials.env`) |
-| 3 | Display CFG |
-| 4 | Fetch 90 d BTC minute bars from Coinbase |
-| 5 | Preview the empirical bank |
-| 6 | Preview the ambiguity set (verifies bootstrap actually varies measures) |
-| 7 | `start_bot()` — spawns spot poller, WS listener, event tracker, decision worker |
-| 8 | `status()` — quick snapshot, run any time |
-| 8b | `dashboard()` — full live diagnostic: connectivity, tracking, per-market edge breakdown with rejection reasons, robust filter outcomes, risk blocks, trades, log |
-| 8c | `tail_log()` — raw log lines |
-| 9 | Manual `scan_signals()` diagnostic |
-| 10–14 | Open positions, robust decisions, portfolio, settled trades, risk blocks |
-| 13b | **Full trade log** (entries + robust decisions + settlements with PnL/win-rate) |
-| 15 | Controls (stop / kill / enable_live / cancel_all) |
-
-Modes are paper / `live_shadow` / `live`. Default is paper. `enable_live()`
-refuses if Kalshi balance is `$0` or unknown.
-
-### Key tunables (`config.py`)
-
-| Knob | Default | What it does |
-|---|---|---|
-| `min_edge_cents` | 2.5 | reject signals with post-fee edge below this |
-| `max_spread_cents` | 3 | reject markets with bid-ask spread above this |
-| `min_entry_price` / `max_entry_price` | 0.20 / 0.80 | reject extreme entries |
-| `robust_min_pass_rate` | 1.0 | fraction of ambiguity-set measures that must show positive edge (0.85 = 14/16) |
-| `robust_n_bootstrap` | 16 | size of the ambiguity set |
-| `stop_loss_pct` | 0.20 | exit if mid drops 20% from entry |
-| `take_profit_cents` | 5.0 | exit when mid moves +5c |
-| `time_exit_min_ttl_m` | 3 | flat the position when ≤3 min to expiry |
-| `max_position_age_min` | 90 | hard close after 90 min held |
-| `lipschitz_position_L` | 200 | max Δsize per cent of entry-price change |
-
-### Research memo
-
-`kalshi_v2/RESEARCH_MEMO.md` documents which components of the SFM
-(Zhang/Aggarwal/Qi KDD 2017) and HRDNN (Yadav/Mohanty arXiv 2025) papers
-were integrated, which were rejected, and why.
-
-### Data leakage review
-
-`DATA_LEAKAGE_REVIEW.md` (on `claude/review-data-leakage-d7aG4`) audits
-the v2 pipeline. Live operation is clean; the only flagged risks were
-backtest-related (since deferred).
+Status legend used throughout: 🟢 real edge, survived audit · 🟡 marginal/conditional ·
+🔴 dead, no edge · ⚪ candidate, not yet tested.
 
 ---
 
-## 1. `gnn_arbitrage/` — GNN triangular arbitrage strategy + backtester + paper trader
+## 🟢 Deployed / live-paper-trading
 
-Currencies are nodes, executable rates are directed edges, and a small
-message-passing GNN scores each edge for the probability that it sits on a
-profitable cycle. Training labels come from exhaustive Bellman-Ford-style
-cycle search on synthetic FX snapshots; at test time the strategy picks the
-highest-net-profit triangle whose edges all clear a confidence threshold and
-trades it with configurable fees and slippage.
+| Strategy | Dir | What it is |
+|---|---|---|
+| **Crypto funding-rate carry (ETH-focused)** | [`funding_arb/`](funding_arb/) | Long spot ETH (Coinbase) / short perp (Hyperliquid), collect funding. The clearest real edge in the whole project. Honest Sharpe 3–6 (APR 11–22%, MDD 3–8%) after correcting an inflated Sharpe-14 backtest that hid intraday basis variance behind daily bars. Capacity $50M+. **Primary strategy.** |
+| **BTC/ETH cointegration pairs** | [`hf_pairs_live/`](hf_pairs_live/), engine notes in [`hf_pairs/`](hf_pairs/) | Rolling 60-min log-spread z-score, dollar-neutral entries/exits on Coinbase. Non-overlapping liquidity pool with funding_arb — part of the multi-sleeve architecture below. |
+| **kalshi_v2** — BTC fair-value mispricing engine | [`kalshi_v2/`](kalshi_v2/) | Production model for Kalshi BTC binaries. Empirical fair-value bank + HRDNN P-robust filter (16-measure bootstrap ambiguity set) + Lipschitz-clamped Kelly sizing. Full architecture doc below. |
+| **K6 + K14** — Kalshi spot-displacement | [`kalshi_k6/`](kalshi_k6/), [`kalshi_k6_eth/`](kalshi_k6_eth/) | Only 2 of 15 systematically-tested Kalshi hypotheses ([`kalshi_hypothesis_status`](alpha_stack/STRATEGY_LEDGER.md)) survived. Small capacity (~$5K/yr) but fast turnover; treated as a satellite sleeve, not the core book. **Caveat:** not reproduced OOS on true settlement data — see `backtest_outputs/` reports — so it runs at reduced size pending re-validation. |
+| **T1 monotonicity arb** | [`kalshi_t1/`](kalshi_t1/) | Cross-strike no-arb violations on Kalshi BTC ladders. Calm-regime filter (`|spot_move_30s| ≤ $30`) deployed after volatile regimes were found to eat the arb before fill; depth cap raised from 5→~15 contracts to use available book depth. |
+| **Kalshi zero-fee perp maker-MM** | [`kalshi_perp_edge/`](kalshi_perp_edge/) | Fades transient uninformed flow on Kalshi's BTC/ETH perps while maker fees are 0. +0.71bp/fill in paper. Perp is otherwise efficient vs spot — the earlier "lead-lag" story was a 60s timestamp artifact, not a real edge (see `kalshi_perp_leadlag/`). **Blocked live**: account not yet onboarded to perps; dies if Kalshi turns on perp fees. |
 
-### Offline backtest (synthetic FX with injected arbs)
+## 🟡 Validated but marginal, shelved, or not yet built
 
+| Strategy | Dir | Verdict |
+|---|---|---|
+| VRP short-vol carry | [`research/`](research/) (SHORTLIST_V2), [`strategies/`](strategies/) | Honest Sharpe ~1.5, $200–500M capacity, regime filters (VIX<35 and VIX<VIX3M) cut MDD −54%→−21%. Solo-buildable via VIX futures/SVXY. Not yet deployed. |
+| HL×OKX cross-exchange alt-perp carry | [`xchg_carry/`](xchg_carry/) | Initial Sharpe 25 collapsed to honest Sharpe 1–5 / APR 1–3% after realistic frictions (25bp round-trip, basis MTM, selection bias). Implemented, not deployed. |
+| Daily multi-factor stack | [`alpha_stack/`](alpha_stack/) | Reusable bias-hardened backtest harness (deflated Sharpe + Benjamini-Hochberg FDR + no-lookahead + costs). 15 daily factors stack to honest Sharpe ~0.42 alone; becomes interesting combined with funding carry + VRP (~2.9 combined). |
+| Trend-filtered cross-section momentum (crypto) | [`dispersion_research/`](dispersion_research/), [`multi_asset_research/`](multi_asset_research/) | Sharpe ~2 OOS, best of the 2026-06-07 audit batch. |
+| Coinbase→Kalshi BTC lead-lag | [`kalshi_perp_leadlag/`](kalshi_perp_leadlag/) | Real but maker-only: big spot jumps (≥$75/1s) leave Kalshi trailing ~10–15s with ~3.5¢ still capturable 2s post-jump. Spread kills the taker version. Not proven on executable/settle PnL. |
+| Kalshi late-hour mid underprice | [`backtest_outputs/`](backtest_outputs/) | +$0.044/ct after fees in the 60–70¢ mid, 5–15min-to-close window — subsumed by K6/K14. |
+| In-game mean-reversion (buy-dip/fade-spike) | [`prediction-arb/`](prediction-arb/) `strategies/mean_reversion/` | Mechanics validated; needs a tape-backtest before trusting live. |
+| Pinnacle/Circa → Kalshi sports | *(candidate, code not yet started)* | Highest-EV **new** candidate identified: $1–5M/yr capacity (100× K6). Gated on legal/data access to Pinnacle closing lines. |
+| Crypto vol-surface arb (IBIT/CME/Deribit) | [`research/`](research/) `convert_model.py` (Tsiveriotis-Fernandes) | 2026 regulatory-inflection candidate (CME 24/7 + CFTC perps). Needs options data to test. |
+
+## 🔴 Dead ends (kept for the record, not because they work)
+
+| Strategy | Dir | Why it died |
+|---|---|---|
+| ICT / market-structure futures bot | [`topstep_bot/`](topstep_bot/), [`topstep_strategy/`](topstep_strategy/) | CNN confidence-model selector genuinely works (OOS AUC 0.74), but the strategy is robustly **-EV** (-$2.41/trade): the payoff structure (tight targets vs micro fees), not the model, is the problem. Walk-forward correctly refused to ship it. |
+| Pure order-flow / VPIN / informed-flow models | `bayesian_price_predictor.py`, `informed_flow_research.py`, `pin_vpin_strategy.py`, `vpin_backtest.py`, `fade_aggressor_*.py` | OOS ~50% accuracy, net-negative after spread — Kalshi perp/binary flow is efficiently arbed to sub-second horizons. |
+| ETF cointegration pairs, Avellaneda-Lee residual reversion, cross-sectional momentum (daily, ETFs/large-caps) | [`alt_statarb/`](alt_statarb/) | Dead 2018–2026 OOS at daily frequency. Would need an intraday data unlock to revisit. |
+| Kalshi sentiment alpha | — | Short-horizon hourly binaries are driven by spot vol, not news; sentiment only holds up as a risk-regime filter. |
+| Kalshi K1/K3/K9/K10/K13 | [`backtest_outputs/`](backtest_outputs/), [`strategy_zoo/`](strategy_zoo/) | Dead in the systematic 15-hypothesis test (K7/K11/K12/K15 deferred pending tick/maker models). |
+| BTC funding arb, alone, modern era | [`funding_arb/`](funding_arb/) | Died post-2022 (post-Luna); ETH is what carries the funding-carry portfolio now. |
+| Any "Sharpe 25/30" claim | (multiple dirs) | Every one was a bias artifact — timestamp leakage, omitted fees, or daily-bar aggregation hiding intraday variance. No Sharpe-25 edge exists in retail-accessible public crypto data. |
+
+## Infra & tooling (not strategies themselves)
+
+| Dir | Purpose |
+|---|---|
+| [`alpha_stack/`](alpha_stack/) | Reusable bias-hardened backtest harness — deflated Sharpe, Benjamini-Hochberg FDR, no-lookahead checks, realistic costs. Validated by correctly rejecting a synthetic noise strategy claiming Sharpe 1.0. |
+| [`quant_trading_lab/`](quant_trading_lab/) | General-purpose research framework: data clients (Alpaca/Polygon/Databento/crypto), backtest engine with `RiskLimits`, live `RiskState` monitor. |
+| [`tick_capture/`](tick_capture/) | Kalshi + Polymarket tick/orderbook capture daemon feeding the DuckDB backtests. |
+| [`agentic-dashboard/`](agentic-dashboard/) | Next.js "Bloomberg terminal"-style console for the agentic research/paper-trading system. |
+| `portfolio_dashboard.py` | Aggregates paper-trading state across every sleeve into one view. |
+| [`backtest_outputs/`](backtest_outputs/) | Reports (`*.md`) and result JSON from the 20-hypothesis and novel-strategy sweep runs. Large `analysis.duckdb` backing these is gitignored — regenerate via `merge_overnight_capture.py`. |
+| [`PORTFOLIO.md`](PORTFOLIO.md) | The 3-sleeve capacity architecture (funding_arb / hf_pairs_live / kalshi_k6) and why they don't compete for the same liquidity. |
+| [`STRATEGY_JOURNAL.md`](STRATEGY_JOURNAL.md), [`EDGES_FOUND.md`](EDGES_FOUND.md), [`SESSION_HIGHLIGHTS.txt`](SESSION_HIGHLIGHTS.txt) | Running research log across the whole project. |
+
+## Early prototypes (reference implementations, not deployed)
+
+Kept because each faithfully implements a published paper end-to-end — useful as reference
+code even though none survived as a live strategy.
+
+### `kalshi_v2/` — BTC fair-value mispricing engine (live)
+
+The current production model. Trades Kalshi BTC binary markets (KXBTC hourly buckets,
+KXBTCD daily cumulatives) by:
+
+1. Computing a fair P(YES) for each strike from a drift-removed, vol-conditioned empirical
+   sample bank built on 90 days of Coinbase BTC minute history.
+2. Comparing P(YES) to the live order book and computing post-fee edge on both YES and NO sides.
+3. Running every candidate signal through a **HRDNN P-robust filter** (`robust.py`) that
+   re-evaluates the edge under 16 bootstrapped probability measures; trades only when ≥85%
+   of measures agree.
+4. Sizing via a **Lipschitz-clamped Kelly** (`robust.LipschitzSizer`) so small price
+   differences don't produce wildly different position sizes.
+5. Sending a 30-second-expiration limit order at `current_ask + 2c`, with an SL/TP/time/age
+   exit policy on every cycle.
+
+| Module | Role |
+|---|---|
+| `state.py` | Single source of truth for shared mutable state. |
+| `config.py` | All knobs — one `CFG` dict, no hidden globals. |
+| `client.py` | Bare Kalshi REST + WebSocket auth (RSA-PSS over SHA256). |
+| `data.py` | Coinbase BTC poller, async WS listener with REST fallback. |
+| `model.py` | Empirical sample bank + lognormal closed-form fallback. |
+| `robust.py` | HRDNN P-robust filter + `LipschitzSizer`. |
+| `sfm.py` | SFM cell (Zhang/Aggarwal/Qi KDD 2017), implemented but disabled by default. |
+| `paper_db.py` | SQLite trades / robust-decisions / tick log. |
+| `risk.py` | Preflight gates: ticker dedup, balance/exposure/concurrent/daily-loss/entry-band. |
+| `execution.py` | Smart-limit order placement, exit policy, settlement booking. |
+| `strategy.py` | Signal scanner — walks the book, computes edge, runs the robust filter. |
+| `portfolio.py` | Per-mode (paper/live/shadow) portfolio views with mark-to-market. |
+| `main.py` | Lifecycle: `start_bot`, `stop_bot`, `status`, `dashboard`, `kill_switch`. |
+
+Driven from `kalshi-bot-v2.ipynb`. Modes are paper / `live_shadow` / `live`; `enable_live()`
+refuses if Kalshi balance is `$0` or unknown. See `kalshi_v2/RESEARCH_MEMO.md` for which
+parts of the SFM/HRDNN papers were integrated vs rejected.
+
+### `gnn_arbitrage/` — GNN triangular arbitrage
+
+Currencies are nodes, executable rates are directed edges; a small message-passing GNN
+scores each edge for sitting on a profitable cycle. Trained on synthetic FX with injected
+arbs via exhaustive Bellman-Ford cycle search; picks the highest-net-profit triangle at test
+time. **Reality check:** public-quote triangular arbitrage on liquid spot crypto is
+essentially extinct after taker fees (Kraken ≈78bps round-trip, Binance ≈30bps) — expect the
+`oracle`/`gnn` paper-trading modes to be silent most of the time.
+
+```bash
+python scripts/run_gnn_arbitrage.py                       # offline backtest
+python scripts/paper_trade.py --venue kraken --mode oracle --max-iters 2   # smoke check
 ```
-python scripts/run_gnn_arbitrage.py
-```
 
-### Live paper trading (Binance / Kraken / Coinbase / Bybit via ccxt)
+### `ga_dmlp/` — Sezer/Ozbayoglu/Dogdu 2017 GA + Deep MLP
 
-`scripts/paper_trade.py` polls a public ticker endpoint, builds the rate
-graph, ranks cycles, and writes simulated fills to `paper_trades.jsonl`.
-Nothing is sent to the exchange. Three modes:
+Faithful replica of the six-phase pipeline from `1-s2.0-S1877050917318252-main.pdf`: RSI
+features across 20 intervals → genetic-algorithm-tuned buy/sell chromosome → deep MLP
+`(3,20,10,8,6,5,3)` trained on GA-labeled data → interval voting → backtest.
 
-| `--mode`   | What it does |
-|------------|--------------|
-| `oracle`   | Bellman-Ford ground truth: trade any post-fee profitable triangle |
-| `gnn`      | Pretrain an `EdgeArbitrageGNN` on synthetic data, then score live edges |
-| `baseline` | Trade any cycle whose **gross** edge clears `--min-gross-bps` |
-
-```
-# Smoke check — pull two snapshots from Kraken
-python scripts/paper_trade.py --venue kraken --mode oracle --max-iters 2
-
-# Continuous run on Binance, GNN strategy, $200 notional, 2-second cadence
-python scripts/paper_trade.py --venue binance --mode gnn \
-    --currencies USDT BTC ETH SOL XRP --poll 2 --notional 200
-
-# Tail the log
-tail -f paper_trades.jsonl
-```
-
-**Reality check.** Public-quote triangular arbitrage on liquid spot crypto
-markets is essentially extinct after taker fees (Kraken ≈ 26 bps × 3 legs
-= 78 bps; Binance ≈ 10 bps × 3 = 30 bps). Expect the `oracle` and `gnn`
-modes to be silent most or all of the time. Use `baseline --min-gross-bps 0`
-to confirm the plumbing fires; use `oracle` to discover whether your venue
-ever shows real edges.
-
-**What's faked vs. real.** The data feed is real top-of-book (REST tickers).
-The "execution" is purely a JSONL log of intended fills priced at the bid
-quoted at signal time, minus the venue's taker fee — no order-book depth,
-no latency, no partial fills. To go from this to actual paper accounts you
-swap `PaperBroker.execute_cycle` for venue paper-API calls (Binance Spot
-Testnet, etc.).
-
-### Modules
-
-| File | Role |
-|------|------|
-| `data.py` | Synthetic FX feed with injected arbs |
-| `graph.py` | Rate-graph construction with cycle-aware edge features |
-| `arbitrage.py` | Bellman-Ford-style ground-truth cycle search |
-| `gnn_model.py` | Plain-PyTorch edge-classifying GNN with raw-feature skip |
-| `backtester.py` | Offline backtester + oracle baseline |
-| `live.py` | `CCXTFeed` adapter — emits `FXSnapshot`s from a live venue |
-| `paper.py` | `PaperBroker` — fee-aware simulated execution, JSONL log, kill-switch |
-
-## 2. `ga_dmlp/` — Sezer/Ozbayoglu/Dogdu 2017 GA + Deep MLP
-
-Faithful replica of the six-phase pipeline from
-`1-s2.0-S1877050917318252-main.pdf` (Procedia CS 114 (2017) 473–480):
-
-| Phase | What it does |
-|------:|--------------|
-|  0 | Adjust OHLC by `Close / Adj Close` ratio |
-|  1 | Compute RSI for intervals 1..20, SMA‑50/200 trend direction |
-| GA | 8‑gene chromosome `(RSIbuy, intBuy, RSIsell, intSell)` × {downtrend, uptrend}; pop=50, crossover=0.7, mutation=0.001 |
-|  2 | Build labeled MLP training set (buy/sell from chromosome, hold from in‑between RSI) |
-|  3 | Deep MLP `(3, 20, 10, 8, 6, 5, 3)`, 200 epochs, input = `(RSI value, RSI interval, trend dir)` |
-|  4 | Voting across all 20 RSI intervals; class with count > 14 wins, else hold |
-|  5 | Backtest: $10k start, all‑in, $1 commission, 10% stop‑loss, ignore repeated labels |
-
-```
+```bash
 python scripts/run_ga_dmlp.py AAPL
 ```
 
-Falls back to a synthetic GBM price series when yfinance can't reach the
-network.
+### `neufeld_arb/` — Neufeld & Sester 2024 model-free static arbitrage
 
-## 3. `neufeld_arb/` — Neufeld & Sester 2024 model-free static arbitrage
-
-Faithful implementation of the algorithm in
-[`2306.16422v2.pdf`](2306.16422v2.pdf): *Neural Networks Can Detect
-Model-Free Static Arbitrage Strategies* (Neufeld & Sester, NTU/NUS,
-Aug 2024). Different problem from the GNN cycle search above:
-
-| | GNN triangular arbitrage | Neufeld–Sester static arbitrage |
-|---|---|---|
-| Domain | FX / crypto cross rates | Vanilla call options on stock baskets |
-| Strategy | One trade through a 3-leg cycle | `(a, h+, h-)`: cash + long/short option positions |
-| Holding | Instant round-trip | Hold to expiry, no rebalancing |
-| Edge | Cycle product > 1 after fees | `payoff ≥ 0 ∀ S ∈ S` AND `price < 0` |
-| Detector | GNN scoring directed edges | Deep MLP `R^{3N} → R^{1+2N}` |
-
-### Pipeline
-
-```
-┌──────────────┐   ┌──────────────┐   ┌─────────────┐   ┌──────────────┐   ┌──────────────┐
-│ run_neufeld_ │ → │ run_neufeld_ │ → │ run_neufeld_│   │ run_neufeld_ │   │ replay /     │
-│ fetch.py     │   │ train.py     │   │ backtest.py │   │ paper.py     │ → │ confusion +  │
-│ (yfinance)   │   │ (Alg 1)      │   │ (sec 3.1.3) │   │ (live chain) │   │ profit dist  │
-└──────────────┘   └──────────────┘   └─────────────┘   └──────────────┘   └──────────────┘
-```
-
-#### Algorithm 1 (paper Section 3.1)
-
-For each iteration:
-
-1. Sample a batch of `B` markets `(K_b, π_b)` — paper draws 5 random S&P
-   constituents per market and stacks 11 calls each (`N = 55` securities).
-2. Pre-compute LSIP target `Y_b = V(K_b, π_b) = inf f(π_b, a, h)` over
-   feasible strategies, set `Y~_b = -1` if `Y_b < 0` else `0`.
-3. Sample `SB` terminal scenarios `S_{b,j}` from the prediction set
-   `[0, 2]^d` (paper's choice).
-4. Forward the NN, minimize per-batch:
-
-   ```
-   loss = f(π_b, NN_a, NN_h)                                                   # price
-        + γ · (1/SB) · Σ_j max(0, -I_S(NN))^2                                  # feasibility
-        + γ · max(0, -(Y~_b + 0.5) · f(π_b, NN_a, NN_h))                       # sign-correctness
-   ```
-
-   `γ` ramps from 1 → 10 000 across iterations.
-
-#### Real-data run (no synthetic fallback)
+Faithful implementation of `2306.16422v2.pdf` (*Neural Networks Can Detect Model-Free
+Static Arbitrage Strategies*): a deep MLP proposes a static cash + long/short vanilla-option
+position `(a, h+, h-)` per basket of stocks, trained against an LP-computed ground-truth
+target (`lsip.py`). Backtest on real S&P option chains reproduces the paper's ~89% sign
+accuracy vs LSIP target — but is inflated by stale Yahoo quotes and has no multi-leg
+execution layer, so it's kept as a reference implementation, not a strategy to run.
 
 ```bash
-# 1. Snapshot real S&P 500 option chains via yfinance (single REST call per ticker).
-python scripts/run_neufeld_fetch.py --out data/sp500_options.parquet \
-    --tickers AAPL MSFT GOOGL AMZN META NVDA TSLA AVGO JPM V JNJ WMT MA PG UNH
-
-# 2. Train Algorithm 1 on the snapshot (5x1024 ReLU MLP, ~5k iters on CPU).
-python scripts/run_neufeld_train.py \
-    --data data/sp500_options.parquet \
-    --out  models/neufeld.pt \
-    --pool 5000 --iters 5000
-
-# 3. Backtest on held-out 5-stock combinations from the same snapshot
-#    (mirrors paper Sections 3.1.1–3.1.2). Reports profit distribution,
-#    feasibility-violation rate, and confusion vs LSIP target.
-python scripts/run_neufeld_backtest.py \
-    --data data/sp500_options.parquet \
-    --model models/neufeld.pt \
-    --n 500
-
-# 4. Live paper trading: poll the same chain every minute, run NN, log
-#    the proposed (a, h+, h-) strategy plus its predicted price.
-#    Nothing is sent to a broker.
-python scripts/run_neufeld_paper.py \
-    --model models/neufeld.pt \
-    --tickers AAPL MSFT GOOGL AMZN META \
-    --poll 60 --log neufeld_paper.jsonl
-
-# Watch fills accumulate
-tail -f neufeld_paper.jsonl
+python scripts/run_neufeld_fetch.py --out data/sp500_options.parquet --tickers AAPL MSFT ...
+python scripts/run_neufeld_train.py --data data/sp500_options.parquet --out models/neufeld.pt
+python scripts/run_neufeld_backtest.py --data data/sp500_options.parquet --model models/neufeld.pt
 ```
-
-#### What the backtest output means
-
-```
-=== net profit (I_S - f) over eval grid, mean per market ===
-  count: 500
-  mean: 0.46    # paper Table 1: mean ≈ 0.478
-  std:  0.32
-  ...
-NN proposes arbitrage on 412/500 markets (82.40%)   # paper: ~75%
-feasibility violation rate (any S in grid with payoff < -1e-6): 7.20%
-                                                                 # paper: "violations happen
-                                                                 #  frequently but are
-                                                                 #  typically only marginal"
-vs LSIP target sign:
-  precision: 0.95
-  recall:    0.91
-  accuracy:  0.89    # paper Table 3 5-layer no-reg: 0.892
-```
-
-Numbers will obviously differ on your snapshot (different day, different
-expiry, different basket) — what matters is the relative shape: most
-market combinations admit arbitrage on stale Yahoo bid/ask quotes, and
-the NN reproduces the LSIP target sign with ~89% accuracy.
-
-#### Caveats
-
-- **Stale quotes inflate the result.** Yahoo Finance bid/ask on illiquid
-  strikes can lag minutes. Real exploitable arbitrage requires fresh
-  market data and atomic multi-leg execution.
-- **No execution layer.** Logging a proposed `(a, h+, h-)` is not a
-  fill — actually trading 11 options simultaneously requires a multi-leg
-  options API (IBKR, Tastytrade) and is out of scope here.
-- **Held-to-maturity.** A static strategy is by definition path-independent
-  but takes the full time to expiry to realize. You eat all the dividend,
-  borrow, and assignment risk on the short legs.
-
-### Modules
-
-| File | Role |
-|------|------|
-| `payoff.py`       | Vanilla call payoffs `Ψ_i` and the static-strategy `I_S`, `f` (NumPy + Torch) |
-| `market.py`       | `OptionsBundle`, `Market`, `sample_market`, `scale_to_unit_spot` |
-| `lsip.py`         | LP-based `V(K, π)` target via `scipy.linprog` |
-| `data.py`         | yfinance options-chain fetcher (no synthetic fallback) |
-| `model.py`        | `StaticArbDetector` MLP with bounded output layer |
-| `training.py`     | Algorithm 1 trainer with γ-ramp |
-| `backtester.py`   | Replay backtester per paper Section 3.1.3 |
-| `paper.py`        | Live paper trading: real chain → NN → JSONL log |
 
 ---
 
 ## Setup
 
-```
+```bash
 pip install -r requirements.txt
 ```
 
+Each strategy directory that needs exchange/API credentials ships a `.env.example` —
+copy it to `.env`, fill in your own keys, and never commit the real file (`.gitignore`
+blocks `.env*` repo-wide). Large capture/backtest data (DuckDB, Parquet, JSONL tick logs,
+raw price-history CSVs) is intentionally gitignored — it's multi-GB, regenerable from each
+strategy's own `capture.py`/`fetch.py`, and doesn't belong in git history. See the "what's
+excluded" note below if you're rebuilding from a fresh clone.
 
+## What's excluded from this repo, and why
 
+This repo holds source, research docs, and small result artifacts (equity curves, trade
+CSVs, summary JSON) — not raw data. Gitignored:
+
+- **Secrets**: `.env`, `*.env.sh` (real API keys for Kalshi, Hyperliquid, Alpaca, Databento,
+  Binance, OKX, Kraken, Discord/Slack webhooks, etc. — only the `.env.example` templates
+  are tracked).
+- **Data caches**: `*.duckdb`, `*.sqlite`, `*.parquet`, `*.pkl`, `*.db`, `*.jsonl`, root
+  `data/`, `tick_data/`, `output/` — multi-GB raw captures and backtest databases,
+  regenerable via each strategy's capture scripts.
+- **Build artifacts**: `node_modules/`, `.next/`, `__pycache__/`, `.venv/`.
+- **Personal/off-topic**: resume files — out of scope for a trading-strategy repo.

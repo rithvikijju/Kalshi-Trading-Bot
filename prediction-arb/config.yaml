@@ -1,0 +1,50 @@
+mode: paper  # paper | live
+
+kalshi:
+  environment: production  # production | demo
+  base_url_production: https://api.elections.kalshi.com/trade-api/v2
+  base_url_demo: https://demo-api.kalshi.co/trade-api/v2
+  ws_url: wss://api.elections.kalshi.com/trade-api/ws/v2
+
+polymarket:
+  gamma_url: https://gamma-api.polymarket.com
+  clob_url: https://clob.polymarket.com
+  ws_url: wss://ws-subscriptions-clob.polymarket.com/ws/market
+  chain_id: 137
+
+scanning:
+  poll_interval_seconds: 30
+  max_markets_per_scan: 500
+
+matching:
+  min_similarity_score: 0.80
+  auto_match_threshold: 0.90
+  max_resolution_date_delta_hours: 24
+  use_semantic_matching: false  # turn on after install sentence-transformers
+  cache_path: data/cache/matches_cache.db
+
+arbitrage:
+  min_net_edge_cents: 2.0
+  min_annualized_return: 0.10
+  min_liquidity_usd: 100
+  max_slippage_pct: 0.02
+
+risk:
+  max_position_per_market_usd: 500
+  max_total_exposure_usd: 5000
+  max_daily_loss_usd: 200
+  min_match_confidence: 0.90
+
+execution:
+  order_type: limit
+  use_maker_on_polymarket: true  # 0% taker fee with maker orders
+  leg_timeout_seconds: 30
+  failed_leg_behavior: cancel  # cancel | retry | hold
+
+paper:
+  starting_capital_usd: 5000
+  db_path: data/paper_trades.db
+
+logging:
+  level: INFO
+  file: prediction_arb.log

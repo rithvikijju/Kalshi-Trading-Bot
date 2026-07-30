@@ -1,0 +1,74 @@
+Connecting…
+
+════════════════════════════════════════════════════════════════════════════════
+ A1 — H34 INVERTED: fade the cross-strike markup
+════════════════════════════════════════════════════════════════════════════════
+    [H34i mark-up-fade ] n= 536 win= 43.7% total=$-163.50 avg/c=$-0.0825 t=-4.16 qty=3.8  >=3 strikes marked up → buy NO at center of band
+    [H34i mark-dn-fade ] n= 542 win= 46.3% total=$-138.65 avg/c=$-0.0673 t=-3.41 qty=3.9  >=3 strikes marked dn → buy YES at center of band
+
+════════════════════════════════════════════════════════════════════════════════
+ A2 — H38 INVERTED: depth imbalance fade
+════════════════════════════════════════════════════════════════════════════════
+    [H38i bid5x-fade   ] n= 642 win= 46.4% total=$-234.01 avg/c=$-0.0734 t=-4.40 qty=4.9  bid_qty>=5x ask_qty → fade by buying NO
+    [H38i ask5x-fade   ] n= 619 win= 49.1% total=$-257.96 avg/c=$-0.0853 t=-5.05 qty=4.9  ask_qty>=5x bid_qty → fade by buying YES
+
+════════════════════════════════════════════════════════════════════════════════
+ A3 — H40 INVERTED: curve deviation IS information, follow it
+════════════════════════════════════════════════════════════════════════════════
+    [H40i over-follow  ] n= 575 win= 56.0% total=$-102.99 avg/c=$-0.0615 t=-3.82 qty=2.9  yes_mid >= smoothed+1.5c → buy YES (trust price)
+    [H40i under-follow ] n= 552 win= 53.4% total=$-120.73 avg/c=$-0.0725 t=-4.41 qty=2.9  yes_mid <= smoothed-1.5c → buy NO (trust price)
+
+════════════════════════════════════════════════════════════════════════════════
+ B1 — Large limit-order delta as imminent-move signal
+════════════════════════════════════════════════════════════════════════════════
+  Building delta features...
+  big_delta: 0 rows
+    [B1 big-yes-add    ] n=   0 win=  0.0% total=$  +0.00 avg/c=$+0.0000 t=+ 0.00 qty=0.0  YES-side add of >=20 contracts → buy YES at next a
+    [B1 big-no-add     ] n=   0 win=  0.0% total=$  +0.00 avg/c=$+0.0000 t=+ 0.00 qty=0.0  NO-side add of >=20 contracts → buy NO
+
+════════════════════════════════════════════════════════════════════════════════
+ B2 — Spot–Kalshi divergence MEAN REVERSION
+════════════════════════════════════════════════════════════════════════════════
+    [B2 spot-ahead-up  ] n=   2 win=100.0% total=$  +3.17 avg/c=$+0.3964 t=+ 7.03 qty=4.0  spot - atm_strike > $200 → buy YES at ATM_old
+    [B2 spot-ahead-dn  ] n=   0 win=  0.0% total=$  +0.00 avg/c=$+0.0000 t=+ 0.00 qty=0.0  atm_strike - spot > $200 → buy NO at ATM
+
+════════════════════════════════════════════════════════════════════════════════
+ B3 — Implied prob MEAN REVERSION over 5 minutes
+════════════════════════════════════════════════════════════════════════════════
+    [B3 mid-up-fade    ] n= 339 win= 47.8% total=$ -41.05 avg/c=$-0.0405 t=-1.54 qty=2.9  yes_mid up >10c in 5min without spot crossing → bu
+    [B3 mid-dn-fade    ] n= 358 win= 47.2% total=$ -50.21 avg/c=$-0.0481 t=-1.94 qty=2.9  yes_mid dn >10c in 5min without spot crossing → bu
+
+════════════════════════════════════════════════════════════════════════════════
+ B4 — Close-auction widening (last 60s before settlement)
+════════════════════════════════════════════════════════════════════════════════
+    [B4 close-no-otm   ] n=   0 win=  0.0% total=$  +0.00 avg/c=$+0.0000 t=+ 0.00 qty=0.0  TTC 30-180s, yes_bid<0.08, spot<strike-100 → buy N
+    [B4 close-yes-itm  ] n=   0 win=  0.0% total=$  +0.00 avg/c=$+0.0000 t=+ 0.00 qty=0.0  TTC 30-180s, yes_ask 0.92-0.98, spot>strike+100 → 
+
+════════════════════════════════════════════════════════════════════════════════
+ B5 — Persistence-of-NO continuation (T3 generalization)
+════════════════════════════════════════════════════════════════════════════════
+    [B5 persist-10m    ] n=  26 win= 92.3% total=$  +2.19 avg/c=$+0.0281 t=+ 0.49 qty=3.0  10-min OTM persistence, NO at yes_bid 0.10-0.25
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ ROUND 2 SUMMARY — sorted by t-stat (★ = win≥60%, total>$5, t>2, n≥20)
+════════════════════════════════════════════════════════════════════════════════════════════════════
+hyp                      n   win%    total$   $/day     avg/c       t   qty  desc
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  B2 spot-ahead-up       2 100.0%     +3.17   +0.45   +0.3964 + 7.03   4.0  spot - atm_strike > $200 → buy YES at ATM_
+  B5 persist-10m        26  92.3%     +2.19   +0.31   +0.0281 + 0.49   3.0  10-min OTM persistence, NO at yes_bid 0.10
+  B1 big-yes-add         0   0.0%     +0.00   +0.00   +0.0000 + 0.00   0.0  YES-side add of >=20 contracts → buy YES a
+  B1 big-no-add          0   0.0%     +0.00   +0.00   +0.0000 + 0.00   0.0  NO-side add of >=20 contracts → buy NO
+  B2 spot-ahead-dn       0   0.0%     +0.00   +0.00   +0.0000 + 0.00   0.0  atm_strike - spot > $200 → buy NO at ATM
+  B4 close-no-otm        0   0.0%     +0.00   +0.00   +0.0000 + 0.00   0.0  TTC 30-180s, yes_bid<0.08, spot<strike-100
+  B4 close-yes-itm       0   0.0%     +0.00   +0.00   +0.0000 + 0.00   0.0  TTC 30-180s, yes_ask 0.92-0.98, spot>strik
+  B3 mid-up-fade       339  47.8%    -41.05   -5.86   -0.0405 -1.54   2.9  yes_mid up >10c in 5min without spot cross
+  B3 mid-dn-fade       358  47.2%    -50.21   -7.17   -0.0481 -1.94   2.9  yes_mid dn >10c in 5min without spot cross
+  H34i mark-dn-fade    542  46.3%   -138.65  -19.81   -0.0673 -3.41   3.9  >=3 strikes marked dn → buy YES at center 
+  H40i over-follow     575  56.0%   -102.99  -14.71   -0.0615 -3.82   2.9  yes_mid >= smoothed+1.5c → buy YES (trust 
+  H34i mark-up-fade    536  43.7%   -163.50  -23.36   -0.0825 -4.16   3.8  >=3 strikes marked up → buy NO at center o
+  H38i bid5x-fade      642  46.4%   -234.01  -33.43   -0.0734 -4.40   4.9  bid_qty>=5x ask_qty → fade by buying NO
+  H40i under-follow    552  53.4%   -120.73  -17.25   -0.0725 -4.41   2.9  yes_mid <= smoothed-1.5c → buy NO (trust p
+  H38i ask5x-fade      619  49.1%   -257.96  -36.85   -0.0853 -5.05   4.9  ask_qty>=5x bid_qty → fade by buying YES
+
+>>> 0 new strategies passed: win≥60%, total>$5, t>2, n≥20
+Wrote backtest_outputs/v3/round2_results.json

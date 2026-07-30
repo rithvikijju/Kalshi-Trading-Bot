@@ -1,0 +1,39 @@
+
+============================================================
+PHASE 1: SPY-only features
+============================================================
+Train: 1564 | Val: 503 | Test: 853
+Features (18): ['spy_ret_1', 'spy_ret_5', 'spy_ret_21', 'spy_ret_63', 'spy_vol_5', 'spy_vol_21']...
+Walk-forward blocks in test: 4
+  Starting Logistic...
+  Logistic      : Sharpe=+1.28  Ret=+15.3%  MDD=-12.9%  Flat=53%  DirAcc=59.0%  (0.0s)
+  Starting RandomForest...
+  RandomForest  : Sharpe=+1.12  Ret=+13.6%  MDD=-16.9%  Flat=52%  DirAcc=56.9%  (0.6s)
+  Starting GradientBoost...
+  GradientBoost : Sharpe=+1.32  Ret=+16.2%  MDD=-13.1%  Flat=40%  DirAcc=57.5%  (5.1s)
+  Starting LightGBM...
+  LightGBM      : Sharpe=+0.44  Ret=+5.9%  MDD=-16.8%  Flat=30%  DirAcc=53.0%  (0.2s)
+  Starting MLP...
+  MLP           : Sharpe=+0.90  Ret=+12.9%  MDD=-14.4%  Flat=11%  DirAcc=53.4%  (2.2s)
+  Starting LSTM...
+  LSTM          : Sharpe=+0.63  Ret=+7.9%  MDD=-17.3%  Flat=48%  DirAcc=56.1%  (11.5s)
+
+Baselines:
+  BuyHold_SPY   : Sharpe=+1.43  Ret=+21.5%  MDD=-19.2%  Flat=0%  DirAcc=57.1%
+  AR1           : Sharpe=-0.45  Ret=-6.8%  MDD=-31.2%  Flat=0%  DirAcc=51.1%
+  AlwaysLong    : Sharpe=+1.43  Ret=+21.5%  MDD=-19.2%  Flat=0%  DirAcc=57.1%
+  RandomSelective: Sharpe=-0.79  Ret=-11.5%  MDD=-47.4%  Flat=9%  DirAcc=48.9%
+
+Deflated Sharpe (n_trials=6 models):
+  BuyHold_SPY   : raw=+1.43  deflated=+0.42
+  AR1           : raw=-0.45  deflated=-1.19
+  AlwaysLong    : raw=+1.43  deflated=+0.42
+  RandomSelective: raw=-0.79  deflated=-1.60
+  Logistic      : raw=+1.28  deflated=+0.33
+  RandomForest  : raw=+1.12  deflated=+0.22
+  GradientBoost : raw=+1.32  deflated=+0.35
+  LightGBM      : raw=+0.44  deflated=-0.30
+  MLP           : raw=+0.90  deflated=+0.06
+  LSTM          : raw=+0.63  deflated=-0.14
+
+Saved phase1 results.

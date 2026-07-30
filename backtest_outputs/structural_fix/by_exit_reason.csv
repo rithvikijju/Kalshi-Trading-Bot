@@ -1,0 +1,4 @@
+exit_kind,n,net_pnl,mean_pnl
+settle,1,0.17,0.17
+stop_loss,87,-9.67,-0.111
+take_profit,24,2.82,0.118

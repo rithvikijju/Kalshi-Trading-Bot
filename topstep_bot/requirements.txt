@@ -1,0 +1,10 @@
+# Core (already in the edge-bot env)
+httpx>=0.28
+duckdb>=1.5
+numpy>=2.0
+pandas>=2.0
+
+# Bot-specific (install these)
+discord.py>=2.3        # Discord control + alerts
+pysignalr>=1.0         # ProjectX/TopstepX SignalR realtime hubs
+scikit-learn>=1.4      # trained confidence model (optional; prior works without it)

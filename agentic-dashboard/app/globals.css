@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg:        #07090d;
+  --color-panel:     #0b0f15;
+  --color-panel-2:   #0f141d;
+  --color-border:    #1a212d;
+  --color-border-2:  #232c3c;
+  --color-fg:        #e6edf3;
+  --color-fg-muted:  #8b9bb3;
+  --color-fg-dim:    #5d6b82;
+  --color-accent:    #58e1c7;
+  --color-accent-2:  #9b8cff;
+  --color-pos:       #5ddca0;
+  --color-neg:       #ff6b81;
+  --color-warn:      #ffcf6b;
+  --color-info:      #6ba8ff;
+
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --font-sans: ui-sans-serif, -apple-system, "Segoe UI", Inter, system-ui, sans-serif;
+}
+
+html, body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-feature-settings: "ss01", "cv11", "tnum";
+  -webkit-font-smoothing: antialiased;
+}
+
+* { border-color: var(--color-border); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1a212d; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #232c3c; }
+
+.font-mono { font-family: var(--font-mono); }
+.tabular  { font-variant-numeric: tabular-nums; }
+.tnum     { font-variant-numeric: tabular-nums; }
+
+.bg-bg       { background-color: var(--color-bg); }
+.bg-panel    { background-color: var(--color-panel); }
+.bg-panel-2  { background-color: var(--color-panel-2); }
+
+.text-fg            { color: var(--color-fg); }
+.text-fg-muted      { color: var(--color-fg-muted); }
+.text-fg-dim        { color: var(--color-fg-dim); }
+.text-accent        { color: var(--color-accent); }
+.text-accent-2      { color: var(--color-accent-2); }
+.text-pos           { color: var(--color-pos); }
+.text-neg           { color: var(--color-neg); }
+.text-warn          { color: var(--color-warn); }
+.text-info          { color: var(--color-info); }
+.border-default     { border-color: var(--color-border); }
+.border-strong      { border-color: var(--color-border-2); }
+.bg-pos\/10         { background-color: color-mix(in oklab, var(--color-pos) 10%, transparent); }
+.bg-neg\/10         { background-color: color-mix(in oklab, var(--color-neg) 10%, transparent); }
+.bg-accent\/10      { background-color: color-mix(in oklab, var(--color-accent) 10%, transparent); }
+.bg-accent-2\/10    { background-color: color-mix(in oklab, var(--color-accent-2) 10%, transparent); }
+.bg-warn\/10        { background-color: color-mix(in oklab, var(--color-warn) 10%, transparent); }
+.bg-info\/10        { background-color: color-mix(in oklab, var(--color-info) 10%, transparent); }
+
+.grid-bg {
+  background-image:
+    linear-gradient(transparent 95%, color-mix(in oklab, var(--color-fg-dim) 8%, transparent) 95%),
+    linear-gradient(90deg, transparent 95%, color-mix(in oklab, var(--color-fg-dim) 8%, transparent) 95%);
+  background-size: 64px 64px;
+}
+
+@keyframes pulse-dot { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+.pulse-dot { animation: pulse-dot 1.6s ease-in-out infinite; }
+
+@keyframes shimmer { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }
+.shimmer { position: relative; overflow: hidden; }
+.shimmer::after {
+  content:""; position:absolute; inset:0;
+  background: linear-gradient(90deg, transparent, color-mix(in oklab, var(--color-accent) 12%, transparent), transparent);
+  animation: shimmer 2.4s ease-in-out infinite;
+  pointer-events: none;
+}

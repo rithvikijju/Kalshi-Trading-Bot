@@ -6,6 +6,44 @@ __pycache__/
 venv/
 .DS_Store
 
+# Secrets — never commit
+.env
+.env.*
+*.env.sh
+!*.env.example
+
 # Paper trading runtime logs
 paper_trades.jsonl
 *.jsonl
+*.log
+*.pid
+topstep_bot/ml/confidence_model.pkl
+
+# Data caches / captures (regenerable via each strategy's capture/fetch scripts)
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.parquet
+*.pkl
+*.db
+
+# Raw market-data dumps and scratch outputs
+/data/
+/tick_data/
+/output/
+/live_capture_gapless_20260512_paused.duckdb
+
+# Node / web build artifacts (agentic-dashboard)
+node_modules/
+.next/
+
+# Personal / off-topic (kept locally, not part of this repo)
+JuneRes.tex
+JuneRes_SWE_ML.tex
+JuneRes copy.pdf
+JuneRes copy 2.pdf
+Strategy_Journal.docx
+
+# Stray worktree artifacts
+.claude/worktrees/
+.claude/scheduled_tasks.lock

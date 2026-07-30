@@ -1,0 +1,191 @@
+Rebuilding features with expanded test period...
+Loading 11 assets...
+  Built 72 features × 2920 days (2014-10-16 → 2026-05-28)
+
+============================================================
+PHASE 1: SPY-only features
+============================================================
+Train: 1311 | Val: 0 | Test: 1609
+Features (18): ['spy_ret_1', 'spy_ret_5', 'spy_ret_21', 'spy_ret_63', 'spy_vol_5', 'spy_vol_21']...
+Walk-forward blocks in test: 7
+  Starting Logistic...
+  Logistic      : Sharpe=+0.32  Ret=+5.4%  MDD=-28.4%  Flat=52%  DirAcc=54.4%  (0.0s)
+  Starting RandomForest...
+  RandomForest  : Sharpe=+0.53  Ret=+9.4%  MDD=-33.6%  Flat=52%  DirAcc=54.4%  (1.0s)
+  Starting GradientBoost...
+  GradientBoost : Sharpe=+0.12  Ret=+2.3%  MDD=-48.5%  Flat=32%  DirAcc=53.0%  (7.6s)
+  Starting LightGBM...
+  LightGBM      : Sharpe=-0.16  Ret=-3.1%  MDD=-51.0%  Flat=23%  DirAcc=51.1%  (0.3s)
+  Starting MLP...
+  MLP           : Sharpe=+0.08  Ret=+1.5%  MDD=-59.7%  Flat=9%  DirAcc=50.3%  (3.2s)
+  Starting LSTM...
+  LSTM          : Sharpe=+0.29  Ret=+5.2%  MDD=-32.5%  Flat=47%  DirAcc=53.2%  (8.9s)
+
+Baselines:
+  BuyHold_SPY   : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  AR1           : Sharpe=-0.63  Ret=-12.8%  MDD=-66.3%  Flat=0%  DirAcc=49.5%
+  AlwaysLong    : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  RandomSelective: Sharpe=+0.56  Ret=+10.6%  MDD=-38.8%  Flat=10%  DirAcc=49.7%
+
+Deflated Sharpe (n_trials=6 models):
+  BuyHold_SPY   : raw=+0.72  deflated=+0.14
+  AR1           : raw=-0.63  deflated=-1.19
+  AlwaysLong    : raw=+0.72  deflated=+0.14
+  RandomSelective: raw=+0.56  deflated=+0.00
+  Logistic      : raw=+0.32  deflated=-0.21
+  RandomForest  : raw=+0.53  deflated=-0.02
+  GradientBoost : raw=+0.12  deflated=-0.39
+  LightGBM      : raw=-0.16  deflated=-0.68
+  MLP           : raw=+0.08  deflated=-0.44
+  LSTM          : raw=+0.29  deflated=-0.24
+
+============================================================
+PHASE 2: SPY + cross-market features
+============================================================
+Train: 1311 | Val: 0 | Test: 1609
+Features (70): ['spy_ret_1', 'spy_ret_5', 'spy_ret_21', 'spy_ret_63', 'spy_vol_5', 'spy_vol_21']...
+Walk-forward blocks in test: 7
+  Starting Logistic...
+  Logistic      : Sharpe=+0.04  Ret=+0.7%  MDD=-55.1%  Flat=27%  DirAcc=50.4%  (0.0s)
+  Starting RandomForest...
+  RandomForest  : Sharpe=-0.03  Ret=-0.4%  MDD=-35.7%  Flat=63%  DirAcc=54.4%  (1.3s)
+  Starting GradientBoost...
+  GradientBoost : Sharpe=-0.63  Ret=-11.0%  MDD=-64.8%  Flat=30%  DirAcc=48.0%  (33.8s)
+  Starting LightGBM...
+  LightGBM      : Sharpe=-0.23  Ret=-4.2%  MDD=-46.9%  Flat=19%  DirAcc=51.0%  (1.1s)
+  Starting MLP...
+  MLP           : Sharpe=+0.13  Ret=+2.7%  MDD=-38.0%  Flat=2%  DirAcc=50.2%  (3.6s)
+  Starting LSTM...
+  LSTM          : Sharpe=+0.02  Ret=+0.4%  MDD=-35.2%  Flat=24%  DirAcc=50.0%  (4.1s)
+
+Baselines:
+  BuyHold_SPY   : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  AR1           : Sharpe=-0.63  Ret=-12.8%  MDD=-66.3%  Flat=0%  DirAcc=49.5%
+  AlwaysLong    : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  RandomSelective: Sharpe=+0.56  Ret=+10.6%  MDD=-38.8%  Flat=10%  DirAcc=49.7%
+
+Deflated Sharpe (n_trials=6 models):
+  BuyHold_SPY   : raw=+0.72  deflated=+0.14
+  AR1           : raw=-0.63  deflated=-1.19
+  AlwaysLong    : raw=+0.72  deflated=+0.14
+  RandomSelective: raw=+0.56  deflated=+0.00
+  Logistic      : raw=+0.04  deflated=-0.47
+  RandomForest  : raw=-0.03  deflated=-0.54
+  GradientBoost : raw=-0.63  deflated=-1.20
+  LightGBM      : raw=-0.23  deflated=-0.75
+  MLP           : raw=+0.13  deflated=-0.38
+  LSTM          : raw=+0.02  deflated=-0.49
+
+============================================================
+PHASE 3: event/domino features + SPY base
+============================================================
+Train: 1311 | Val: 0 | Test: 1609
+Features (57): ['spy_ret_1', 'spy_ret_5', 'spy_ret_21', 'spy_ret_63', 'spy_vol_5', 'spy_vol_21']...
+Walk-forward blocks in test: 7
+  Starting Logistic...
+  Logistic block 0:253 FAILED: Input X contains NaN.
+LogisticRegression does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  Logistic block 253:505 FAILED: Input X contains NaN.
+LogisticRegression does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  Logistic block 505:756 FAILED: Input X contains NaN.
+LogisticRegression does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  Logistic block 756:1006 FAILED: Input X contains NaN.
+LogisticRegression does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  Logistic block 1006:1258 FAILED: Input X contains NaN.
+LogisticRegression does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  Logistic block 1258:1508 FAILED: Input X contains NaN.
+LogisticRegression does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  Logistic block 1508:1609 FAILED: Input X contains NaN.
+LogisticRegression does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  Logistic      : Sharpe=+0.00  Ret=+0.0%  MDD=+0.0%  Flat=100%  DirAcc=0.0%  (0.0s)
+  Starting RandomForest...
+  RandomForest  : Sharpe=+0.60  Ret=+10.2%  MDD=-32.5%  Flat=56%  DirAcc=55.4%  (1.0s)
+  Starting GradientBoost...
+  GradientBoost block 0:253 FAILED: Input X contains NaN.
+GradientBoostingClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  GradientBoost block 253:505 FAILED: Input X contains NaN.
+GradientBoostingClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  GradientBoost block 505:756 FAILED: Input X contains NaN.
+GradientBoostingClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  GradientBoost block 756:1006 FAILED: Input X contains NaN.
+GradientBoostingClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  GradientBoost block 1006:1258 FAILED: Input X contains NaN.
+GradientBoostingClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  GradientBoost block 1258:1508 FAILED: Input X contains NaN.
+GradientBoostingClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  GradientBoost block 1508:1609 FAILED: Input X contains NaN.
+GradientBoostingClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  GradientBoost : Sharpe=+0.00  Ret=+0.0%  MDD=+0.0%  Flat=100%  DirAcc=0.0%  (0.0s)
+  Starting LightGBM...
+  LightGBM      : Sharpe=-0.06  Ret=-1.1%  MDD=-49.4%  Flat=26%  DirAcc=51.5%  (0.4s)
+  Starting MLP...
+  MLP block 0:253 FAILED: Input X contains NaN.
+MLPClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  MLP block 253:505 FAILED: Input X contains NaN.
+MLPClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  MLP block 505:756 FAILED: Input X contains NaN.
+MLPClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  MLP block 756:1006 FAILED: Input X contains NaN.
+MLPClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  MLP block 1006:1258 FAILED: Input X contains NaN.
+MLPClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  MLP block 1258:1508 FAILED: Input X contains NaN.
+MLPClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  MLP block 1508:1609 FAILED: Input X contains NaN.
+MLPClassifier does not accept missing values encoded as NaN natively. For supervised learning, you might want to consider sklearn.ensemble.HistGradientBoostingClassifier and Regressor which accept missing values encoded as NaNs natively. Alternatively, it is possible to preprocess the data, for instance by using an imputer transformer in a pipeline or drop samples with missing values. See https://scikit-learn.org/stable/modules/impute.html You can find a list of all estimators that handle NaN values at the following page: https://scikit-learn.org/stable/modules/impute.html#estimators-that-handle-nan-values
+  MLP           : Sharpe=+0.00  Ret=+0.0%  MDD=+0.0%  Flat=100%  DirAcc=0.0%  (0.0s)
+  Starting LSTM...
+  LSTM          : Sharpe=+0.00  Ret=+0.0%  MDD=+0.0%  Flat=100%  DirAcc=0.0%  (3.2s)
+
+Baselines:
+  BuyHold_SPY   : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  AR1           : Sharpe=-0.63  Ret=-12.8%  MDD=-66.3%  Flat=0%  DirAcc=49.5%
+  AlwaysLong    : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  RandomSelective: Sharpe=+0.56  Ret=+10.6%  MDD=-38.8%  Flat=10%  DirAcc=49.7%
+
+Deflated Sharpe (n_trials=6 models):
+  BuyHold_SPY   : raw=+0.72  deflated=+0.14
+  AR1           : raw=-0.63  deflated=-1.19
+  AlwaysLong    : raw=+0.72  deflated=+0.14
+  RandomSelective: raw=+0.56  deflated=+0.00
+  RandomForest  : raw=+0.60  deflated=+0.04
+  LightGBM      : raw=-0.06  deflated=-0.58
+
+============================================================
+PHASE 4 (LEAKAGE DEMO): SPY-only + 1 future feature
+============================================================
+Train: 1311 | Val: 0 | Test: 1609
+Features (19): ['spy_ret_1', 'spy_ret_5', 'spy_ret_21', 'spy_ret_63', 'spy_vol_5', 'spy_vol_21']...
+Walk-forward blocks in test: 7
+  Starting Logistic...
+  Logistic      : Sharpe=+13.56  Ret=+209.5%  MDD=-0.1%  Flat=5%  DirAcc=99.7%  (0.0s)
+  Starting RandomForest...
+  RandomForest  : Sharpe=+13.62  Ret=+210.0%  MDD=-0.0%  Flat=0%  DirAcc=99.9%  (0.9s)
+  Starting GradientBoost...
+  GradientBoost : Sharpe=+13.62  Ret=+210.0%  MDD=-0.0%  Flat=0%  DirAcc=99.9%  (3.2s)
+  Starting LightGBM...
+  LightGBM      : Sharpe=+13.62  Ret=+210.0%  MDD=-0.0%  Flat=0%  DirAcc=99.9%  (0.3s)
+  Starting MLP...
+  MLP           : Sharpe=+13.56  Ret=+209.5%  MDD=-0.4%  Flat=0%  DirAcc=97.9%  (2.4s)
+  Starting LSTM...
+  LSTM          : Sharpe=-1.26  Ret=-21.2%  MDD=-80.9%  Flat=54%  DirAcc=46.1%  (2.9s)
+
+Baselines:
+  BuyHold_SPY   : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  AR1           : Sharpe=-0.63  Ret=-12.8%  MDD=-66.3%  Flat=0%  DirAcc=49.5%
+  AlwaysLong    : Sharpe=+0.72  Ret=+14.6%  MDD=-35.7%  Flat=0%  DirAcc=55.1%
+  RandomSelective: Sharpe=+0.56  Ret=+10.6%  MDD=-38.8%  Flat=10%  DirAcc=49.7%
+
+Deflated Sharpe (n_trials=6 models):
+  BuyHold_SPY   : raw=+0.72  deflated=+0.14
+  AR1           : raw=-0.63  deflated=-1.19
+  AlwaysLong    : raw=+0.72  deflated=+0.14
+  RandomSelective: raw=+0.56  deflated=+0.00
+  Logistic      : raw=+13.56  deflated=+8.60
+  RandomForest  : raw=+13.62  deflated=+8.64
+  GradientBoost : raw=+13.62  deflated=+8.64
+  LightGBM      : raw=+13.62  deflated=+8.64
+  MLP           : raw=+13.56  deflated=+8.60
+  LSTM          : raw=-1.26  deflated=-1.95
+
+All phases done.

@@ -1,0 +1,66 @@
+# ── Live in-game mean-reversion strategy ────────────────────────────
+# "Buy the dip / fade the spike" on high-volatility markets (NBA game
+# winner markets are the flagship, but the price-based core is sport-agnostic).
+#
+# The whole game is the Kalshi fee floor (see memory kalshi_fee_floor.md):
+# a directional binary round-trip pays fees twice, so signals only fire when
+# the expected reversion comfortably clears 2x fee + slippage + buffer.
+
+mode: paper            # paper | live   (live requires Kalshi auth)
+
+scanning:
+  poll_interval_seconds: 4         # how often we re-quote the watchlist
+  watchlist_refresh_seconds: 60    # how often we re-discover live games
+  sports: ["nba"]                  # which ESPN sports to pull live games from
+  generic_series: []               # extra Kalshi series to track price-only (no model)
+  max_markets: 40
+
+signal:
+  ema_span: 40            # baseline (reversion target) EMA span, in samples
+  vol_window: 40          # rolling window for price std / z-score
+  warmup_samples: 25      # need this many ticks before trading a market
+  entry_z: 2.0            # |z| threshold to call a dislocation
+  spike_window: 6         # samples over which the move must have happened
+  spike_min_move: 0.04    # min |Δprice| (in $) over spike_window to count as a *fast* dislocation
+  reversion_frac: 0.6     # target = entry + frac*(baseline - entry); how far back to the mean we aim
+  price_floor: 0.10       # never trade outside [floor, 1-floor] (near 0/1 reversion dies, fees dominate)
+  min_secs_to_close: 240  # don't fade inside the last N seconds before settlement
+
+exits:
+  stop_cents: 6.0         # held-side adverse move that means "reversion failed" -> bail
+  max_hold_seconds: 300   # time-stop
+  take_profit_at_target: true
+
+fair_value:                # in-game model overlay (NBA). Filters out *justified* moves.
+  enabled: true
+  mode: confirm            # off | confirm | require
+                           #   confirm: model used to VETO fades that agree with the move
+                           #   require: only trade when model says market overshot fair by >= edge
+  sigma_game: 13.0         # SD of NBA final margin around expectation (pts)
+  min_model_edge_cents: 3.0
+  espn_ttl_seconds: 5
+
+fees:                      # conservative Kalshi taker fee model (per contract, USD)
+  model: kalshi_pct        # kalshi_pct (0.07*P*(1-P)) | flat3 (repo default 3%)
+  slippage_cents: 1.0      # assumed adverse fill vs mid, each leg
+
+sizing:
+  contracts_per_trade: 10        # fixed size (paper). Live: capped by risk + book depth
+  max_contracts_per_market: 30
+
+risk:
+  max_position_per_market_usd: 100
+  max_total_exposure_usd: 1000
+  max_concurrent_positions: 8
+  max_daily_loss_usd: 75
+  min_edge_cents: 3.0            # required expected net edge after fees+slippage to enter
+
+paper:
+  starting_capital_usd: 2000
+  db_path: data/mr_paper.db
+
+recorder:
+  tape_db_path: data/mr_tape.db   # captured price tapes for backtesting
+
+logging:
+  level: INFO

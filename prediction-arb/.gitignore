@@ -1,0 +1,9 @@
+.env
+*.pem
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/cache/
+data/paper_trades.db
+*.log
+.DS_Store

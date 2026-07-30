@@ -1,0 +1,109 @@
+
+════════════════════════════════════════════════════════════════════════════════
+ Z1 — Empirical-vs-Implied (calibration trades)
+════════════════════════════════════════════════════════════════════════════════
+  Empirical P(yes) by (dist_sigma, TTC) bucket:
+   dist_bucket ttc_bucket      n  n_yes  empirical_p_yes
+0       01_dn3         t1   4709      0         0.000000
+1       01_dn3         t2  49473    150         0.003032
+2       01_dn3         t3  51226    349         0.006813
+3       01_dn3         t4  32017     25         0.000781
+4       02_dn2         t1  13703    139         0.010144
+5       02_dn2         t2  87178   1847         0.021187
+6       02_dn2         t3  79464   3251         0.040912
+7       02_dn2         t4  46455   1337         0.028781
+8       03_dn1         t1  13207    947         0.071704
+9       03_dn1         t2  95419  12061         0.126400
+10      03_dn1         t3  92824  13576         0.146255
+11      03_dn1         t4  53726   7689         0.143115
+12     04_atm-         t1   7968   1970         0.247239
+13     04_atm-         t2  63366  21843         0.344712
+14     04_atm-         t3  67594  23865         0.353064
+15     04_atm-         t4  41057  15378         0.374552
+16      05_atm         t1  10223   5116         0.500440
+17      05_atm         t2  67070  35084         0.523095
+18      05_atm         t3  71787  38859         0.541310
+19      05_atm         t4  43318  24512         0.565862
+20     06_atm+         t1   9262   7263         0.784172
+21     06_atm+         t2  67101  48041         0.715951
+22     06_atm+         t3  67747  45668         0.674096
+23     06_atm+         t4  40619  27580         0.678993
+24      07_up1         t1  13359  12299         0.920653
+25      07_up1         t2  89994  80890         0.898838
+26      07_up1         t3  91898  76907         0.836873
+27      07_up1         t4  53665  45143         0.841200
+28      08_up2         t1  11536  11407         0.988818
+29      08_up2         t2  83485  82264         0.985375
+30      08_up2         t3  76147  74833         0.982744
+31      08_up2         t4  42511  41679         0.980429
+32      09_up3         t1   4223   4223         1.000000
+33      09_up3         t2  43038  43023         0.999651
+34      09_up3         t3  48535  48535         1.000000
+35      09_up3         t4  32678  32678         1.000000
+    [Z1 emp<imp YES              ] n= 606 win= 58.1% total=$  -98.51 avg/c=$-0.0450 t=-2.67 qty=3.8  empirical_p_yes > market_yes_ask+5c → buy 
+    [Z1 emp>imp NO               ] n= 712 win= 51.1% total=$ -119.32 avg/c=$-0.0413 t=-2.85 qty=3.9  empirical_p_yes < (1-no_price)-5c → buy NO
+
+════════════════════════════════════════════════════════════════════════════════
+ Z2 — Delta-volume momentum (sum |delta| in last 60s)
+════════════════════════════════════════════════════════════════════════════════
+  delta_vol_60s rows: 24,824
+    [Z2 yes-flow-100             ] n=   9 win= 77.8% total=$   +4.90 avg/c=$+0.1478 t=+ 1.56 qty=3.7  yes_vol>=100 + net yes adds, buy YES
+    [Z2 no-flow-100              ] n=   9 win= 22.2% total=$   -9.24 avg/c=$-0.2567 t=-2.59 qty=4.0  no_vol>=100 + net no adds, buy NO
+    [Z2 flow-direction           ] n=   7 win= 42.9% total=$   -5.70 avg/c=$-0.2037 t=-1.29 qty=4.0  Total flow >= 200, follow signed direction
+
+════════════════════════════════════════════════════════════════════════════════
+ Z3 — Coinbase outage detection
+════════════════════════════════════════════════════════════════════════════════
+  CB tick gap stats:
+   total_secs  gap_secs    pct_gap
+0      602487    355590  59.020361
+  CB outages (>=3s) found: 39,808
+    [Z3 T2-clean-cb              ] n= 117 win= 39.3% total=$  -30.05 avg/c=$-0.0514 t=-2.79 qty=5.0  T2 only when no CB gap in last 60s
+    [Z3 T2-during-outage         ] n= 105 win= 22.9% total=$  -30.66 avg/c=$-0.0592 t=-3.20 qty=4.8  T2 DURING or right after CB outage (CB sta
+
+════════════════════════════════════════════════════════════════════════════════
+ Z4 — Live-bot win reverse-engineering
+════════════════════════════════════════════════════════════════════════════════
+  Private event types:
+      message_type  count_star()
+0             fill            81
+1       user_order           104
+2  market_position           272
+
+  Sample payloads (first 3 fills):
+        received_at_ns message_type               market_ticker                                                                                                                                                                                                                                                                                                                                                                                                                                                payload_json
+0  1778056457246947200         fill  KXBTCD-26MAY0605-T81699.99   {"action": "buy", "client_order_id": "research-1778056457-bf9315b495", "count_fp": "1.00", "fee_cost": "0.020000", "is_taker": true, "market_ticker": "KXBTCD-26MAY0605-T81699.99", "order_id": "5b1205ee-6731-4983-adc6-9deca4c81a2a", "post_position_fp": "1.00", "purchased_side": "yes", "side": "yes", "subaccount": 0, "trade_id": "052401f9-5abc-6713-1644-a3a5efba2d3c", "ts": 1778056456, "ts_ms": 1778056456953, "yes_price_dollars": "0.7500"}
+1  1778069717977594700         fill  KXBTCD-26MAY0609-T82299.99  {"action": "sell", "client_order_id": "research-1778069717-e82212c452", "count_fp": "3.00", "fee_cost": "0.060000", "is_taker": true, "market_ticker": "KXBTCD-26MAY0609-T82299.99", "order_id": "3df49300-2b05-4c6a-bbe4-7f40f8790c1f", "post_position_fp": "-3.00", "purchased_side": "no", "side": "yes", "subaccount": 0, "trade_id": "9583c444-e2fe-71ca-5b3c-0b058179bdbe", "ts": 1778069717, "ts_ms": 1778069717679, "yes_pr
+
+  private_fills: 81
+        received_at_ns               market_ticker action side   qty  yes_price  no_price      ts_sec
+0  1778056457246947200  KXBTCD-26MAY0605-T81699.99    buy  yes  <NA>        NaN       NaN  1778056457
+1  1778069717977594700  KXBTCD-26MAY0609-T82299.99   sell  yes  <NA>        NaN       NaN  1778069718
+2  1778072552924306600  KXBTCD-26MAY0610-T81899.99    buy  yes  <NA>        NaN       NaN  1778072553
+3  1778099577814758100  KXBTCD-26MAY0617-T81499.99   sell  yes  <NA>        NaN       NaN  1778099578
+4  1778099684160233100     KXHIGHAUS-26MAY07-B72.5    buy   no  <NA>        NaN       NaN  1778099684
+    [Z4 actual-fills             ] n=   0 win=  0.0% total=$   +0.00 avg/c=$+0.0000 t=+ 0.00 qty=0.0  Live bot actual fills (real PnL ground tru
+
+════════════════════════════════════════════════════════════════════════════════
+ Z5 — T1 with recent-spot-stability filter
+════════════════════════════════════════════════════════════════════════════════
+    [Z5 T1-calm                  ] n=  10 win=100.0% total=$  +31.27 avg/c=$+0.1907 t=+ 3.28 qty=13.2  T1 when |spot_move_30s|<$30 (calm)
+    [Z5 T1-volatile              ] n=   0 win=  0.0% total=$   +0.00 avg/c=$+0.0000 t=+ 0.00 qty=0.0  T1 when |spot_move_30s|>$50 (volatile)
+
+════════════════════════════════════════════════════════════════════════════════════════════════════
+ ROUND 5 SUMMARY
+════════════════════════════════════════════════════════════════════════════════════════════════════
+hyp                                n   win%    total$   $/day     avg/c       t   qty  desc
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Z5 T1-calm                      10 100.0%    +31.27   +4.47   +0.1907 + 3.28  13.2  T1 when |spot_move_30s|<$30 (calm)
+  Z2 yes-flow-100                  9  77.8%     +4.90   +0.70   +0.1478 + 1.56   3.7  yes_vol>=100 + net yes adds, buy YES
+  Z4 actual-fills                  0   0.0%     +0.00   +0.00   +0.0000 + 0.00   0.0  Live bot actual fills (real PnL ground tru
+  Z5 T1-volatile                   0   0.0%     +0.00   +0.00   +0.0000 + 0.00   0.0  T1 when |spot_move_30s|>$50 (volatile)
+  Z2 flow-direction                7  42.9%     -5.70   -0.81   -0.2037 -1.29   4.0  Total flow >= 200, follow signed direction
+  Z2 no-flow-100                   9  22.2%     -9.24   -1.32   -0.2567 -2.59   4.0  no_vol>=100 + net no adds, buy NO
+  Z3 T2-clean-cb                 117  39.3%    -30.05   -4.29   -0.0514 -2.79   5.0  T2 only when no CB gap in last 60s
+  Z3 T2-during-outage            105  22.9%    -30.66   -4.38   -0.0592 -3.20   4.8  T2 DURING or right after CB outage (CB sta
+  Z1 emp<imp YES                 606  58.1%    -98.51  -14.07   -0.0450 -2.67   3.8  empirical_p_yes > market_yes_ask+5c → buy 
+  Z1 emp>imp NO                  712  51.1%   -119.32  -17.05   -0.0413 -2.85   3.9  empirical_p_yes < (1-no_price)-5c → buy NO
+
+>>> 0 strategies passed criteria

@@ -1,0 +1,22 @@
+Train: 1311  Test: 1607  Features: 14
+
+=== Vol prediction MAE + trading-rule Sharpe ===
+
+  Naive21D       : MAE=0.0698  Sharpe=+0.89  Ret=+17.3%  MDD=-23.9%
+  BuyHold        : MAE=n/a    Sharpe=+0.71  Ret=+14.5%  MDD=-35.7%
+  Ridge         : MAE=0.2370  Sharpe=+0.71  Ret=+15.7%  MDD=-38.8%  (0.0s)
+  RandomForest  : MAE=0.0626  Sharpe=+0.85  Ret=+18.7%  MDD=-32.1%  (1.5s)
+  GradientBoost : MAE=0.0638  Sharpe=+0.73  Ret=+18.8%  MDD=-39.9%  (7.2s)
+  LightGBM      : MAE=0.0629  Sharpe=+0.88  Ret=+20.3%  MDD=-33.6%  (0.4s)
+  MLP           : MAE=0.0735  Sharpe=+0.98  Ret=+25.8%  MDD=-36.5%  (2.8s)
+
+Deflated Sharpe (n_trials=5):
+  Naive21D      : raw=+0.89  deflated=+0.33
+  BuyHold       : raw=+0.71  deflated=+0.18
+  Ridge         : raw=+0.71  deflated=+0.18
+  RandomForest  : raw=+0.85  deflated=+0.30
+  GradientBoost : raw=+0.73  deflated=+0.20
+  LightGBM      : raw=+0.88  deflated=+0.33
+  MLP           : raw=+0.98  deflated=+0.41
+
+Saved Phase 5 vol results.
